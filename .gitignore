@@ -11,6 +11,8 @@ cameras.json
 *.ply
 *.mp4
 datasets
+ablation_results
+runtime_results
 wandb
 
 result*

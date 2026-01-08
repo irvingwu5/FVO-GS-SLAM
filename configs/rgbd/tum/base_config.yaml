@@ -1,9 +1,10 @@
 ## SLAM parameters
 Results:
   save_results: True
-  save_dir: "results"
+  save_dir: "ablation_results"
   save_trj: True
   save_trj_kf_intv: 5
+
   use_gui: True
   eval_rendering: False
   use_wandb: False
@@ -11,10 +12,11 @@ Results:
 Dataset:
   type: 'tum'
   sensor_type: 'depth'
-  pcd_downsample: 128
+  pcd_downsample: 64
   pcd_downsample_init: 32
   adaptive_pointsize: True
   point_size: 0.01
+  use_label: True
 
 Training:
   #Initialization
@@ -59,6 +61,9 @@ opt_params:
   position_lr_delay_mult: 0.01
   position_lr_max_steps: 30000
   feature_lr: 0.0025
+  labels_lr: 0.001
+  lambda_dist: 0.0
+  lambda_normal: 0.05
   opacity_lr: 0.05
   scaling_lr: 0.001
   rotation_lr: 0.001
@@ -81,3 +86,4 @@ model_params:
 pipeline_params:
   convert_SHs_python: False
   compute_cov3D_python: False
+  depth_ratio: 0.0

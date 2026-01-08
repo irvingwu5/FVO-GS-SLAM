@@ -373,7 +373,7 @@ class FrontEnd(mp.Process):
 
                 viewpoint = Camera.init_from_dataset(
                     self.dataset, cur_frame_idx, projection_matrix
-                )
+                ) # 具体读取第一帧数据的代码
                 viewpoint.compute_grad_mask(self.config)
 
                 self.cameras[cur_frame_idx] = viewpoint

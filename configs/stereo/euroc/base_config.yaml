@@ -64,6 +64,8 @@ opt_params:
   scaling_lr: 0.001
   rotation_lr: 0.001
   percent_dense: 0.01
+  lambda_dist: 0.0
+  lambda_normal: 0.05
   lambda_dssim: 0.2
   densification_interval: 100
   opacity_reset_interval: 3000

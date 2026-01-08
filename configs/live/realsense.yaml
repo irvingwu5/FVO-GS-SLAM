@@ -58,6 +58,7 @@ opt_params:
   opacity_lr: 0.05
   scaling_lr: 0.001
   rotation_lr: 0.001
+  labels_lr: 0.001
   percent_dense: 0.01
   lambda_dssim: 0.2
   densification_interval: 100

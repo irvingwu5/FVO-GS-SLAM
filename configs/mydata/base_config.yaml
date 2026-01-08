@@ -1,20 +1,19 @@
 Results:
-  save_results: False
+  save_results: True
   save_dir: "results"
-  save_trj: False
-  save_trj_kf_intv: 0
+  save_trj: True
+  save_trj_kf_intv: 10
   use_gui: True
   eval_rendering: False
   use_wandb: False
 
 Dataset:
-  dataset_path: datasets/realsense/rgbd
-  sensor_type: 'depth'
-  pcd_downsample: 32
+  type: 'tum'
+  sensor_type: 'monocular'
+  pcd_downsample: 64
   pcd_downsample_init: 32
   adaptive_pointsize: True
   point_size: 0.01
-  type: 'realsense'
 
 Training:
   init_itr_num: 1050
@@ -22,8 +21,8 @@ Training:
   init_gaussian_reset: 500
   init_gaussian_th: 0.005
   init_gaussian_extent: 30
-  tracking_itr_num: 50
-  mapping_itr_num: 50
+  tracking_itr_num: 100
+  mapping_itr_num: 150
   gaussian_update_every: 150
   gaussian_update_offset: 50
   gaussian_th: 0.7
@@ -35,19 +34,18 @@ Training:
   pose_window: 3
   edge_threshold: 1.1
   rgb_boundary_threshold: 0.01
-  single_thread: False
-  spherical_harmonics: True
 
-  kf_translation: 0.05
-  kf_min_translation: 0.02
+  kf_translation: 0.08
+  kf_min_translation: 0.05
   kf_overlap: 0.9
   kf_cutoff: 0.3
   prune_mode: 'slam'
+  single_thread: False
+  spherical_harmonics: False
 
   lr:
     cam_rot_delta: 0.003
     cam_trans_delta: 0.001
-
 
 opt_params:
   iterations: 30000

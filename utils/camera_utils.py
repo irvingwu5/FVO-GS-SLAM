@@ -22,6 +22,7 @@ class Camera(nn.Module):
         image_height,
         image_width,
         device="cuda:0",
+        label_data=None
     ):
         super(Camera, self).__init__()
         self.uid = uid
@@ -45,6 +46,7 @@ class Camera(nn.Module):
         self.FoVy = fovy
         self.image_height = image_height
         self.image_width = image_width
+        self.label_data = label_data # dict:3{num_planes int,label_data(ndarray(H,W)),nonplanepxl_mask(ndarray(H,W))}
 
         self.cam_rot_delta = nn.Parameter(
             torch.zeros(3, requires_grad=True, device=device)
@@ -64,7 +66,7 @@ class Camera(nn.Module):
 
     @staticmethod
     def init_from_dataset(dataset, idx, projection_matrix):
-        gt_color, gt_depth, gt_pose = dataset[idx]
+        gt_color, gt_depth, gt_pose, label_data = dataset[idx] #Tensor(3,H,W)、ndarray(H,W)、Tensor(4,4)、dict:3{num_planes int,label_data(ndarray(H,W)),nonplanepxl_mask(ndarray(H,W))}
         return Camera(
             idx,
             gt_color,
@@ -80,6 +82,7 @@ class Camera(nn.Module):
             dataset.height,
             dataset.width,
             device=dataset.device,
+            label_data=label_data
         )
 
     @staticmethod

@@ -1,7 +1,7 @@
 inherit_from: "configs/rgbd/tum/base_config.yaml"
 
 Dataset:
-  dataset_path: "/home/wuxiangyu/Desktop/data/2d_gaussian_slam/datasets/tum/room_desk/"
+  dataset_path: "datasets/tum/rgbd_dataset_freiburg1_room"
   Calibration:
     fx: 517.306408
     fy: 516.469215

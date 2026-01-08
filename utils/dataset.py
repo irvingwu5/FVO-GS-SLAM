@@ -17,10 +17,12 @@ except Exception:
 
 
 class ReplicaParser:
-    def __init__(self, input_folder):
+    def __init__(self, input_folder, has_label=False):
         self.input_folder = input_folder
-        self.color_paths = sorted(glob.glob(f"{self.input_folder}/results/frame*.jpg"))
-        self.depth_paths = sorted(glob.glob(f"{self.input_folder}/results/depth*.png"))
+        self.color_paths = sorted(glob.glob(f"{self.input_folder}/image/*.jpg"))
+        self.depth_paths = sorted(glob.glob(f"{self.input_folder}/depth/*.png"))
+        if has_label:
+            self.label_paths = sorted(glob.glob(f"{self.input_folder}/label/*.txt")) # 添加标签文件路径
         self.n_img = len(self.color_paths)
         self.load_poses(f"{self.input_folder}/traj.txt")
 
@@ -46,77 +48,85 @@ class ReplicaParser:
 
 
 class TUMParser:
-    def __init__(self, input_folder):
+    def __init__(self, input_folder, has_label=False):
         self.input_folder = input_folder
-        self.load_poses(self.input_folder, frame_rate=32)
+        self.load_poses(self.input_folder, frame_rate=32, has_label=has_label)
         self.n_img = len(self.color_paths)
 
     def parse_list(self, filepath, skiprows=0):
         data = np.loadtxt(filepath, delimiter=" ", dtype=np.unicode_, skiprows=skiprows)
         return data
 
-    def associate_frames(self, tstamp_image, tstamp_depth, tstamp_pose, max_dt=0.08):
+    def associate_frames(self, tstamp_image, tstamp_depth, tstamp_pose, max_dt=0.08): # 图像时间戳(613,)、深度图时间戳(595,)、gt位姿时间戳(2335,)、max_dt表示时间戳允许的最大差值
         associations = []
-        for i, t in enumerate(tstamp_image):
-            if tstamp_pose is None:
-                j = np.argmin(np.abs(tstamp_depth - t))
+        for i, t in enumerate(tstamp_image): # i表示图像索引，t表示图像时间戳，i和t同步移动，遍历每个图像时间戳
+            if tstamp_pose is None: # 如果没有位姿时间戳，只关联图像和深度图
+                j = np.argmin(np.abs(tstamp_depth - t)) #找到与当前图像时间戳t最接近的深度图索引j，并且两者时间差小于 max_dt 才视为关联
                 if np.abs(tstamp_depth[j] - t) < max_dt:
                     associations.append((i, j))
 
             else:
-                j = np.argmin(np.abs(tstamp_depth - t))
-                k = np.argmin(np.abs(tstamp_pose - t))
+                j = np.argmin(np.abs(tstamp_depth - t)) # 所有深度图时间戳减去当前图像时间戳t，取绝对值后找到最小值的索引j，即找到与当前图像时间戳t最接近的深度图索引j(int64类型)
+                k = np.argmin(np.abs(tstamp_pose - t)) # 所有位姿时间戳减去当前图像时间戳t，取绝对值后找到最小值的索引k，即找到与当前图像时间戳t最接近的位姿索引k(int64类型)
 
                 if (np.abs(tstamp_depth[j] - t) < max_dt) and (
                     np.abs(tstamp_pose[k] - t) < max_dt
                 ):
                     associations.append((i, j, k))
 
-        return associations
+        return associations # list of tuples [(16,0,351),(),……,()]，每个元组包含图像索引、深度图索引、位姿索引
 
-    def load_poses(self, datapath, frame_rate=-1):
-        if os.path.isfile(os.path.join(datapath, "groundtruth.txt")):
-            pose_list = os.path.join(datapath, "groundtruth.txt")
+    def load_poses(self, datapath, frame_rate=-1, has_label=False):
+        if os.path.isfile(os.path.join(datapath, "groundtruth.txt")): # 检测是否存在groundtruth.txt文件
+            pose_list = os.path.join(datapath, "groundtruth.txt") # 文件绝对路径，文件内容包含时间戳、平移、四元数
         elif os.path.isfile(os.path.join(datapath, "pose.txt")):
             pose_list = os.path.join(datapath, "pose.txt")
 
-        image_list = os.path.join(datapath, "rgb.txt")
+        image_list = os.path.join(datapath, "rgb.txt") # 文件绝对路径，文件内容包含时间戳及其相对应图像相对路径
         depth_list = os.path.join(datapath, "depth.txt")
+        if has_label:
+            label_list = os.path.join(datapath, "plane.txt") # 平面标签文件绝对路径，文件内容包含时间戳及其相对应标签文件相对路径
+        # image、depth、gtpose的时间戳可能不完全对应，需要进行关联
+        image_data = self.parse_list(image_list) #(613,2) 第一列时间戳，第二列时间戳对应的图像相对路径
+        depth_data = self.parse_list(depth_list) #(595,2) 第一列时间戳，第二列时间戳对应的深度图相对路径
+        pose_data = self.parse_list(pose_list, skiprows=1) #字符串类型numpy数组(2335,8) 第一列时间戳，第二到第四列平移，第五到第八列四元数
+        pose_vecs = pose_data[:, 0:].astype(np.float64) #转换为浮点型numpy数组
+        label_data = self.parse_list(label_list) if has_label is True else None #(613,2) 第一列时间戳，第二列时间戳对应的标签文件相对路径
 
-        image_data = self.parse_list(image_list)
-        depth_data = self.parse_list(depth_list)
-        pose_data = self.parse_list(pose_list, skiprows=1)
-        pose_vecs = pose_data[:, 0:].astype(np.float64)
+        tstamp_image = image_data[:, 0].astype(np.float64) # 第0列图片时间戳(613,)
+        tstamp_depth = depth_data[:, 0].astype(np.float64) # 第0列深度图时间戳(595,)
+        tstamp_pose = pose_data[:, 0].astype(np.float64) # 第0列pose时间戳(2335,)
+        #tstamp_label = label_data[:, 0].astype(np.float64) if is_add_label_flag is True else None # 第0列标签时间戳(613,),与图像时间戳一致不需要单独关联
 
-        tstamp_image = image_data[:, 0].astype(np.float64)
-        tstamp_depth = depth_data[:, 0].astype(np.float64)
-        tstamp_pose = pose_data[:, 0].astype(np.float64)
-        associations = self.associate_frames(tstamp_image, tstamp_depth, tstamp_pose)
-
-        indicies = [0]
-        for i in range(1, len(associations)):
-            t0 = tstamp_image[associations[indicies[-1]][0]]
-            t1 = tstamp_image[associations[i][0]]
+        associations = self.associate_frames(tstamp_image, tstamp_depth, tstamp_pose) # list of tuples [(16,0,351),(),……,()]，每个元组包含图像索引、深度图索引、位姿索引
+        # 对已关联的帧做下采样（thinning / subsampling）：从原始的连续帧序列中只保留部分帧，使相邻保留帧的时间间隔不小于阈值 1/frame_rate 秒
+        # 目的：去除时间上过于密集的冗余帧，降低计算和存储开销，保证均匀的时间间隔。
+        indicies = [0] #保存的是被保留的关联项在 associations 列表中的索引（整数列表）
+        for i in range(1, len(associations)): # 遍历所有关联的帧
+            t0 = tstamp_image[associations[indicies[-1]][0]] # 获取上一个被选择的关联项的图像时间戳
+            t1 = tstamp_image[associations[i][0]] # 获取当前关联项的图像时间戳
             if t1 - t0 > 1.0 / frame_rate:
                 indicies += [i]
 
-        self.color_paths, self.poses, self.depth_paths, self.frames = [], [], [], []
+        self.color_paths, self.poses, self.depth_paths, self.frames, self.label_paths = [], [], [], [], []
 
-        for ix in indicies:
-            (i, j, k) = associations[ix]
-            self.color_paths += [os.path.join(datapath, image_data[i, 1])]
+        for ix in indicies: # 遍历被保留的关联项索引列表
+            (i, j, k) = associations[ix] # 获取图像索引i、深度图索引j、位姿索引k
+            self.color_paths += [os.path.join(datapath, image_data[i, 1])] # 行索引i 时间戳(列索引0)、相对路径(列索引1)，最终保存的是图像文件的绝对路径
             self.depth_paths += [os.path.join(datapath, depth_data[j, 1])]
-
-            quat = pose_vecs[k][4:]
-            trans = pose_vecs[k][1:4]
-            T = trimesh.transformations.quaternion_matrix(np.roll(quat, 1))
-            T[:3, 3] = trans
-            self.poses += [np.linalg.inv(T)]
+            if has_label:
+                self.label_paths += [os.path.join(datapath, label_data[i, 1])] # 行索引i 时间戳(列索引0)、相对路径(列索引1)，最终保存的是标签文件的绝对路径
+            quat = pose_vecs[k][4:] # 行索引k 时间戳(列索引0)、平移(列索引1-3)、四元数(列索引4-7)，(4,)
+            trans = pose_vecs[k][1:4] # (3,)
+            T = trimesh.transformations.quaternion_matrix(np.roll(quat, 1)) # 四元数转为(4,4)变换矩阵填充3*3旋转矩阵部分，注意np.roll(quat,1)将四元数循环右移一位从(x,y,z,w)变为(w,x,y,z)
+            T[:3, 3] = trans # 将平移部分赋值给变换矩阵的前三行第四列
+            self.poses += [np.linalg.inv(T)] #相机位姿c2w
 
             frame = {
-                "file_path": str(os.path.join(datapath, image_data[i, 1])),
-                "depth_path": str(os.path.join(datapath, depth_data[j, 1])),
-                "transform_matrix": (np.linalg.inv(T)).tolist(),
+                "file_path": str(os.path.join(datapath, image_data[i, 1])), # 挑选出来的rgb的绝对路径
+                "depth_path": str(os.path.join(datapath, depth_data[j, 1])), # 挑选出来的depth的绝对路径
+                "label_path": str(os.path.join(datapath, label_data[i, 1])) if has_label is True else None, # 挑选出来的label的绝对路径
+                "transform_matrix": (np.linalg.inv(T)).tolist(), # 对应的相机位姿矩阵c2w
             }
 
             self.frames.append(frame)
@@ -244,6 +254,8 @@ class MonocularDataset(BaseDataset):
         # depth parameters
         self.has_depth = True if "depth_scale" in calibration.keys() else False
         self.depth_scale = calibration["depth_scale"] if self.has_depth else None
+        # wheter to use label
+        self.has_label = bool(config["Dataset"].get("use_label", False))
 
         # Default scene scale
         nerf_normalization_radius = 5
@@ -253,6 +265,18 @@ class MonocularDataset(BaseDataset):
                 "translation": np.zeros(3),
             },
         }
+
+    def parse_label_from_file(self, label_path):
+        with open(label_path, "r") as f:
+            N = int(f.readline().strip()) # 读取文件的第一行，获取平面数量
+            label_data = np.loadtxt(f,dtype=int) # 从第二行开始读取标签数据，存储为整数类型的numpy数组,大小与图片分辨率相同，每个像素点的值表示该像素所属的平面标签
+        nonplanepxl_mask = (label_data == 0)
+        label_info = {
+            "num_planes": N,
+            "label_data": label_data,
+            "nonplanepxl_mask": nonplanepxl_mask
+        }
+        return label_info
 
     def __getitem__(self, idx):
         color_path = self.color_paths[idx]
@@ -275,7 +299,12 @@ class MonocularDataset(BaseDataset):
             .to(device=self.device, dtype=self.dtype)
         )
         pose = torch.from_numpy(pose).to(device=self.device)
-        return image, depth, pose
+
+        if self.has_label:
+            label_path = self.label_paths[idx]
+            label_info = self.parse_label_from_file(label_path)
+
+        return image, depth, pose, label_info if self.has_label else None
 
 
 class StereoDataset(BaseDataset):
@@ -397,21 +426,23 @@ class TUMDataset(MonocularDataset):
     def __init__(self, args, path, config):
         super().__init__(args, path, config)
         dataset_path = config["Dataset"]["dataset_path"]
-        parser = TUMParser(dataset_path)
+        parser = TUMParser(dataset_path, self.has_label)
         self.num_imgs = parser.n_img
         self.color_paths = parser.color_paths
         self.depth_paths = parser.depth_paths
         self.poses = parser.poses
+        self.label_paths = parser.label_paths if self.has_label else None
 
 
 class ReplicaDataset(MonocularDataset):
     def __init__(self, args, path, config):
         super().__init__(args, path, config)
         dataset_path = config["Dataset"]["dataset_path"]
-        parser = ReplicaParser(dataset_path)
+        parser = ReplicaParser(dataset_path, self.has_label)
         self.num_imgs = parser.n_img
         self.color_paths = parser.color_paths
         self.depth_paths = parser.depth_paths
+        self.label_paths = parser.label_paths if self.has_label else None # 存储标签文件路径
         self.poses = parser.poses
 
 
