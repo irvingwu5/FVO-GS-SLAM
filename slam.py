@@ -24,74 +24,81 @@ from utils.slam_frontend import FrontEnd
 
 class SLAM:
     def __init__(self, config, save_dir=None):
-        start = torch.cuda.Event(enable_timing=True)
+        start = torch.cuda.Event(enable_timing=True) #创建了两个事件（Event）对象，主要用于GPU上的时间测量
         end = torch.cuda.Event(enable_timing=True)
 
         start.record()
 
         self.config = config
         self.save_dir = save_dir
+        # 解析配置文件中的模型参数、优化参数和管道参数
         model_params = munchify(config["model_params"])
         opt_params = munchify(config["opt_params"])
         pipeline_params = munchify(config["pipeline_params"])
+        # 赋值给类的成员变量
         self.model_params, self.opt_params, self.pipeline_params = (
             model_params,
             opt_params,
             pipeline_params,
         )
-
-        self.live_mode = self.config["Dataset"]["type"] == "realsense"
-        self.monocular = self.config["Dataset"]["sensor_type"] == "monocular"
-        self.use_spherical_harmonics = self.config["Training"]["spherical_harmonics"]
-        self.use_gui = self.config["Results"]["use_gui"]
+        # 根据配置文件设置各种模式和选项
+        # 通过检查配置文件中 Dataset 部分的 type 字段是否为 "realsense"。
+        # 如果是 "realsense"，意味着使用 Intel RealSense 相机进行实时采集和建图；否则可能是离线读取数据集。
+        self.live_mode = self.config["Dataset"]["type"] == "realsense" # False or True
+        # 通过检查配置文件中 Dataset 部分的 sensor_type 字段是否为 "monocular"
+        # 如果是 "monocular"，表示输入源是单目相机；否则可能是 RGB-D 或双目相机等其他传感器类型。
+        self.monocular = self.config["Dataset"]["sensor_type"] == "monocular" # False or True
+        self.use_spherical_harmonics = self.config["Training"]["spherical_harmonics"] # False or True
+        self.use_gui = self.config["Results"]["use_gui"] # False or True
         if self.live_mode:
             self.use_gui = True
-        self.eval_rendering = self.config["Results"]["eval_rendering"]
+        self.eval_rendering = self.config["Results"]["eval_rendering"] # False or True
 
-        model_params.sh_degree = 3 if self.use_spherical_harmonics else 0
-
-        self.gaussians = GaussianModel(model_params.sh_degree, config=self.config)
+        model_params.sh_degree = 3 if self.use_spherical_harmonics else 0 # true设置为3，false设置为0
+        # 初始化高斯模型和数据集
+        self.gaussians = GaussianModel(model_params.sh_degree, config=self.config) # 执行__init_函数初始化高斯各属性
         self.gaussians.init_lr(6.0)
+        # 加载数据集
         self.dataset = load_dataset(
             model_params, model_params.source_path, config=config
-        )
-
+        ) #返回了数据集中每个文件的绝对路径还没有具体读取
+        # 从config文件中读取的超参数设置训练超参数配置
         self.gaussians.training_setup(opt_params)
+        # 设置背景颜色为黑色
         bg_color = [0, 0, 0]
         self.background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-
-        frontend_queue = mp.Queue()
-        backend_queue = mp.Queue()
-
-        q_main2vis = mp.Queue() if self.use_gui else FakeQueue()
-        q_vis2main = mp.Queue() if self.use_gui else FakeQueue()
-
+        # 创建前端和后端进程之间的队列
+        frontend_queue = mp.Queue() #后端传给前端的数据队列
+        backend_queue = mp.Queue() #前端传给后端的数据队列
+        # FakeQueue 是一个“假的”队列，它存在的目的是为了让程序在关闭 GUI 模式下，依然能够流畅运行原本为 GUI 通信设计的代码逻辑，而不会因为没有真实的队列对象而崩溃。
+        q_main2vis = mp.Queue() if self.use_gui else FakeQueue() #主进程（frontend）传给可视化进程的数据队列
+        q_vis2main = mp.Queue() if self.use_gui else FakeQueue() #可视化进程传给主进程（frontend）的数据队列
+        # 重新赋值保存目录和单目模式
         self.config["Results"]["save_dir"] = save_dir
         self.config["Training"]["monocular"] = self.monocular
-
-        self.frontend = FrontEnd(self.config)
-        self.backend = BackEnd(self.config)
-
+        # 初始化前端和后端模块
+        self.frontend = FrontEnd(self.config) # 执行__init_函数初始化前端各属性
+        self.backend = BackEnd(self.config) # 执行__init_函数初始化后端各属性
+        # 给前端一系列参数赋值
         self.frontend.dataset = self.dataset
         self.frontend.background = self.background
         self.frontend.pipeline_params = self.pipeline_params
-        self.frontend.frontend_queue = frontend_queue
-        self.frontend.backend_queue = backend_queue
-        self.frontend.q_main2vis = q_main2vis
-        self.frontend.q_vis2main = q_vis2main
-        self.frontend.set_hyperparams()
-
+        self.frontend.frontend_queue = frontend_queue #后端传给前端的数据队列
+        self.frontend.backend_queue = backend_queue  #前端传给后端的数据队列
+        self.frontend.q_main2vis = q_main2vis #主进程（frontend）传给可视化进程的数据队列
+        self.frontend.q_vis2main = q_vis2main #可视化进程传给主进程（frontend）的数据队列
+        self.frontend.set_hyperparams() # 设置前端的超参数
+        # 给后端一系列参数赋值
         self.backend.gaussians = self.gaussians
         self.backend.background = self.background
-        self.backend.cameras_extent = 6.0
+        self.backend.cameras_extent = 6.0 #场景中相机的空间范围
         self.backend.pipeline_params = self.pipeline_params
         self.backend.opt_params = self.opt_params
-        self.backend.frontend_queue = frontend_queue
-        self.backend.backend_queue = backend_queue
-        self.backend.live_mode = self.live_mode
-
-        self.backend.set_hyperparams()
-
+        self.backend.frontend_queue = frontend_queue #后端传给前端的数据队列
+        self.backend.backend_queue = backend_queue #前端传给后端的数据队列
+        self.backend.live_mode = self.live_mode # 实时模式标志
+        self.backend.set_hyperparams() # 设置后端的超参数
+        # 给GUI的参数赋值
         self.params_gui = gui_utils.ParamsGUI(
             pipe=self.pipeline_params,
             background=self.background,
@@ -99,15 +106,20 @@ class SLAM:
             q_main2vis=q_main2vis,
             q_vis2main=q_vis2main,
         )
-
+        # 仅仅是创建了一个进程对象，并将 self.backend.run 注册为该进程启动时要运行的目标函数，不会执行 run 方法
         backend_process = mp.Process(target=self.backend.run)
         if self.use_gui:
+            # 创建一个 GUI 进程，目标函数为 slam_gui.run，传递参数 self.params_gui
             gui_process = mp.Process(target=slam_gui.run, args=(self.params_gui,))
+            # 启动 GUI 进程
             gui_process.start()
+            # 等待5秒，主要是等 GUI 界面加载好
             time.sleep(5)
-
-        backend_process.start()
+        # 启动 backend_process 进程
+        backend_process.start() #它会请求操作系统启动一个新的进程，并在该进程中执行 self.backend.run 方法
+        # 主进程运行frontend
         self.frontend.run()
+        # 前端运行结束了，利用队列传递信息，让后端暂停
         backend_queue.put(["pause"])
 
         end.record()
@@ -199,7 +211,7 @@ class SLAM:
 
 
 if __name__ == "__main__":
-    # Set up command line argument parser
+    # Set up command line argument parser，解析命令行参数
     parser = ArgumentParser(description="Training script parameters")
     parser.add_argument("--config", type=str)
     parser.add_argument("--eval", action="store_true")
@@ -207,13 +219,13 @@ if __name__ == "__main__":
     args = parser.parse_args(sys.argv[1:])
 
     mp.set_start_method("spawn")
-
+    # 加载配置文件
     with open(args.config, "r") as yml:
         config = yaml.safe_load(yml)
 
     config = load_config(args.config)
     save_dir = None
-
+    # 如果命令行参数中包含 --eval，则进入评估模式
     if args.eval:
         Log("Running MonoGS in Evaluation Mode")
         Log("Following config will be overriden")
@@ -223,9 +235,9 @@ if __name__ == "__main__":
         config["Results"]["use_gui"] = False
         Log("\teval_rendering=True")
         config["Results"]["eval_rendering"] = True
-        Log("\tuse_wandb=True")
-        config["Results"]["use_wandb"] = True
-
+        Log("\tuse_wandb=False")
+        config["Results"]["use_wandb"] = False # True->False
+    # 如果配置文件中指定了保存结果，则创建保存目录并初始化 wandb
     if config["Results"]["save_results"]:
         mkdir_p(config["Results"]["save_dir"])
         current_datetime = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
@@ -248,7 +260,7 @@ if __name__ == "__main__":
         )
         wandb.define_metric("frame_idx")
         wandb.define_metric("ate*", step_metric="frame_idx")
-
+    # 整个SLAM系统作为一个类实现在SLAM.py中，而且在__init__()的时候就运行了所有的线程：gui_process、frontend_process、backend_process
     slam = SLAM(config, save_dir=save_dir)
 
     slam.run()

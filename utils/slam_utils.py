@@ -20,7 +20,8 @@ def image_gradient(image):
     )
     return img_grad_v[0], img_grad_h[0]
 
-
+#这个函数实际上是在寻找内部有效点。如果一个像素位于有效区域的边缘（邻居中有无效点），或者自身无效，它都会被掩盖掉。
+# 这在计算图像梯度（如函数 depth_reg 中用到）时非常重要，可以防止在深度断裂或无效边界处计算出错误的巨大梯度值
 def image_gradient_mask(image, eps=0.01):
     # Compute image gradient mask
     c = image.shape[0]
@@ -60,15 +61,16 @@ def get_loss_tracking(config, image, depth, opacity, viewpoint, initialization=F
     return get_loss_tracking_rgbd(config, image_ab, depth, opacity, viewpoint)
 
 
-def get_loss_tracking_rgb(config, image, depth, opacity, viewpoint):
+def get_loss_tracking_rgb(config, image, depth, opacity, viewpoint): #主要用于计算 RGB 颜色跟踪损失 (Tracking Loss)。在 SLAM 系统中，这个损失值用于衡量当前渲染出的图像与真实观测图像之间的差异，通常用于优化当前的相机位姿（Tracking 过程）。
     gt_image = viewpoint.original_image.cuda()
     _, h, w = gt_image.shape
     mask_shape = (1, h, w)
     rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
-    rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*mask_shape)
-    rgb_pixel_mask = rgb_pixel_mask * viewpoint.grad_mask
+    rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*mask_shape) #只要像素的 RGB 值之和大于该阈值，就被视为有效像素。这通常用于过滤掉全黑的图像边界或无效区域
+    rgb_pixel_mask = rgb_pixel_mask * viewpoint.grad_mask #进一步通过外部提供的梯度掩码来筛选纹理丰富区域
+    # 计算渲染图像与真值图像之间的绝对差值 (L1 Error)，并乘以不透明度掩码，确保只考虑那些被高置信度渲染的像素，这意味着模型渲染出不透明度高（实体表面）的区域，其颜色误差对损失函数的贡献更大；而透明或半透明区域的颜色误差权重较低
     l1 = opacity * torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
-    return l1.mean()
+    return l1.mean() #返回整个图像所有像素误差的平均值
 
 
 def get_loss_tracking_rgbd(
@@ -82,7 +84,7 @@ def get_loss_tracking_rgbd(
     depth_pixel_mask = (gt_depth > 0.01).view(*depth.shape)
     opacity_mask = (opacity > 0.95).view(*depth.shape)
 
-    l1_rgb = get_loss_tracking_rgb(config, image, depth, opacity, viewpoint)
+    l1_rgb = get_loss_tracking_rgb(config, image, depth, opacity, viewpoint) #l1加权损失
     depth_mask = depth_pixel_mask * opacity_mask
     l1_depth = torch.abs(depth * depth_mask - gt_depth * depth_mask)
     return alpha * l1_rgb + (1 - alpha) * l1_depth.mean()

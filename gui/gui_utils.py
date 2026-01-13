@@ -159,7 +159,7 @@ class Packet_vis2main:
     flag_pause = None
 
 
-class ParamsGUI:
+class ParamsGUI: # 定义了一个名为 ParamsGUI 的 Python 类，其主要作用是一个数据容器或配置对象，用于封装和传递 GUI（图形用户界面）所需的各种参数和共享对象。
     def __init__(
         self,
         pipe=None,
@@ -170,6 +170,6 @@ class ParamsGUI:
     ):
         self.pipe = pipe
         self.background = background
-        self.gaussians = gaussians
-        self.q_main2vis = q_main2vis
-        self.q_vis2main = q_vis2main
+        self.gaussians = gaussians #要在 GUI 中可视化的 3D 高斯数据
+        self.q_main2vis = q_main2vis #从前端（主进程/线程）发送消息到可视化 (GUI) 进程/线程。这通常用于传输更新的数据包
+        self.q_vis2main = q_vis2main #从可视化 (GUI) 进程/线程发送消息回主进程/线程（例如用户在 GUI 上的操作指令，如暂停、调整视角等）

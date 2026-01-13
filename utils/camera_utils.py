@@ -111,39 +111,41 @@ class Camera(nn.Module):
         return self.world_view_transform.inverse()[3, :3]
 
     def update_RT(self, R, t):
-        self.R = R.to(device=self.device)
+        self.R = R.to(device=self.device) #接收新的旋转矩阵 R 和平移向量 t，并将它们更新到当前相机对象的属性中。
         self.T = t.to(device=self.device)
-
+    # 该梯度掩码在计算仅基于 RGB 颜色 的相机跟踪（Tracking）损失时使用
+    # #该函数生成了一个二值掩码 self.grad_mask，掩码中的 True (或 1) 表示该像素点位于边缘或纹理区域，
+    # 将被用于后续的 Tracking 损失计算，忽略平坦区域以提高计算效率和稳定性
     def compute_grad_mask(self, config):
         edge_threshold = config["Training"]["edge_threshold"]
-
+        #主要作用是计算图像的梯度掩码（Gradient Mask），用于筛选出图像中纹理丰富或边缘明显的区域。  这些区域在视觉 SLAM 或相机跟踪（Tracking）算法中非常重要，因为还可以基于这些具体的特征点计算光度误差，而平坦无纹理的区域通常无法提供有效的几何约束。
         gray_img = self.original_image.mean(dim=0, keepdim=True)
         gray_grad_v, gray_grad_h = image_gradient(gray_img)
         mask_v, mask_h = image_gradient_mask(gray_img)
         gray_grad_v = gray_grad_v * mask_v
         gray_grad_h = gray_grad_h * mask_h
-        img_grad_intensity = torch.sqrt(gray_grad_v**2 + gray_grad_h**2)
+        img_grad_intensity = torch.sqrt(gray_grad_v**2 + gray_grad_h**2) #主要目的是计算当前相机图像的梯度强度图（Gradient Intensity Map）。这通常用于识别图像中的边缘或纹理丰富区域，这些区域在 SLAM 跟踪或计算光度误差时往往更重要。
 
         if config["Dataset"]["type"] == "replica":
-            row, col = 32, 32
+            row, col = 32, 32 # 将图像划分为32x32个小块
             multiplier = edge_threshold
             _, h, w = self.original_image.shape
-            for r in range(row):
+            for r in range(row): #遍历每个图像块
                 for c in range(col):
                     block = img_grad_intensity[
                         :,
                         r * int(h / row) : (r + 1) * int(h / row),
                         c * int(w / col) : (c + 1) * int(w / col),
                     ]
-                    th_median = block.median()
-                    block[block > (th_median * multiplier)] = 1
+                    th_median = block.median() #计算该块内梯度强度的中位数
+                    block[block > (th_median * multiplier)] = 1 #大于该阈值的像素置为 1，否则置为 0
                     block[block <= (th_median * multiplier)] = 0
-            self.grad_mask = img_grad_intensity
-        else:
+            self.grad_mask = img_grad_intensity #这种局部自适应方法能更好地处理光照不均匀或纹理分布不均的情况，确保在图像的各个区域都能提取到相对显著的特征点
+        else: #全局阈值法，适用于纹理分布较均匀的图像
             median_img_grad_intensity = img_grad_intensity.median()
             self.grad_mask = (
                 img_grad_intensity > median_img_grad_intensity * edge_threshold
-            )
+            ) #只有梯度强度显著高于全局中位数的像素点（即边缘或纹理丰富点）会被保留（标记为 True），平坦区域会被过滤掉。该掩码随后用于相机追踪时的损失计算
 
     def clean(self):
         self.original_image = None
