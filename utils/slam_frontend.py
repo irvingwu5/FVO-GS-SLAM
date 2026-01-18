@@ -359,6 +359,14 @@ class FrontEnd(mp.Process):
 
     def cleanup(self, cur_frame_idx):
         self.cameras[cur_frame_idx].clean()
+        # --- 内存优化: 清理平面数据 (RAM Fix) ---
+        # 显式删除挂载在相机对象上的大数组，防止内存泄漏
+        if hasattr(self.cameras[cur_frame_idx], "label_info"):
+            del self.cameras[cur_frame_idx].label_info
+        if hasattr(self.cameras[cur_frame_idx], "plane_param_info"):
+            del self.cameras[cur_frame_idx].plane_param_info
+        # -------------------------------------
+
         if cur_frame_idx % 10 == 0:
             torch.cuda.empty_cache()
     '''

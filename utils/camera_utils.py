@@ -22,7 +22,8 @@ class Camera(nn.Module):
         image_height,
         image_width,
         device="cuda:0",
-        label_data=None
+        label_info=None,
+        plane_param_info=None
     ):
         super(Camera, self).__init__()
         self.uid = uid
@@ -46,7 +47,8 @@ class Camera(nn.Module):
         self.FoVy = fovy
         self.image_height = image_height
         self.image_width = image_width
-        self.label_data = label_data # dict:3{num_planes int,label_data(ndarray(H,W)),nonplanepxl_mask(ndarray(H,W))}
+        self.label_info = label_info # dict:3{num_planes int,label_data(ndarray(H,W)),nonplanepxl_mask(ndarray(H,W))}
+        self.plane_param_info = plane_param_info
 
         self.cam_rot_delta = nn.Parameter(
             torch.zeros(3, requires_grad=True, device=device)
@@ -63,10 +65,10 @@ class Camera(nn.Module):
         )
 
         self.projection_matrix = projection_matrix.to(device=device)
-
+    #Tensor(3,H,W)、ndarray(H,W)、Tensor(4,4)、dict:3{num_planes int,label_data(ndarray(H,W)),nonplanepxl_mask(ndarray(H,W))},plane_param_info dict:3{plane_normals ndarray(num_planes,3),plane_center ndarray(num_planes,3), plane_equations ndarray(num_planes,4)}
     @staticmethod
     def init_from_dataset(dataset, idx, projection_matrix):
-        gt_color, gt_depth, gt_pose, label_data = dataset[idx] #Tensor(3,H,W)、ndarray(H,W)、Tensor(4,4)、dict:3{num_planes int,label_data(ndarray(H,W)),nonplanepxl_mask(ndarray(H,W))}
+        gt_color, gt_depth, gt_pose, label_info, plane_param_info = dataset[idx]
         return Camera(
             idx,
             gt_color,
@@ -82,7 +84,8 @@ class Camera(nn.Module):
             dataset.height,
             dataset.width,
             device=dataset.device,
-            label_data=label_data
+            label_info=label_info,
+            plane_param_info=plane_param_info
         )
 
     @staticmethod

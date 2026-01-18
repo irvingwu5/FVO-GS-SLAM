@@ -10,7 +10,7 @@ from gaussian_splatting.utils.loss_utils import l1_loss, ssim
 from utils.logging_utils import Log
 from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
-from utils.slam_utils import get_loss_mapping
+from utils.slam_utils import get_loss_mapping,get_loss_mapping_plane_constraint
 
 # 它主要负责全局地图构建（Mapping）和光束法平差（Bundle Adjustment）
 # BackEnd 的核心设计模式是维护全局一致性。前端只关心“当前在哪里”，而后端关心“整个地图长什么样以及历史轨迹是否准确”。
@@ -49,7 +49,7 @@ class BackEnd(mp.Process):
         self.init_gaussian_extent = (
             self.cameras_extent * self.config["Training"]["init_gaussian_extent"]
         ) # 初始化期间场景范围180
-        self.mapping_itr_num = self.config["Training"]["mapping_itr_num"] # 建图阶段每处理一个新关键帧时的优化迭代次数
+        self.mapping_itr_num = self.config["Training"]["mapping_itr_num"] # 建图阶段每处理一个新关键帧时的优化迭代次数150
         self.gaussian_update_every = self.config["Training"]["gaussian_update_every"] # 建图期间执行高斯点分裂/修剪的间隔次数
         self.gaussian_update_offset = self.config["Training"]["gaussian_update_offset"] # 建图期间首次执行高斯更新的起始偏移量
         self.gaussian_th = self.config["Training"]["gaussian_th"] # 建图期间用于高斯密化（新增点）的梯度阈值
@@ -116,7 +116,22 @@ class BackEnd(mp.Process):
             )
             loss_init = get_loss_mapping(
                 self.config, image, depth, viewpoint, opacity, initialization=True
-            )
+            ) #0.4688
+            if self.config["Training"]["plane_constraint"]["use_plane_constraint"]:
+                lambda_plane = self.config["Training"]["plane_constraint"]["weight"]
+                loss_type = self.config["Training"]["plane_constraint"]["loss_type"]
+                warmup_iter = self.config["Training"]["plane_constraint"]["warmup_iter"]
+
+                if self.iteration_count > warmup_iter: #如果 warmup_iter = 2500，且 init_itr_num = 1050，那么在初始化阶段平面约束永远不会触发。
+                    actual_lambda_plane = 0
+                else:
+                    actual_lambda_plane = lambda_plane
+                if actual_lambda_plane > 0:
+                    loss_plane_constraint = get_loss_mapping_plane_constraint(
+                        self.gaussians, viewpoint, loss_type
+                    )
+                    loss_init += actual_lambda_plane * loss_plane_constraint
+
             loss_init.backward()
 
             with torch.no_grad():
@@ -212,6 +227,20 @@ class BackEnd(mp.Process):
                 visibility_filter_acm.append(visibility_filter)
                 radii_acm.append(radii)
                 n_touched_acm.append(n_touched)
+                if self.config["Training"]["plane_constraint"]["use_plane_constraint"]:
+                    lambda_plane = self.config["Training"]["plane_constraint"]["weight"]
+                    loss_type = self.config["Training"]["plane_constraint"]["loss_type"]
+                    warmup_iter = self.config["Training"]["plane_constraint"]["warmup_iter"]
+                    if self.iteration_count > warmup_iter:
+                        actual_lambda_plane = 0
+                    else:
+                        actual_lambda_plane = lambda_plane
+                    # 只有权重 > 0 时才计算，节省算力
+                    if actual_lambda_plane > 0:
+                        loss_plane_constraint = get_loss_mapping_plane_constraint(
+                            self.gaussians, viewpoint, loss_type
+                        )
+                        loss_mapping += actual_lambda_plane * loss_plane_constraint
             # 随机选取的历史关键帧进行迭代优化
             for cam_idx in torch.randperm(len(random_viewpoint_stack))[:2]:
                 viewpoint = random_viewpoint_stack[cam_idx]
@@ -241,6 +270,21 @@ class BackEnd(mp.Process):
                 viewspace_point_tensor_acm.append(viewspace_point_tensor)
                 visibility_filter_acm.append(visibility_filter)
                 radii_acm.append(radii)
+                # [修改点] 历史帧也要应用同样的 Warm-up 策略
+                if self.config["Training"]["plane_constraint"]["use_plane_constraint"]:
+                    lambda_plane = self.config["Training"]["plane_constraint"]["weight"]
+                    loss_type = self.config["Training"]["plane_constraint"]["loss_type"]
+                    warmup_iter = self.config["Training"]["plane_constraint"]["warmup_iter"]
+
+                    if self.iteration_count > warmup_iter:
+                        actual_lambda_plane = 0.0
+                    else:
+                        actual_lambda_plane = lambda_plane
+
+                    if actual_lambda_plane > 0:
+                        loss_mapping += actual_lambda_plane * get_loss_mapping_plane_constraint(
+                            self.gaussians, viewpoint, loss_type
+                        )
 
             scaling = self.gaussians.get_scaling
             isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))

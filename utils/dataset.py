@@ -22,7 +22,8 @@ class ReplicaParser:
         self.color_paths = sorted(glob.glob(f"{self.input_folder}/image/*.jpg"))
         self.depth_paths = sorted(glob.glob(f"{self.input_folder}/depth/*.png"))
         if has_label:
-            self.label_paths = sorted(glob.glob(f"{self.input_folder}/label/*.txt")) # 添加标签文件路径
+            self.label_paths = sorted(glob.glob(f"{self.input_folder}/plane/*label.txt")) # 添加标签文件路径
+            self.plane_params = sorted(glob.glob(f"{self.input_folder}/plane/*data.txt")) # 添加平面参数文件路径
         self.n_img = len(self.color_paths)
         self.load_poses(f"{self.input_folder}/traj.txt")
 
@@ -86,6 +87,7 @@ class TUMParser:
         depth_list = os.path.join(datapath, "depth.txt")
         if has_label:
             label_list = os.path.join(datapath, "plane.txt") # 平面标签文件绝对路径，文件内容包含时间戳及其相对应标签文件相对路径
+
         # image、depth、gtpose的时间戳可能不完全对应，需要进行关联
         image_data = self.parse_list(image_list) #(613,2) 第一列时间戳，第二列时间戳对应的图像相对路径
         depth_data = self.parse_list(depth_list) #(595,2) 第一列时间戳，第二列时间戳对应的深度图相对路径
@@ -270,13 +272,58 @@ class MonocularDataset(BaseDataset):
         with open(label_path, "r") as f:
             N = int(f.readline().strip()) # 读取文件的第一行，获取平面数量
             label_data = np.loadtxt(f,dtype=int) # 从第二行开始读取标签数据，存储为整数类型的numpy数组,大小与图片分辨率相同，每个像素点的值表示该像素所属的平面标签
-        nonplanepxl_mask = (label_data == 0)
+        nonplanepxl_mask = (label_data == N) #RGBD plane detection中，非平面像素的标签值为N，创建一个布尔掩码数组，标记哪些像素不属于任何平面
         label_info = {
             "num_planes": N,
             "label_data": label_data,
             "nonplanepxl_mask": nonplanepxl_mask
         }
         return label_info
+
+    def parse_plane_param_from_file(self, path):
+        # 读取 TXT 数据
+        try:
+            data = np.loadtxt(path, dtype=np.float32)
+        except Exception as e:
+            print(f"Error loading plane parameters: {e}")
+            return None
+
+        # 处理空文件情况
+        if data.size == 0:
+            return None
+
+        # 处理只有一行数据（单个平面）的情况，确保是二维数组 (1, N)
+        if data.ndim == 1:
+            data = data[None, :]
+
+        # ------------------ 提取关键信息 ------------------
+        # Columns 2-4: Color (R, G, B) -> Indices 2, 3, 4
+        #plane_colors = data[:, 2:5].astype(np.uint8)
+
+        # Columns 5-7: Normal (nx, ny, nz) -> Indices 5, 6, 7
+        plane_normals = data[:, 5:8]
+
+        # Columns 8-10: Center (cx, cy, cz) -> Indices 8, 9, 10
+        plane_centers = data[:, 8:11]
+
+        # ------------------ 计算平面参数 ------------------
+        # 平面方程: ax + by + cz + d = 0
+        # 其中 (a, b, c) 是法向量 normal
+        # 由于中心点 (cx, cy, cz) 在平面上，代入方程：
+        # n . center + d = 0  =>  d = - (n . center)
+        plane_d = -np.sum(plane_normals * plane_centers, axis=1, keepdims=True)
+
+        # 组合成 (N, 4) 的数组，每行对应 [a, b, c, d]
+        plane_params = np.hstack([plane_normals, plane_d])
+
+        # 组织并返回数据字典
+        plane_info = {
+            "normals": plane_normals,  # (N, 3) float32
+            "centers": plane_centers,  # (N, 3) float32
+            "plane_equation": plane_params  # (N, 4) float32 [a,b,c,d]
+        }
+
+        return plane_info
 
     def __getitem__(self, idx):
         color_path = self.color_paths[idx]
@@ -303,8 +350,9 @@ class MonocularDataset(BaseDataset):
         if self.has_label:
             label_path = self.label_paths[idx]
             label_info = self.parse_label_from_file(label_path)
-
-        return image, depth, pose, label_info if self.has_label else None
+            plane_param_path = self.plane_params[idx]
+            plane_param_info = self.parse_plane_param_from_file(plane_param_path)
+        return image, depth, pose, label_info if self.has_label else None, plane_param_info if self.has_label else None
 
 
 class StereoDataset(BaseDataset):
@@ -432,6 +480,7 @@ class TUMDataset(MonocularDataset):
         self.depth_paths = parser.depth_paths
         self.poses = parser.poses
         self.label_paths = parser.label_paths if self.has_label else None
+        self.plane_params = parser.plane_params if self.has_label else None  # 存储平面参数文件路径
 
 
 class ReplicaDataset(MonocularDataset):
@@ -443,6 +492,7 @@ class ReplicaDataset(MonocularDataset):
         self.color_paths = parser.color_paths
         self.depth_paths = parser.depth_paths
         self.label_paths = parser.label_paths if self.has_label else None # 存储标签文件路径
+        self.plane_params = parser.plane_params if self.has_label else None # 存储平面参数文件路径
         self.poses = parser.poses
 
 

@@ -1,5 +1,5 @@
 import torch
-
+import numpy as np
 
 def image_gradient(image):
     # Compute image gradient using Scharr Filter
@@ -115,7 +115,6 @@ def get_loss_mapping_rgb(config, image, depth, viewpoint):
 def get_loss_mapping_rgbd(config, image, depth, viewpoint, initialization=False):
     alpha = config["Training"]["alpha"] if "alpha" in config["Training"] else 0.95
     rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
-
     gt_image = viewpoint.original_image.cuda()
 
     gt_depth = torch.from_numpy(viewpoint.depth).to(
@@ -128,6 +127,205 @@ def get_loss_mapping_rgbd(config, image, depth, viewpoint, initialization=False)
     l1_depth = torch.abs(depth * depth_pixel_mask - gt_depth * depth_pixel_mask)
 
     return alpha * l1_rgb.mean() + (1 - alpha) * l1_depth.mean()
+
+def prepare_plane_data(viewpoint):
+    # ------------准备数据，提取当前帧的平面参数和平面id----------------
+    # Ensure the viewpoint has the necessary custom data
+    if not hasattr(viewpoint, "plane_param_info") or not hasattr(viewpoint, "label_info"):
+        return torch.tensor(0.0, device="cuda")
+        # Extract info (assuming they might still be numpy arrays from the parsing functions)
+        # Move plane equations to GPU: [N, 4] -> (a, b, c, d)
+    plane_equations = viewpoint.plane_param_info["plane_equation"]
+    if isinstance(plane_equations, np.ndarray):
+        plane_equations = torch.from_numpy(plane_equations).float().cuda()
+
+    # Move label map to GPU: [H, W]
+    label_map = viewpoint.label_info["label_data"]
+    if isinstance(label_map, np.ndarray):
+        label_map = torch.from_numpy(label_map).long().cuda()
+
+    num_planes = viewpoint.label_info["num_planes"]
+    return plane_equations, label_map, num_planes
+
+
+def world2camera(viewpoint, points_world):
+    H, W = viewpoint.image_height, viewpoint.image_width
+    # In 3DGS, world_view_transform is typically stored transposed.
+    # P_cam = P_world @ R^T + t
+    # Or if using the matrix directly: P_cam = P_world @ world_view_transform
+    # We explicitly separate R and T for clarity matching standard math.
+    w2c = viewpoint.world_view_transform.transpose(0, 1)  # Transpose back to [4, 4] row-major standard
+    R = w2c[:3, :3]
+    T = w2c[:3, 3]
+    # Transform: (M, 3) @ (3, 3).T + (1, 3)
+    points_cam = points_world @ R.T + T.view(1, 3)
+
+    # 4. Frustum Culling (Remove points outside image)
+    # 4A. Depth Check (Keep points in front of camera)
+    valid_z_mask = (points_cam[:, 2] > 0.01) & (points_cam[:, 2] < 100.0)
+
+    if valid_z_mask.sum() == 0:
+        return torch.tensor(0.0, device="cuda")
+
+    points_cam_valid = points_cam[valid_z_mask]
+    # 4B. Projection to Pixel Coordinates
+    # Derive intrinsics from FOV if not explicitly stored
+    if hasattr(viewpoint, "fx"):
+        fx, fy = viewpoint.fx, viewpoint.fy
+        cx, cy = viewpoint.cx, viewpoint.cy
+    else:
+        fovx = viewpoint.FoVx
+        fovy = viewpoint.FoVy
+        fx = W / (2 * torch.tan(torch.tensor(fovx) * 0.5))
+        fy = H / (2 * torch.tan(torch.tensor(fovy) * 0.5))
+        cx = W / 2.0
+        cy = H / 2.0
+
+    x, y, z = points_cam_valid[:, 0], points_cam_valid[:, 1], points_cam_valid[:, 2]
+
+    # Project: u = fx * (x/z) + cx
+    u = (x / z * fx + cx).long()
+    v = (y / z * fy + cy).long()
+
+    # 4C. Screen Space Check
+    valid_pixel_mask = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+
+    if valid_pixel_mask.sum() == 0:
+        return torch.tensor(0.0, device="cuda")
+
+    # Filter points again based on screen bounds
+    u_valid = u[valid_pixel_mask]
+    v_valid = v[valid_pixel_mask]
+    points_final = points_cam_valid[valid_pixel_mask]
+
+    return points_final, u_valid, v_valid, valid_z_mask, valid_pixel_mask
+
+
+def get_loss_mapping_plane_constraint(gaussians, viewpoint, loss_type=None):
+    """
+        计算点到平面的几何约束 Loss (基于当前视锥投影，解决跨帧ID不连续问题)
+
+        Args:
+            gaussians: GaussianModel 对象
+            viewpoint: 当前视角的相机对象，需包含:
+                       - world_view_transform: W2C 矩阵 [4, 4] (通常是转置的)
+                       - projection_matrix: 投影矩阵 (用于获取FOV等，或直接使用 fx/fy)
+                       - plane_params: 当前帧的平面参数 Tensor [K, 4] (ax+by+cz+d=0)
+                       - plane_map: 当前帧的平面语义分割图 Tensor [H, W] (内容为 int 类型的 plane_id)
+            loss_type: 'l1' 或 'l2'
+    """
+
+    # 1. Check & Prepare Data: plane_equations: [N, 4], label_map: [H, W], num_planes: int
+    plane_equations, label_map, num_planes = prepare_plane_data(viewpoint)
+    # -----------------------------------------------------------
+    # [新增优化 1]: 筛选高质量高斯点 (Opacity Filtering)
+    # -----------------------------------------------------------
+    # 只约束比较"实"的点，忽略半透明的雾状点
+    opacity = gaussians.get_opacity
+    valid_opacity_mask = (opacity > 0.5).squeeze()
+
+    if valid_opacity_mask.sum() == 0:
+        return torch.tensor(0.0, device="cuda")
+
+    # 提取符合条件的点
+    points_world = gaussians.get_xyz[valid_opacity_mask]  # [M, 3]
+    # 2. Extract XYZ from World Space
+    #points_world = gaussians.get_xyz  # [M, 3]
+    # --- 显存优化: 随机采样 (VRAM Fix) ---
+    # 计算全部点的投影和索引极其消耗显存。采样 100k 点计算 Loss 已足够。
+    total_points = points_world.shape[0]
+    SAMPLE_SIZE = 100000
+    if total_points > SAMPLE_SIZE:
+        # 使用 randint 随机采样索引
+        indices = torch.randint(0, total_points, (SAMPLE_SIZE,), device="cuda")
+        points_world = points_world[indices]
+    # -----------------------------------
+    # 3. Transform World -> Camera Coordinate System -> Frustum Culling -> Projection to Pixel Coordinates
+    points_cam, u, v, valid_z_mask, valid_pixel_mask = world2camera(viewpoint, points_world)
+    # 4.Get Plane IDs and Parameters
+    # Sample the plane ID for each projected point from the label map
+    # Note: v corresponds to rows (height), u to columns (width)
+    sampled_plane_ids = label_map[v, u]  # [M_final]
+    is_plane_mask = (sampled_plane_ids < num_planes)
+
+    if is_plane_mask.sum() == 0:
+        return torch.tensor(0.0, device="cuda")
+
+    # Apply mask
+    final_plane_ids = sampled_plane_ids[is_plane_mask]
+    final_points = points_cam[is_plane_mask]
+
+    # Gather plane parameters: (a, b, c, d)
+    # plane_equations is [Num_Planes, 4]
+    target_plane_params = plane_equations[final_plane_ids]  # [K, 4]
+    # 5. Compute Plane Constraint Loss
+    # -----------------------------------------------------------
+    # Plane Equation: ax + by + cz + d = 0
+    # Your `parse_plane_param_from_file` returns normals (a,b,c) and d computed as -(n.center)
+    # So we want to minimize: | n . p + d |
+
+    # Extract normal (a,b,c) and d
+    n = target_plane_params[:, :3]
+    d = target_plane_params[:, 3]
+
+    # Compute dot product (n . p)
+    dot_prod = (final_points * n).sum(dim=1)
+
+    # Distance to plane
+    dist = dot_prod + d
+    # -----------------------------------------------------------
+    # [新增优化 2]: 深度一致性剔除 (Outlier Rejection)
+    # -----------------------------------------------------------
+    # 如果点到平面的距离本来就非常大(例如 > 10cm)，说明可能是误匹配(遮挡边界等)
+    # 强行拉扯会破坏结构。我们只优化那些"离平面不远"的点。
+    valid_dist_mask = torch.abs(dist) < 0.10  # 10cm 阈值
+    if valid_dist_mask.sum() == 0: return torch.tensor(0.0, device="cuda")
+
+    dist_filtered = dist[valid_dist_mask]
+
+    # ===========================================================
+    # [修改点]: 添加基于置信度的动态加权 (Confidence-based Weighting)
+    # ===========================================================
+
+    # 1. 计算每个点的基础 Loss (注意：必须使用 reduction='none' 以获得逐点 Loss)
+    #if loss_type == "l1":
+    #    per_point_loss = torch.abs(dist_filtered)
+    #elif loss_type == "l2":
+    #    per_point_loss = dist_filtered ** 2
+    #else:
+        # Huber loss 默认 reduction='mean'，这里必须改为 'none' 才能和权重相乘
+    #    per_point_loss = torch.nn.functional.huber_loss(
+    #        dist_filtered,
+    #        torch.zeros_like(dist_filtered),
+    #        delta=0.05,
+    #        reduction='none'  # <--- 关键修改
+    #    )
+
+    # 2. 计算置信度权重 (Gaussian Kernel)
+    # 逻辑：距离越小(dist -> 0)，权重越接近 1；距离越大(dist -> 10cm)，权重迅速衰减
+    # sigma 控制衰减速度，建议设为 0.05 (5cm)
+    #sigma = 0.05
+    #confidence_weight = torch.exp(- (dist_filtered ** 2) / (sigma ** 2))
+
+    # [可选] 停止梯度的传递给权重，防止网络试图通过移动点来增加权重（虽然在此场景下通常不需要，但更严谨）
+    #confidence_weight = confidence_weight.detach()
+
+    # 3. 计算加权后的 Loss
+    # 方式 A (Soft Constraint - 推荐): 简单的加权平均。
+    # 离得远的点不仅 Loss 大，但权重小，最终梯度会被抑制，不会强行拉扯。
+    #loss = (per_point_loss * confidence_weight).mean()
+    # -----------------------------------------------------------
+    # [新增优化 3]: 使用 Huber Loss
+    # -----------------------------------------------------------
+    if loss_type == "l1":
+        loss = torch.abs(dist_filtered).mean()
+    elif loss_type == "l2":
+        loss = (dist_filtered ** 2).mean()
+    else: # Huber (默认推荐)
+        # delta=0.01 (1cm): 小于1cm用L2平滑逼近，大于1cm用L1线性惩罚
+        loss = torch.nn.functional.huber_loss(dist_filtered, torch.zeros_like(dist_filtered), delta=0.01)
+
+    return loss #1.2667
 
 
 def get_median_depth(depth, opacity=None, mask=None, return_std=False):

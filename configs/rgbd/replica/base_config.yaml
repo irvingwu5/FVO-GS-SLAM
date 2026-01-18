@@ -61,6 +61,12 @@ Training:
     cam_rot_delta: 0.003
     cam_trans_delta: 0.001
 
+  plane_constraint:
+    use_plane_constraint: True
+    weight: 0.5
+    loss_type: "Huber"  # "l1" or "l2"
+    warmup_iter: 2500
+
 
 opt_params:
   iterations: 30000
