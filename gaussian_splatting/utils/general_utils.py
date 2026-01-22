@@ -178,3 +178,36 @@ def safe_state(silent):
     np.random.seed(0)
     torch.manual_seed(0)
     torch.cuda.set_device(torch.device("cuda:0"))
+
+
+def find_orthonormal_vectors_batch(n):
+    """
+    Given a batch of 3D normal vectors n (tensor of shape [B, 3]),
+    find two orthonormal vectors on the plane orthogonal to each n.
+    给定一批 3D 法向量 n（形状 [B,3]），为每个法向量构造两个与其正交且单位长度的向量，返回这两个向量（u1, u2），用于构建局部正交坐标系或切平面基
+    Parameters:
+    n (torch.Tensor): A batch of 3D normal vectors (shape: [B, 3])
+
+    Returns:
+    torch.Tensor, torch.Tensor: Two orthonormal vectors for each normal vector in the batch (shape: [B, 3] for each)
+    """
+    # Normalize the input normal vectors
+    n = n / torch.norm(n, dim=1, keepdim=True)
+
+    # Create a batch of random vectors that are not parallel to each normal vector
+    v1 = torch.zeros_like(n)
+
+    # If n is close to the z-axis (0, 0, 1), use [1, 0, 0] as the random vector, otherwise use [0, 0, 1]
+    mask = torch.abs(n[:, 0]) < 1e-6  # Check if x-component is close to zero
+    v1[mask] = torch.tensor([1.0, 0.0, 0.0])  # Use [1, 0, 0] when close to z-axis
+    v1[~mask] = torch.tensor([0.0, 0.0, 1.0])  # Otherwise, use [0, 0, 1]
+
+    # Compute the first orthogonal vector using the cross product
+    u1 = torch.cross(n, v1, dim=1)
+    u1 = u1 / torch.norm(u1, dim=1, keepdim=True)
+
+    # Compute the second orthogonal vector as the cross product of n and u1
+    u2 = torch.cross(n, u1, dim=1)
+    u2 = u2 / torch.norm(u2, dim=1, keepdim=True)
+
+    return u1, u2

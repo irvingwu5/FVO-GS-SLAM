@@ -25,11 +25,12 @@ from gaussian_splatting.utils.general_utils import (
     helper,
     inverse_sigmoid,
     strip_symmetric,
+    find_orthonormal_vectors_batch,
 )
 from gaussian_splatting.utils.graphics_utils import BasicPointCloud, getWorld2View2
 from gaussian_splatting.utils.sh_utils import RGB2SH
 from gaussian_splatting.utils.system_utils import mkdir_p
-
+from pytorch3d import transforms
 
 class GaussianModel:
     def __init__(self, sh_degree: int, config=None):
@@ -44,7 +45,6 @@ class GaussianModel:
         self._rotation = torch.empty(0, device="cuda") # 高斯旋转(四元数) (高斯数量,4)
         self._opacity = torch.empty(0, device="cuda") # 高斯不透明度  (高斯数量,1)
         # 不参与优化的辅助变量
-        self._pxl_plane_id = torch.empty(0, device="cuda")
         self.max_radii2D = torch.empty(0, device="cuda") # 高斯投影后的最大半径(通过计算2D协方差矩阵的特征值，取其最大值的平方根，再乘以3并向上取整得到的) (高斯数量,)
         self.xyz_gradient_accum = torch.empty(0, device="cuda") # 高斯位置(均值)的累积梯度 (高斯数量,1)
         #这两个变量用于追踪高斯点的来源（哪个关键帧）和稳定性（被观测了多少次），主要用于增量式建图场景。
@@ -69,14 +69,18 @@ class GaussianModel:
         self.ply_input = None
 
         self.isotropic = False
-
+    #这个矩阵定义了每个2DGS从局部切空间（Local Tangent Space）到世界空间（World Space）的变换,这通常用于光线追踪或光栅化器中，计算光线与2D平面的求交。
     def build_covariance_from_scaling_rotation( # 缩放矩阵,用于调整缩放矩阵的大小,四元数
-        self, scaling, scaling_modifier, rotation
+        self, center, scaling, scaling_modifier, rotation
     ):
-        L = build_scaling_rotation(scaling_modifier * scaling, rotation) # S,q->R，L=RS，scaling_modifier用于调整缩放矩阵的大小
-        actual_covariance = L @ L.transpose(1, 2) # sigma=L*L^T=(RS)(RS)^T=RSS^TR^T
-        symm = strip_symmetric(actual_covariance) # 协方差矩阵sigma属于对称矩阵，只需存储一半即可
-        return symm
+        RS = build_scaling_rotation(torch.cat([scaling * scaling_modifier, torch.ones_like(scaling)], dim=-1),
+            rotation,
+        ).permute(0,2,1) # S,q->R，L=RS，scaling_modifier用于调整缩放矩阵的大小
+        trans = torch.zeros((center.shape[0], 4, 4), dtype=torch.float, device="cuda")
+        trans[:, :3, :3] = RS
+        trans[:, 3, :3] = center
+        trans[:, 3, 3] = 1
+        return trans
 
     # @property 装饰器将 get_scaling 方法伪装成属性，外部只能通过该接口获取缩放值（model.get_scaling）
     # 而无法直接访问 _scaling# @property 装饰器将 get_scaling 方法伪装成属性，
@@ -103,13 +107,9 @@ class GaussianModel:
     def get_opacity(self):
         return self.opacity_activation(self._opacity) # 不透明度
 
-    @property
-    def get_px_plane_id(self):
-        return self._pxl_plane_id
-
     def get_covariance(self, scaling_modifier=1): # 根据缩放矩阵和四元数获取协方差矩阵
         return self.covariance_activation(
-            self.get_scaling, scaling_modifier, self._rotation
+            self.get_xyz, self.get_scaling, scaling_modifier, self._rotation
         )
 
     def oneupSHdegree(self):
@@ -159,7 +159,8 @@ class GaussianModel:
             convert_rgb_to_intensity=False,
         )
 
-        W2C = getWorld2View2(cam.R, cam.T).cpu().numpy()
+        W2C = cam.T.cpu().numpy()
+
         pcd_tmp = o3d.geometry.PointCloud.create_from_rgbd_image(
             rgbd,
             o3d.camera.PinholeCameraIntrinsic(
@@ -173,6 +174,17 @@ class GaussianModel:
             extrinsic=W2C,
             project_valid_depth_only=True,
         )
+        #这里的核心是将相机坐标系下的法向量 (normal_raw) 转换到世界坐标系 (normal_global)，以便与点云 (_xyz) 在同一坐标系下。
+        if cam.normal_raw is not None: #把相机坐标系下的法线变换到全局（世界）坐标系并赋给点云。
+            valid_normal = cam.normal_raw[cam.depth > 0]
+            valid_normal[np.abs(valid_normal) < 1e-9] = 1e-9
+            normal_global = (
+                    cam.T[0:3, 0:3].cpu().numpy().T @ valid_normal.transpose()
+            ).transpose()
+            pcd_tmp.normals = o3d.utility.Vector3dVector(
+                normal_global.astype(np.float32)
+            )
+
         pcd_tmp = pcd_tmp.random_down_sample(1.0 / downsample_factor)
         new_xyz = np.asarray(pcd_tmp.points)
         new_rgb = np.asarray(pcd_tmp.colors)
@@ -199,14 +211,24 @@ class GaussianModel:
             )
             * point_size
         )
-        scales = torch.log(torch.sqrt(dist2))[..., None] # 先对距离平方取平方根得到距离，然后取对数得到缩放值
+        scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1,2) # 先对距离平方取平方根得到距离，然后取对数得到缩放值
         # Isotropic (各向同性)：意味着高斯体在 X, Y, Z 所有方向上的性质（缩放比例）是相同的。在几何上，这代表一个标准的 球体 (Sphere)。
         # Anisotropic (各向异性)：意味着不同方向的缩放比例可以不同。在几何上，这代表一个 椭球体 (Ellipsoid)。
-        if not self.isotropic:
-            scales = scales.repeat(1, 3)
+        # if not self.isotropic:
+        #     scales = scales.repeat(1, 3)
 
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda") # 存储每个点的四元数表示
         rots[:, 0] = 1 # 将每个四元数的第一个元素设置为 1，其他元素保持为 0。这相当于将所有四元数初始化为单位四元数 [1, 0, 0, 0]，表示没有旋转
+        #rots = torch.rand((fused_point_cloud.shape[0], 4), device="cuda") # 2dgs原代码随机初始化四元数
+        #normals_tmp 是目标法向量 $n$。函数 find_orthonormal_vectors_batch 会通过数学方法（通常是取与非共线向量的叉积）找到两个向量 $u_1, u_2$，使得 $u_1 \perp u_2 \perp n$，构成一个局部正交坐标系（切空间）。
+        normals_tmp = torch.from_numpy(np.asarray(pcd_tmp.normals)).float()
+        u1, u2 = find_orthonormal_vectors_batch(normals_tmp) #2D 高斯被定义为局部切平面上的圆盘（XY 平面），其局部 Z 轴对应于表面的法向量。为了将这个圆盘旋转到正确的朝向，代码需要构建一个旋转矩阵。
+        #将这三个轴组装成旋转矩阵，并转换为四元数存储
+        # 构建旋转矩阵 R = [u1, u2, n]
+        # 第1列是局部X，第2列是局部Y，第3列是局部Z（即法向量）
+        R = torch.stack([u1, u2, normals_tmp], dim=2) # (N,3,3)
+        rots = transforms.matrix_to_quaternion(R).cuda() # 将旋转矩阵转换为四元数表示(N,4)
+
         # 生成的张量的每个元素都为0.1经过逆sigmoid变换得到真实不透明度 [0,1]->inv_sig->[-inf,inf]
         opacities = inverse_sigmoid(
             0.5
@@ -214,7 +236,7 @@ class GaussianModel:
                 (fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"
             )
         )
-
+        #(N,3)、(N,3,1)、(N,2)、(N,4)、(N,1)
         return fused_point_cloud, features, scales, rots, opacities
 
     def init_lr(self, spatial_lr_scale):
@@ -636,8 +658,11 @@ class GaussianModel:
         # 通过生成符合正态分布的样本，可以确保新生成的高斯点在空间上分布合理，并且与原有高斯点的分布特性一致
         # 这样可以在保持原有高斯点分布特性的基础上，增加高斯点的数量，从而提高模型的精度和表现
         # 为后续的高斯点密化过程准备缩放值。通过重复缩放值，可以生成多个新的高斯点，这些点将用于克隆或分裂现有的高斯点
-        stds = self.get_scaling[selected_pts_mask].repeat(N, 1) # (242,3)->(484,3)直接在242尾部复制了一份，选择满足条件的高斯点的缩放值，将选中的缩放值沿第一个维度重复N次(分裂个数N)，生成一个新的张量stds(xyz三个方向标准差)
-        means = torch.zeros((stds.size(0), 3), device="cuda") # (484,3)高斯位置(零均值)
+        # stds = self.get_scaling[selected_pts_mask].repeat(N, 1) # (242,3)->(484,3)直接在242尾部复制了一份，选择满足条件的高斯点的缩放值，将选中的缩放值沿第一个维度重复N次(分裂个数N)，生成一个新的张量stds(xyz三个方向标准差)
+        # means = torch.zeros((stds.size(0), 3), device="cuda") # (484,3)高斯位置(零均值)
+        stds = self.get_scaling[selected_pts_mask].repeat(N, 1)
+        stds = torch.cat([stds, 0 * torch.ones_like(stds[:, :1])], dim=-1)
+        means = torch.zeros_like(stds)
         samples = torch.normal(mean=means, std=stds) # 根据提供的均值和标准差生成一个与 means 和 stds 形状相同服从正态分布的张量 (x,3)
         rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N, 1, 1) # 四元数转旋转矩阵，对生成的旋转矩阵进行重复操作。N 表示重复的次数，1,1 表示在后两个维度上不进行重复。这样可以生成一个形状为 (N * 选定高斯点数量, 3, 3) 的张量
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[
@@ -734,6 +759,7 @@ class GaussianModel:
             )# 进行逻辑或操作，更新剪枝掩码prune_mask，标记出所有需要剪枝的高斯点
         self.prune_points(prune_mask) # 移除那些不透明度小于min_opacity的高斯点，以及那些2D高斯半径大于max_screen_size或3D高斯缩放值大于场景范围10%的高斯点
 
+        #torch.cuda.empty_cache() #-----------------2dgs中有这一句-----------------------
     # 所有高斯点的张量、半径大于0的高斯点的索引
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(

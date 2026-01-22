@@ -10,7 +10,7 @@ from gaussian_splatting.utils.loss_utils import l1_loss, ssim
 from utils.logging_utils import Log
 from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
-from utils.slam_utils import get_loss_mapping,get_loss_mapping_plane_constraint
+from utils.slam_utils import get_loss_mapping,get_loss_mapping_plane_constraint,get_depth_dist_loss,get_normal_consistency_loss,_save_normal_pair, _save_rendered_rgb
 
 # 它主要负责全局地图构建（Mapping）和光束法平差（Bundle Adjustment）
 # BackEnd 的核心设计模式是维护全局一致性。前端只关心“当前在哪里”，而后端关心“整个地图长什么样以及历史轨迹是否准确”。
@@ -38,6 +38,10 @@ class BackEnd(mp.Process):
         self.current_window = []
         self.initialized = not self.monocular
         self.keyframe_optimizers = None
+
+        self.use_normal = config["Training"]["sagsslam"]["use_normal"]
+        self.use_dist = config["Training"]["sagsslam"]["use_dist"]
+        self.use_plane_constraint = config["Training"]["sagsslam"]["use_plane_constraint"]
 
     def set_hyperparams(self):
         self.save_results = self.config["Results"]["save_results"]
@@ -114,24 +118,10 @@ class BackEnd(mp.Process):
                 render_pkg["opacity"],
                 render_pkg["n_touched"],
             )
+            #_save_normal_pair(render_pkg, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/runtime_results/")
             loss_init = get_loss_mapping(
                 self.config, image, depth, viewpoint, opacity, initialization=True
-            ) #0.4688
-            if self.config["Training"]["plane_constraint"]["use_plane_constraint"]:
-                lambda_plane = self.config["Training"]["plane_constraint"]["weight"]
-                loss_type = self.config["Training"]["plane_constraint"]["loss_type"]
-                warmup_iter = self.config["Training"]["plane_constraint"]["warmup_iter"]
-
-                if self.iteration_count > warmup_iter: #如果 warmup_iter = 2500，且 init_itr_num = 1050，那么在初始化阶段平面约束永远不会触发。
-                    actual_lambda_plane = 0
-                else:
-                    actual_lambda_plane = lambda_plane
-                if actual_lambda_plane > 0:
-                    loss_plane_constraint = get_loss_mapping_plane_constraint(
-                        self.gaussians, viewpoint, loss_type
-                    )
-                    loss_init += actual_lambda_plane * loss_plane_constraint
-
+            ) #0.4255
             loss_init.backward()
 
             with torch.no_grad():
@@ -184,7 +174,7 @@ class BackEnd(mp.Process):
                 continue
             random_viewpoint_stack.append(viewpoint)
 
-        for _ in range(iters):
+        for itr in range(iters):
             self.iteration_count += 1
             self.last_sent += 1
 
@@ -193,14 +183,13 @@ class BackEnd(mp.Process):
             visibility_filter_acm = []
             radii_acm = []
             n_touched_acm = []
-
             keyframes_opt = []
             # 对多帧渲染计算联合损失，对当前滑动窗口内的关键帧进行优化
             for cam_idx in range(len(current_window)):
                 viewpoint = viewpoint_stack[cam_idx]
                 keyframes_opt.append(viewpoint)
                 render_pkg = render(
-                    viewpoint, self.gaussians, self.pipeline_params, self.background
+                    viewpoint, self.gaussians, self.pipeline_params, self.background,surf=True
                 )
                 (
                     image,
@@ -219,28 +208,34 @@ class BackEnd(mp.Process):
                     render_pkg["opacity"],
                     render_pkg["n_touched"],
                 )
-
+                #_save_normal_pair(render_pkg, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/runtime_results/", cam_idx)
+                #_save_rendered_rgb(render_pkg, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/runtime_results/", cam_idx)
                 loss_mapping += get_loss_mapping(
                     self.config, image, depth, viewpoint, opacity
-                )
+                ) #0.0202
+                #-----------------------------------------------
+                if self.use_normal:
+                    rend_normal = render_pkg["rend_normal"]
+                    surf_normal = render_pkg["surf_normal"]
+                    normal_error = (1 - (rend_normal * (-surf_normal).detach()).sum(dim=0))[None]
+                    normal_loss = self.config["opt_params"]["lambda_normal"] * normal_error.mean()
+                    loss_mapping += normal_loss
+
+                # 如果启用了 use_dist
+                # 2DGS SLAM 对几何非常敏感，Distortion Loss 主要是为了压实表面。如果你的 Raw Loss 一直非常小（比如 1e-6 级别），
+                # 说明你的高斯在光线方向上已经很“薄”了，甚至可能不需要太强的 Distortion Loss，此时该损失的意义主要在于防止未来产生新的浮空垃圾
+                if self.use_dist:
+                    # 你的 __init__.py 已经返回了 "rend_dist"
+                    rend_dist = render_pkg["rend_dist"]
+                    # 建议权重在 0.001 ~ 0.01 之间
+                    loss_mapping += self.config["opt_params"][
+                                        "lambda_dist"] * rend_dist.mean()  # 500*6.3175e-06=3.1587e-07
+                #--------------------------------------------------
                 viewspace_point_tensor_acm.append(viewspace_point_tensor)
                 visibility_filter_acm.append(visibility_filter)
                 radii_acm.append(radii)
                 n_touched_acm.append(n_touched)
-                if self.config["Training"]["plane_constraint"]["use_plane_constraint"]:
-                    lambda_plane = self.config["Training"]["plane_constraint"]["weight"]
-                    loss_type = self.config["Training"]["plane_constraint"]["loss_type"]
-                    warmup_iter = self.config["Training"]["plane_constraint"]["warmup_iter"]
-                    if self.iteration_count > warmup_iter:
-                        actual_lambda_plane = 0
-                    else:
-                        actual_lambda_plane = lambda_plane
-                    # 只有权重 > 0 时才计算，节省算力
-                    if actual_lambda_plane > 0:
-                        loss_plane_constraint = get_loss_mapping_plane_constraint(
-                            self.gaussians, viewpoint, loss_type
-                        )
-                        loss_mapping += actual_lambda_plane * loss_plane_constraint
+
             # 随机选取的历史关键帧进行迭代优化
             for cam_idx in torch.randperm(len(random_viewpoint_stack))[:2]:
                 viewpoint = random_viewpoint_stack[cam_idx]
@@ -270,25 +265,39 @@ class BackEnd(mp.Process):
                 viewspace_point_tensor_acm.append(viewspace_point_tensor)
                 visibility_filter_acm.append(visibility_filter)
                 radii_acm.append(radii)
-                # [修改点] 历史帧也要应用同样的 Warm-up 策略
-                if self.config["Training"]["plane_constraint"]["use_plane_constraint"]:
-                    lambda_plane = self.config["Training"]["plane_constraint"]["weight"]
-                    loss_type = self.config["Training"]["plane_constraint"]["loss_type"]
-                    warmup_iter = self.config["Training"]["plane_constraint"]["warmup_iter"]
 
-                    if self.iteration_count > warmup_iter:
-                        actual_lambda_plane = 0.0
-                    else:
-                        actual_lambda_plane = lambda_plane
+            # [修改点] 历史帧也要应用同样的 Warm-up 策略
+            # if self.use_plane_constraint:
+            #     lambda_plane = self.config["Training"]["sagsslam"]["weight"]
+            #     loss_type = self.config["Training"]["sagsslam"]["loss_type"]
+            #     warmup_iter = self.config["Training"]["sagsslam"]["warmup_iter"]
+            #
+            #     if self.iteration_count < warmup_iter:
+            #         actual_lambda_plane = 0.0
+            #     else:
+            #         actual_lambda_plane = lambda_plane
+            #
+            #     if actual_lambda_plane > 0:
+            #         loss_mapping += actual_lambda_plane * get_loss_mapping_plane_constraint(
+            #             self.gaussians, viewpoint, loss_type
+            #         )
 
-                    if actual_lambda_plane > 0:
-                        loss_mapping += actual_lambda_plane * get_loss_mapping_plane_constraint(
-                            self.gaussians, viewpoint, loss_type
-                        )
+            # if self.use_normal:
+            #     rend_normal = render_pkg["rend_normal"]
+            #     surf_normal = render_pkg["surf_normal"]
+            #     normal_error =(1 - (rend_normal * (-surf_normal).detach()).sum(dim=0))[None]
+            #     normal_loss = self.config["opt_params"]["lambda_normal"] * normal_error.mean()
+            #     loss_mapping += normal_loss
+            #
+            # # 如果启用了 use_dist
+            # #2DGS SLAM 对几何非常敏感，Distortion Loss 主要是为了压实表面。如果你的 Raw Loss 一直非常小（比如 1e-6 级别），
+            # # 说明你的高斯在光线方向上已经很“薄”了，甚至可能不需要太强的 Distortion Loss，此时该损失的意义主要在于防止未来产生新的浮空垃圾
+            # if self.use_dist:
+            #     # 你的 __init__.py 已经返回了 "rend_dist"
+            #     rend_dist = render_pkg["rend_dist"]
+            #     # 建议权重在 0.001 ~ 0.01 之间
+            #     loss_mapping += self.config["opt_params"]["lambda_dist"] * rend_dist.mean() #500*6.3175e-06=3.1587e-07
 
-            scaling = self.gaussians.get_scaling
-            isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
-            loss_mapping += 10 * isotropic_loss.mean()
             loss_mapping.backward()
             gaussian_split = False
             ## Deinsifying / Pruning Gaussians高斯密度自适应控制模块
@@ -397,19 +406,41 @@ class BackEnd(mp.Process):
             )
             viewpoint_cam = self.viewpoints[viewpoint_cam_idx]
             render_pkg = render(
-                viewpoint_cam, self.gaussians, self.pipeline_params, self.background
+                viewpoint_cam, self.gaussians, self.pipeline_params, self.background, surf=True
             )
-            image, visibility_filter, radii = (
+            image, viewspace_point_tensor, visibility_filter, radii, depth, opacity, n_touched = (
                 render_pkg["render"],
+                render_pkg["viewspace_points"],
                 render_pkg["visibility_filter"],
                 render_pkg["radii"],
+                render_pkg["depth"],
+                render_pkg["opacity"],
+                render_pkg["n_touched"],
             )
 
             gt_image = viewpoint_cam.original_image.cuda()
             Ll1 = l1_loss(image, gt_image)
-            loss = (1.0 - self.opt_params.lambda_dssim) * (
-                Ll1
-            ) + self.opt_params.lambda_dssim * (1.0 - ssim(image, gt_image))
+            #------------------------
+            gt_depth = viewpoint_cam.gt_depth
+            gt_depth_mask = gt_depth > 0.0
+            Ll1_depth = l1_loss(depth * gt_depth_mask, gt_depth * gt_depth_mask)
+            #------------------------
+            # scaling = self.gaussians.get_scaling
+            # isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
+            #------------------------
+            # loss = (1.0 - self.opt_params.lambda_dssim) * (
+            #     Ll1
+            # ) + self.opt_params.lambda_dssim * (1.0 - ssim(image, gt_image))
+            #loss = Ll1 + 0.1 * isotropic_loss.mean() + 0.01 * Ll1_depth
+            loss = Ll1 + 0.01 * Ll1_depth
+            #------------------------
+            if self.use_normal:
+                rend_normal = render_pkg["rend_normal"]
+                surf_normal = render_pkg["surf_normal"]
+                normal_error =(1 - (rend_normal * (-surf_normal)).sum(dim=0))[None]
+                normal_loss = 0.005 * normal_error.mean()
+                loss += normal_loss
+            #------------------------
             loss.backward()
             with torch.no_grad():
                 self.gaussians.max_radii2D[visibility_filter] = torch.max(
@@ -433,7 +464,8 @@ class BackEnd(mp.Process):
         keyframes = []
         for kf_idx in self.current_window:
             kf = self.viewpoints[kf_idx]
-            keyframes.append((kf_idx, kf.R.clone(), kf.T.clone()))
+            # keyframes.append((kf_idx, kf.R.clone(), kf.T.clone()))
+            keyframes.append((kf_idx, kf.T.clone()))
         if tag is None:
             tag = "sync_backend"
 

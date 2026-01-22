@@ -16,7 +16,7 @@ Dataset:
   pcd_downsample_init: 32
   adaptive_pointsize: True
   point_size: 0.01
-  use_label: True
+  use_label: False
 
 Training:
   #Initialization
@@ -33,8 +33,8 @@ Training:
   gaussian_th: 0.7
   gaussian_extent: 1.0
   gaussian_reset: 2001
-  size_threshold: 20
-  kf_interval: 5
+  size_threshold: 20 #20->80
+  kf_interval: 5 #5->10
   window_size: 8
   pose_window: 3
   edge_threshold: 1.1
@@ -42,7 +42,7 @@ Training:
   alpha: 0.9
   kf_translation: 0.08
   kf_min_translation: 0.05
-  kf_overlap: 0.9
+  kf_overlap: 0.9 #0.9->0.6
   kf_cutoff: 0.3
   prune_mode: 'slam'
   single_thread: False
@@ -50,7 +50,13 @@ Training:
   lr:
     cam_rot_delta: 0.003
     cam_trans_delta: 0.001
-
+    normal_loss: 0.001
+  use_normal: True
+  plane_constraint:
+    use_plane_constraint: False
+    weight: 0.5
+    loss_type: "Huber"  # "l1" or "l2"
+    warmup_iter: 2500
 
 
 ## 3DGS default parameters
@@ -66,11 +72,13 @@ opt_params:
   rotation_lr: 0.001
   percent_dense: 0.01
   lambda_dssim: 0.2
+  lambda_dist: 1000 #depth distortion loss weight
+  lambda_normal: 0.005 #normal consistency loss weight
   densification_interval: 100
   opacity_reset_interval: 3000
   densify_from_iter: 500
   densify_until_iter: 15000
-  densify_grad_threshold: 0.0002
+  densify_grad_threshold: 0.0002 #0.0002->0.0008
 
 model_params:
   sh_degree: 0
@@ -83,4 +91,8 @@ model_params:
 pipeline_params:
   convert_SHs_python: False
   compute_cov3D_python: False
-  depth_ratio: 0.0
+  depth_ratio: 1.0
+  # psedo surface attributes
+  # surf depth is either median or expected by setting depth_ratio to 1 or 0
+  # for bounded scene, use median depth, i.e., depth_ratio = 1;
+  # for unbounded scene, use expected depth, i.e., depth_ration = 0, to reduce disk anliasing.

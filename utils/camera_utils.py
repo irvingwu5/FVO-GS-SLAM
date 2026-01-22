@@ -3,7 +3,8 @@ from torch import nn
 
 from gaussian_splatting.utils.graphics_utils import getProjectionMatrix2, getWorld2View2
 from utils.slam_utils import image_gradient, image_gradient_mask
-
+import torch.nn.functional as F
+from utils.normal_utils import intrins_to_intrins_inv, get_cam_coords, d2n_tblr
 
 class Camera(nn.Module):
     def __init__(
@@ -23,17 +24,20 @@ class Camera(nn.Module):
         image_width,
         device="cuda:0",
         label_info=None,
-        plane_param_info=None
+        plane_param_info=None,
     ):
         super(Camera, self).__init__()
         self.uid = uid
         self.device = device
 
-        T = torch.eye(4, device=device)
-        self.R = T[:3, :3]
-        self.T = T[:3, 3]
-        self.R_gt = gt_T[:3, :3]
-        self.T_gt = gt_T[:3, 3]
+        # T = torch.eye(4, device=device)
+        # self.R = T[:3, :3]
+        # self.T = T[:3, 3]
+        # self.R_gt = gt_T[:3, :3]
+        # self.T_gt = gt_T[:3, 3]
+        self.T = torch.eye(4, device=device).to(torch.float32)
+        self.T_gt = gt_T.to(device=device).to(torch.float32).clone() #4*4 matrix
+
 
         self.original_image = color
         self.depth = depth
@@ -65,6 +69,10 @@ class Camera(nn.Module):
         )
 
         self.projection_matrix = projection_matrix.to(device=device)
+
+        intrins = torch.tensor([[fx, 0, cx], [0, fy, cy], [0, 0, 1.0]])
+        self.intrins_inv = intrins_to_intrins_inv(intrins).float().unsqueeze(0).to(0)
+
     #Tensor(3,H,W)、ndarray(H,W)、Tensor(4,4)、dict:3{num_planes int,label_data(ndarray(H,W)),nonplanepxl_mask(ndarray(H,W))},plane_param_info dict:3{plane_normals ndarray(num_planes,3),plane_center ndarray(num_planes,3), plane_equations ndarray(num_planes,4)}
     @staticmethod
     def init_from_dataset(dataset, idx, projection_matrix):
@@ -85,7 +93,7 @@ class Camera(nn.Module):
             dataset.width,
             device=dataset.device,
             label_info=label_info,
-            plane_param_info=plane_param_info
+            plane_param_info=plane_param_info,
         )
 
     @staticmethod
@@ -99,7 +107,8 @@ class Camera(nn.Module):
 
     @property
     def world_view_transform(self):
-        return getWorld2View2(self.R, self.T).transpose(0, 1)
+        # return getWorld2View2(self.R, self.T).transpose(0, 1)
+        return self.T.transpose(0, 1).to(device=self.device)
 
     @property
     def full_proj_transform(self):
@@ -111,11 +120,12 @@ class Camera(nn.Module):
 
     @property
     def camera_center(self):
-        return self.world_view_transform.inverse()[3, :3]
+        #return self.world_view_transform.inverse()[3, :3]
+        return self.world_view_transform # TODO: Need to invert for high order SHs by inverse_t(self.world_view_transform).
 
-    def update_RT(self, R, t):
-        self.R = R.to(device=self.device) #接收新的旋转矩阵 R 和平移向量 t，并将它们更新到当前相机对象的属性中。
-        self.T = t.to(device=self.device)
+    # def update_RT(self, R, t):
+    #     self.R = R.to(device=self.device) #接收新的旋转矩阵 R 和平移向量 t，并将它们更新到当前相机对象的属性中。
+    #     self.T = t.to(device=self.device)
     # 该梯度掩码在计算仅基于 RGB 颜色 的相机跟踪（Tracking）损失时使用
     # #该函数生成了一个二值掩码 self.grad_mask，掩码中的 True (或 1) 表示该像素点位于边缘或纹理区域，
     # 将被用于后续的 Tracking 损失计算，忽略平坦区域以提高计算效率和稳定性
@@ -130,25 +140,62 @@ class Camera(nn.Module):
         img_grad_intensity = torch.sqrt(gray_grad_v**2 + gray_grad_h**2) #主要目的是计算当前相机图像的梯度强度图（Gradient Intensity Map）。这通常用于识别图像中的边缘或纹理丰富区域，这些区域在 SLAM 跟踪或计算光度误差时往往更重要。
 
         if config["Dataset"]["type"] == "replica":
-            row, col = 32, 32 # 将图像划分为32x32个小块
+            # row, col = 32, 32 # 将图像划分为32x32个小块
+            size = 32
             multiplier = edge_threshold
             _, h, w = self.original_image.shape
-            for r in range(row): #遍历每个图像块
-                for c in range(col):
-                    block = img_grad_intensity[
-                        :,
-                        r * int(h / row) : (r + 1) * int(h / row),
-                        c * int(w / col) : (c + 1) * int(w / col),
-                    ]
-                    th_median = block.median() #计算该块内梯度强度的中位数
-                    block[block > (th_median * multiplier)] = 1 #大于该阈值的像素置为 1，否则置为 0
-                    block[block <= (th_median * multiplier)] = 0
-            self.grad_mask = img_grad_intensity #这种局部自适应方法能更好地处理光照不均匀或纹理分布不均的情况，确保在图像的各个区域都能提取到相对显著的特征点
+            I = img_grad_intensity.unsqueeze(0)
+            I_unf = F.unfold(I, size, stride=size)
+            median_patch, _ = torch.median(I_unf, dim=1, keepdim=True)
+            mask = (I_unf > (median_patch * multiplier)).float()
+            I_f = F.fold(mask, I.shape[-2:], size, stride=size).squeeze(0)
+            self.grad_mask = I_f
+            # for r in range(row): #遍历每个图像块
+            #     for c in range(col):
+            #         block = img_grad_intensity[
+            #             :,
+            #             r * int(h / row) : (r + 1) * int(h / row),
+            #             c * int(w / col) : (c + 1) * int(w / col),
+            #         ]
+            #         th_median = block.median() #计算该块内梯度强度的中位数
+            #         block[block > (th_median * multiplier)] = 1 #大于该阈值的像素置为 1，否则置为 0
+            #         block[block <= (th_median * multiplier)] = 0
+            # self.grad_mask = img_grad_intensity #这种局部自适应方法能更好地处理光照不均匀或纹理分布不均的情况，确保在图像的各个区域都能提取到相对显著的特征点
         else: #全局阈值法，适用于纹理分布较均匀的图像
             median_img_grad_intensity = img_grad_intensity.median()
             self.grad_mask = (
                 img_grad_intensity > median_img_grad_intensity * edge_threshold
             ) #只有梯度强度显著高于全局中位数的像素点（即边缘或纹理丰富点）会被保留（标记为 True），平坦区域会被过滤掉。该掩码随后用于相机追踪时的损失计算
+
+        gt_image = self.original_image.cuda()
+        _, h, w = self.original_image.cuda().shape
+        mask_shape = (1, h, w)
+        rgb_boundary_threshold = 0.05
+        rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(
+            *mask_shape
+        )
+        self.rgb_pixel_mask = rgb_pixel_mask * self.grad_mask
+
+        self.rgb_pixel_mask = rgb_pixel_mask
+        self.rgb_pixel_mask_mapping = rgb_pixel_mask
+
+        if self.depth is not None:
+            self.gt_depth = torch.from_numpy(self.depth).to(
+                dtype=torch.float32, device=self.device
+            )[None]
+
+            depth = self.gt_depth.unsqueeze(0)
+            points = get_cam_coords(self.intrins_inv, depth)
+            normal, valid_mask = d2n_tblr(points, d_min=1e-3, d_max=1000.0)
+            normal = normal * valid_mask
+            self.normal = normal
+            self.normal_raw = self.normal.squeeze(0).permute(1, 2, 0).cpu().numpy() #相机坐标系下的法向量
+            self.mask = valid_mask
+
+        if self.mask is not None:
+            self.rgb_pixel_mask = self.rgb_pixel_mask * self.mask
+            self.rgb_pixel_mask_mapping = self.rgb_pixel_mask_mapping
+
 
     def clean(self):
         self.original_image = None
@@ -160,3 +207,21 @@ class Camera(nn.Module):
 
         self.exposure_a = None
         self.exposure_b = None
+
+        self.rgb_pixel_mask = None
+        self.rgb_pixel_mask_mapping = None
+        self.gt_depth = None
+        self.normal = None
+        self.normal_raw = None
+
+
+class CameraMsg:
+    def __init__(self, Camera=None, uid=None, T=None, T_gt=None):
+        if Camera is not None:
+            self.uid = Camera.uid
+            self.T = Camera.T
+            self.T_gt = Camera.T_gt
+        else:
+            self.uid = uid
+            self.T = T
+            self.T_gt = T_gt

@@ -129,7 +129,8 @@ class FrontEnd(mp.Process):
             self.backend_queue.get()
 
         # Initialise the frame at the ground truth pose 将当前相机的位姿（R 和 T）强制更新为上述的真值
-        viewpoint.update_RT(viewpoint.R_gt, viewpoint.T_gt) #系统在初始化第一帧时，并不进行位姿估计，而是直接读取数据集提供的真实位姿
+        #viewpoint.update_RT(viewpoint.R_gt, viewpoint.T_gt) #系统在初始化第一帧时，并不进行位姿估计，而是直接读取数据集提供的真实位姿
+        viewpoint.T = viewpoint.T_gt
 
         self.kf_indices = []
         depth_map = self.add_new_keyframe(cur_frame_idx, init=True) #生成初始深度图（忽略无效区域）
@@ -143,7 +144,8 @@ class FrontEnd(mp.Process):
     '''
     def tracking(self, cur_frame_idx, viewpoint):
         prev = self.cameras[cur_frame_idx - self.use_every_n_frames] # 上一帧位姿
-        viewpoint.update_RT(prev.R, prev.T) # 以上一帧位姿初始化当前帧位姿
+        #viewpoint.update_RT(prev.R, prev.T) # 以上一帧位姿初始化当前帧位姿
+        viewpoint.T = prev.T
         # 优化参数与优化器构建
         opt_params = []
         opt_params.append(
@@ -232,8 +234,10 @@ class FrontEnd(mp.Process):
         curr_frame = self.cameras[cur_frame_idx] # 当前帧对象
         last_kf = self.cameras[last_keyframe_idx] # 上一个关键帧对象
         #计算相对位移（几何距离判断）这部分计算当前帧相对于上一关键帧移动了多少距离
-        pose_CW = getWorld2View2(curr_frame.R, curr_frame.T) # 当前帧的世界到相机变换矩阵 (World to Camera)
-        last_kf_CW = getWorld2View2(last_kf.R, last_kf.T) # 上一关键帧的世界到相机变换矩阵
+        # pose_CW = getWorld2View2(curr_frame.R, curr_frame.T) # 当前帧的世界到相机变换矩阵 (World to Camera)
+        # last_kf_CW = getWorld2View2(last_kf.R, last_kf.T) # 上一关键帧的世界到相机变换矩阵
+        pose_CW = curr_frame.T
+        last_kf_CW = last_kf.T
         last_kf_WC = torch.linalg.inv(last_kf_CW) # 上一关键帧的相机到世界变换矩阵 (Camera to World)
         dist = torch.norm((pose_CW @ last_kf_WC)[0:3, 3]) # 计算相对变换矩阵：pose_CW @ last_kf_WC 提取位移向量的模长（欧氏距离）
         dist_check = dist > kf_translation * self.median_depth #判断 1：距离是否超过了一个较大的阈值 (kf_translation * main_depth)如果超过这个距离，说明相机移动很大，应该强制插入关键帧。
@@ -299,7 +303,8 @@ class FrontEnd(mp.Process):
         if to_remove:
             window.remove(to_remove[-1])
             removed_frame = to_remove[-1]
-        kf_0_WC = torch.linalg.inv(getWorld2View2(curr_frame.R, curr_frame.T))
+        # kf_0_WC = torch.linalg.inv(getWorld2View2(curr_frame.R, curr_frame.T))
+        kf_0_WC = torch.linalg.inv(curr_frame.T)
         # 策略二：基于几何分布剔除 (Geometric Pruning)如果经过策略一处理后，窗口大小仍然超过配置的限制（window_size），则强制基于空间几何关系移除一帧。
         # 解释：系统倾向于移除那些 “既离当前位置很远，又和其他旧帧挤在一起” 的关键帧。这样可以保留那些空间分布较均匀、或者离当前区域较近的关键帧。
         if len(window) > self.config["Training"]["window_size"]:
@@ -309,13 +314,15 @@ class FrontEnd(mp.Process):
                 inv_dists = []
                 kf_i_idx = window[i]
                 kf_i = self.cameras[kf_i_idx]
-                kf_i_CW = getWorld2View2(kf_i.R, kf_i.T)
+                # kf_i_CW = getWorld2View2(kf_i.R, kf_i.T)
+                kf_i_CW = kf_i.T
                 for j in range(N_dont_touch, len(window)):
                     if i == j:
                         continue
                     kf_j_idx = window[j]
                     kf_j = self.cameras[kf_j_idx]
-                    kf_j_WC = torch.linalg.inv(getWorld2View2(kf_j.R, kf_j.T))
+                    # kf_j_WC = torch.linalg.inv(getWorld2View2(kf_j.R, kf_j.T))
+                    kf_j_WC = torch.linalg.inv(kf_j.T)
                     T_CiCj = kf_i_CW @ kf_j_WC
                     inv_dists.append(1.0 / (torch.norm(T_CiCj[0:3, 3]) + 1e-6).item())
                 T_CiC0 = kf_i_CW @ kf_0_WC
@@ -350,23 +357,15 @@ class FrontEnd(mp.Process):
     '''
     def sync_backend(self, data): # 从后端接收更新的数据包，并同步前端的高斯模型、关键帧位姿和可见性信息
         self.gaussians = data[1] #更新全局高斯模型
-        occ_aware_visibility = data[2] #更新可见性信息
+        self.occ_aware_visibility = data[2] #更新可见性信息
         keyframes = data[3] #修正后的关键帧位姿列表，包含 (kf_id, kf_R, kf_T)
-        self.occ_aware_visibility = occ_aware_visibility
 
-        for kf_id, kf_R, kf_T in keyframes:
-            self.cameras[kf_id].update_RT(kf_R.clone(), kf_T.clone())
+        for kf_id, kf_T in keyframes:
+            #self.cameras[kf_id].update_RT(kf_R.clone(), kf_T.clone())
+            self.cameras[kf_id].T = kf_T
 
     def cleanup(self, cur_frame_idx):
         self.cameras[cur_frame_idx].clean()
-        # --- 内存优化: 清理平面数据 (RAM Fix) ---
-        # 显式删除挂载在相机对象上的大数组，防止内存泄漏
-        if hasattr(self.cameras[cur_frame_idx], "label_info"):
-            del self.cameras[cur_frame_idx].label_info
-        if hasattr(self.cameras[cur_frame_idx], "plane_param_info"):
-            del self.cameras[cur_frame_idx].plane_param_info
-        # -------------------------------------
-
         if cur_frame_idx % 10 == 0:
             torch.cuda.empty_cache()
     '''
@@ -438,7 +437,7 @@ class FrontEnd(mp.Process):
                     self.dataset, cur_frame_idx, projection_matrix
                 )
                 viewpoint.compute_grad_mask(self.config) # 计算rgb l1损失时使用的梯度掩码,提取图像中纹理丰富或边缘明显的区域，忽略平坦区域，提高tracking计算的效率和稳定性
-
+                # 读取当前帧数据后，将其存储在前端属性 self.cameras 字典中，以便后续处理和访问
                 self.cameras[cur_frame_idx] = viewpoint #将当前正在处理的这一帧（由索引 cur_frame_idx 标识）的相机对象（viewpoint）保存到前端类的成员变量 self.cameras 字典中
                 # 系统初始化
                 if self.reset: #系统重置标志为 True，说明需要重新初始化 SLAM 系统

@@ -132,6 +132,17 @@ class GaussianPacket:
             self.get_scaling, scaling_modifier, self._rotation
         )
 
+    # def build_covariance_from_scaling_rotation(  # 缩放矩阵,用于调整缩放矩阵的大小,四元数
+    #         self, center, scaling, scaling_modifier, rotation
+    # ):
+    #     RS = build_scaling_rotation(torch.cat([scaling * scaling_modifier, torch.ones_like(scaling)], dim=-1),
+    #                                 rotation,
+    #                                 ).permute(0, 2, 1)  # S,q->R，L=RS，scaling_modifier用于调整缩放矩阵的大小
+    #     trans = torch.zeros((center.shape[0], 4, 4), dtype=torch.float, device="cuda")
+    #     trans[:, :3, :3] = RS
+    #     trans[:, 3, :3] = center
+    #     trans[:, 3, 3] = 1
+    #     return trans
     def build_covariance_from_scaling_rotation(
         self, scaling, scaling_modifier, rotation
     ):

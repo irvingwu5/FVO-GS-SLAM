@@ -61,32 +61,60 @@ def get_loss_tracking(config, image, depth, opacity, viewpoint, initialization=F
     return get_loss_tracking_rgbd(config, image_ab, depth, opacity, viewpoint)
 
 
-def get_loss_tracking_rgb(config, image, depth, opacity, viewpoint): #主要用于计算 RGB 颜色跟踪损失 (Tracking Loss)。在 SLAM 系统中，这个损失值用于衡量当前渲染出的图像与真实观测图像之间的差异，通常用于优化当前的相机位姿（Tracking 过程）。
+# def get_loss_tracking_rgb(config, image, depth, opacity, viewpoint): #主要用于计算 RGB 颜色跟踪损失 (Tracking Loss)。在 SLAM 系统中，这个损失值用于衡量当前渲染出的图像与真实观测图像之间的差异，通常用于优化当前的相机位姿（Tracking 过程）。
+#     gt_image = viewpoint.original_image.cuda()
+#     _, h, w = gt_image.shape
+#     mask_shape = (1, h, w)
+#     rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
+#     rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*mask_shape) #只要像素的 RGB 值之和大于该阈值，就被视为有效像素。这通常用于过滤掉全黑的图像边界或无效区域
+#     rgb_pixel_mask = rgb_pixel_mask * viewpoint.grad_mask #进一步通过外部提供的梯度掩码来筛选纹理丰富区域
+#     # 计算渲染图像与真值图像之间的绝对差值 (L1 Error)，并乘以不透明度掩码，确保只考虑那些被高置信度渲染的像素，这意味着模型渲染出不透明度高（实体表面）的区域，其颜色误差对损失函数的贡献更大；而透明或半透明区域的颜色误差权重较低
+#     l1 = opacity * torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
+#     return l1.mean() #返回整个图像所有像素误差的平均值
+def get_loss_tracking_rgb(config, image, depth, opacity, viewpoint):
     gt_image = viewpoint.original_image.cuda()
-    _, h, w = gt_image.shape
-    mask_shape = (1, h, w)
-    rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
-    rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*mask_shape) #只要像素的 RGB 值之和大于该阈值，就被视为有效像素。这通常用于过滤掉全黑的图像边界或无效区域
-    rgb_pixel_mask = rgb_pixel_mask * viewpoint.grad_mask #进一步通过外部提供的梯度掩码来筛选纹理丰富区域
-    # 计算渲染图像与真值图像之间的绝对差值 (L1 Error)，并乘以不透明度掩码，确保只考虑那些被高置信度渲染的像素，这意味着模型渲染出不透明度高（实体表面）的区域，其颜色误差对损失函数的贡献更大；而透明或半透明区域的颜色误差权重较低
-    l1 = opacity * torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
-    return l1.mean() #返回整个图像所有像素误差的平均值
+    l1 = opacity * torch.abs(
+        image * viewpoint.rgb_pixel_mask - gt_image * viewpoint.rgb_pixel_mask
+    )
+    # huberloss = torch.nn.HuberLoss(reduction='mean', delta=0.005)
+
+    # l1 = opacity * huberloss(image * viewpoint.rgb_pixel_mask,
+    #  gt_image * viewpoint.rgb_pixel_mask)
+
+    return l1.mean()
 
 
+# def get_loss_tracking_rgbd(
+#     config, image, depth, opacity, viewpoint, initialization=False
+# ):
+#     alpha = config["Training"]["alpha"] if "alpha" in config["Training"] else 0.95
+#
+#     gt_depth = torch.from_numpy(viewpoint.depth).to(
+#         dtype=torch.float32, device=image.device
+#     )[None]
+#     depth_pixel_mask = (gt_depth > 0.01).view(*depth.shape)
+#     opacity_mask = (opacity > 0.95).view(*depth.shape)
+#
+#     l1_rgb = get_loss_tracking_rgb(config, image, depth, opacity, viewpoint) #l1加权损失
+#     depth_mask = depth_pixel_mask * opacity_mask
+#     l1_depth = torch.abs(depth * depth_mask - gt_depth * depth_mask)
+#     return alpha * l1_rgb + (1 - alpha) * l1_depth.mean()
 def get_loss_tracking_rgbd(
     config, image, depth, opacity, viewpoint, initialization=False
 ):
     alpha = config["Training"]["alpha"] if "alpha" in config["Training"] else 0.95
-
-    gt_depth = torch.from_numpy(viewpoint.depth).to(
-        dtype=torch.float32, device=image.device
-    )[None]
-    depth_pixel_mask = (gt_depth > 0.01).view(*depth.shape)
+    depth_pixel_mask = (viewpoint.gt_depth > 0.01).view(*depth.shape)
     opacity_mask = (opacity > 0.95).view(*depth.shape)
 
-    l1_rgb = get_loss_tracking_rgb(config, image, depth, opacity, viewpoint) #l1加权损失
+    # if viewpoint.mask is not None:
+    #     depth_pixel_mask = depth_pixel_mask * viewpoint.mask
+
+    l1_rgb = get_loss_tracking_rgb(config, image, depth, opacity, viewpoint)
     depth_mask = depth_pixel_mask * opacity_mask
-    l1_depth = torch.abs(depth * depth_mask - gt_depth * depth_mask)
+    l1_depth = torch.abs(depth * depth_mask - viewpoint.gt_depth * depth_mask)
+    # huberloss = torch.nn.HuberLoss(reduction='mean', delta=0.0005)
+    # l1_depth =huberloss(depth * depth_mask, viewpoint.gt_depth * depth_mask)
+
     return alpha * l1_rgb + (1 - alpha) * l1_depth.mean()
 
 
@@ -100,31 +128,54 @@ def get_loss_mapping(config, image, depth, viewpoint, opacity, initialization=Fa
     return get_loss_mapping_rgbd(config, image_ab, depth, viewpoint)
 
 
+# def get_loss_mapping_rgb(config, image, depth, viewpoint):
+#     gt_image = viewpoint.original_image.cuda()
+#     _, h, w = gt_image.shape
+#     mask_shape = (1, h, w)
+#     rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
+#
+#     rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*mask_shape)
+#     l1_rgb = torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
+#
+#     return l1_rgb.mean()
 def get_loss_mapping_rgb(config, image, depth, viewpoint):
     gt_image = viewpoint.original_image.cuda()
-    _, h, w = gt_image.shape
-    mask_shape = (1, h, w)
-    rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
-
-    rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*mask_shape)
-    l1_rgb = torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
+    l1_rgb = torch.abs(
+        image * viewpoint.rgb_pixel_mask_mapping
+        - gt_image * viewpoint.rgb_pixel_mask_mapping
+    )
 
     return l1_rgb.mean()
 
-
+# def get_loss_mapping_rgbd(config, image, depth, viewpoint, initialization=False):
+#     alpha = config["Training"]["alpha"] if "alpha" in config["Training"] else 0.95
+#     rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
+#     gt_image = viewpoint.original_image.cuda()
+#
+#     gt_depth = torch.from_numpy(viewpoint.depth).to(
+#         dtype=torch.float32, device=image.device
+#     )[None]
+#     rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*depth.shape)
+#     depth_pixel_mask = (gt_depth > 0.01).view(*depth.shape)
+#
+#     l1_rgb = torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
+#     l1_depth = torch.abs(depth * depth_pixel_mask - gt_depth * depth_pixel_mask)
+#
+#     return alpha * l1_rgb.mean() + (1 - alpha) * l1_depth.mean()
 def get_loss_mapping_rgbd(config, image, depth, viewpoint, initialization=False):
     alpha = config["Training"]["alpha"] if "alpha" in config["Training"] else 0.95
-    rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
     gt_image = viewpoint.original_image.cuda()
 
-    gt_depth = torch.from_numpy(viewpoint.depth).to(
-        dtype=torch.float32, device=image.device
-    )[None]
-    rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*depth.shape)
-    depth_pixel_mask = (gt_depth > 0.01).view(*depth.shape)
+    rgb_pixel_mask = viewpoint.rgb_pixel_mask_mapping
+
+    depth_pixel_mask = (viewpoint.gt_depth > 0.01).view(*depth.shape)
+    # if viewpoint.mask is not None:
+    #     depth_pixel_mask = depth_pixel_mask * viewpoint.mask
 
     l1_rgb = torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
-    l1_depth = torch.abs(depth * depth_pixel_mask - gt_depth * depth_pixel_mask)
+    l1_depth = torch.abs(
+        depth * depth_pixel_mask - viewpoint.gt_depth * depth_pixel_mask
+    )
 
     return alpha * l1_rgb.mean() + (1 - alpha) * l1_depth.mean()
 
@@ -327,6 +378,112 @@ def get_loss_mapping_plane_constraint(gaussians, viewpoint, loss_type=None):
 
     return loss #1.2667
 
+def get_depth_dist_loss(render_pkg):
+    rend_dist = render_pkg["rend_dist"]
+    dist_loss = rend_dist.mean()
+    return dist_loss
+
+def get_normal_consistency_loss(render_pkg):
+    rend_normal  = render_pkg['rend_normal'] #转到了世界坐标系下
+    surf_normal = render_pkg['surf_normal'] #转到了世界坐标系下
+    #render_alpha = render_pkg['opacity']
+    #dot_product = (rend_normal * (-surf_normal)).sum(dim=0)
+    normal_error = (1 - (rend_normal * (-surf_normal)).sum(dim=0))[None]
+    normal_loss = normal_error.mean()
+    #normal_loss = (render_alpha - dot_product).mean()
+    return normal_loss
+
+def _save_tensor_as_image(tensor, path, normal_map=False):
+    import os
+    from PIL import Image
+    import numpy as np
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    t = tensor.detach().cpu()
+    # support [3,H,W], [1,H,W], [H,W]
+    if t.dim() == 3 and t.shape[0] == 3:
+        img = t.permute(1, 2, 0)  # H,W,3
+        if normal_map:
+            img = (img * 0.5 + 0.5).clamp(0, 1)  # map from [-1,1] -> [0,1]
+        else:
+            img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+        arr = (img.numpy() * 255).astype(np.uint8)
+        Image.fromarray(arr).save(path)
+    else:
+        if t.dim() == 3 and t.shape[0] == 1:
+            t2 = t[0]
+        elif t.dim() == 2:
+            t2 = t
+        else:
+            # fallback: take first channel if exists
+            t2 = t[0] if t.dim() >= 3 else t
+        img = (t2 - t2.min()) / (t2.max() - t2.min() + 1e-8)
+        arr = (img.numpy() * 255).astype(np.uint8)
+        Image.fromarray(arr).convert("L").save(path)
+
+def _save_normal_pair(render_pkg, save_dir, cam_idx, basename="normal"):
+    import os
+    rend_normal = render_pkg.get("rend_normal", None)
+    surf_normal = render_pkg.get("surf_normal", None)
+    surf_normal = -surf_normal
+    if rend_normal is None or surf_normal is None:
+        return
+    os.makedirs(save_dir, exist_ok=True)
+    _save_tensor_as_image(rend_normal, os.path.join(save_dir, f"{basename}_{cam_idx}_rend.png"), normal_map=True)
+    _save_tensor_as_image(surf_normal, os.path.join(save_dir, f"{basename}_{cam_idx}_surf.png"), normal_map=True)
+
+
+def _save_rendered_rgb(render_pkg, save_dir, cam_idx, basename="rgb"):
+        """
+        保存渲染的 RGB 图像。
+        支持 render_pkg 中固定键名：'render'。
+        支持张量形状：[3,H,W], [H,W,3], [1,3,H,W], [B,3,H,W]（取第一个），并会将数值归一化到 [0,255]。
+        """
+        import os
+        from PIL import Image
+        import numpy as np
+        import torch
+
+        # 直接读取固定键名 'render'
+        if "render" not in render_pkg:
+            return
+        tensor = render_pkg["render"]
+
+        os.makedirs(save_dir, exist_ok=True)
+        t = tensor.detach().cpu()
+
+        # 规范为 H,W,3
+        if t.dim() == 4 and t.shape[0] == 1 and t.shape[1] == 3:
+            img = t[0].permute(1, 2, 0)
+        elif t.dim() == 4 and t.shape[0] > 1 and t.shape[1] == 3:
+            img = t[0].permute(1, 2, 0)
+        elif t.dim() == 3 and t.shape[0] == 3:
+            img = t.permute(1, 2, 0)
+        elif t.dim() == 3 and t.shape[2] == 3:
+            img = t
+        else:
+            # fallback: try to pick first 3 channels
+            if t.dim() >= 3:
+                c = t.shape[0]
+                if c >= 3:
+                    img = t[:3].permute(1, 2, 0) if t.dim() == 3 else t[0, :3].permute(1, 2, 0)
+                else:
+                    return
+            else:
+                return
+
+        # 归一化到 [0,1] 再 *255
+        img = img.float()
+        minv = img.min()
+        maxv = img.max()
+        if (maxv - minv).abs() < 1e-8:
+            img = img.clamp(0, 1)
+        else:
+            img = (img - minv) / (maxv - minv)
+
+        arr = (img.numpy() * 255).astype(np.uint8)
+        path = os.path.join(save_dir, f"{basename}_{cam_idx}.png")
+        Image.fromarray(arr).convert("RGB").save(path)
 
 def get_median_depth(depth, opacity=None, mask=None, return_std=False):
     depth = depth.detach().clone()

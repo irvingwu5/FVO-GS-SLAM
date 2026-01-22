@@ -73,7 +73,7 @@ class SLAM_GUI:
         self.save_path = "."
         self.save_path = pathlib.Path(self.save_path)
         self.save_path.mkdir(parents=True, exist_ok=True)
-
+        self.origin_pose = None
         threading.Thread(target=self._update_thread).start()
 
     def init_widget(self):
@@ -173,6 +173,10 @@ class SLAM_GUI:
         self.depth_chbox = gui.Checkbox("Depth")
         self.depth_chbox.checked = False
         chbox_tile_geometry.add_child(self.depth_chbox)
+
+        self.normals_chbox = gui.Checkbox("Normal")
+        self.normals_chbox.checked = False
+        chbox_tile_geometry.add_child(self.normals_chbox)
 
         self.opacity_chbox = gui.Checkbox("Opacity")
         self.opacity_chbox.checked = False
@@ -534,10 +538,30 @@ class SLAM_GUI:
             H=image_gui.shape[1],
             W=image_gui.shape[2],
         )
-        current_cam.update_RT(T[0:3, 0:3], T[0:3, 3])
+        # current_cam.update_RT(T[0:3, 0:3], T[0:3, 3])
+        current_cam.T = T.clone()
         return current_cam
 
     def rasterise(self, current_cam):
+        # --- 新增/修改代码开始 ---
+        # 检查是否需要临时修改 scaling 维度以防止 C++ 崩溃
+        original_scaling = None
+        if self.gaussian_cur is not None and self.gaussian_cur.get_scaling.shape[1] == 2:
+            # 获取当前的 2D scaling
+            scales_2d = self.gaussian_cur.get_scaling
+            # 创建一个全为 1 (或极小值) 的第 3 维，模拟薄片
+            # 注意：2DGS 通常假设 Z 轴(厚度)极薄，这里补 1 或 0 需根据你的 2DGS CUDA 实现决定
+            # 大多数 2DGS 实现中，如果沿用 3D 接口，通常补 1 (因为经过 exp 激活后) 或 0 (如果是 log 域)
+            # 这里假设 scale 已经是激活后的值，补一个小值 0.001 防止奇异性
+            pad_dim = torch.ones((scales_2d.shape[0], 1), device=scales_2d.device, dtype=scales_2d.dtype) * 0.001
+
+            # 拼接成 (N, 3)
+            scales_3d = torch.cat([scales_2d, pad_dim], dim=1)
+
+            # 临时替换
+            original_scaling = self.gaussian_cur.get_scaling
+            self.gaussian_cur.get_scaling = scales_3d
+
         if (
             self.time_shader_chbox.checked
             and self.gaussian_cur is not None
@@ -558,6 +582,7 @@ class SLAM_GUI:
                 self.pipe,
                 self.background,
                 self.scaling_slider.double_value,
+                surf=self.normals_chbox.checked,
             )
             self.gaussian_cur.get_features = features
         else:
@@ -567,7 +592,11 @@ class SLAM_GUI:
                 self.pipe,
                 self.background,
                 self.scaling_slider.double_value,
+                surf=self.normals_chbox.checked,
             )
+        # --- 恢复原始数据 (很重要，否则会污染后续的数据包处理) ---
+        if original_scaling is not None:
+            self.gaussian_cur.get_scaling = original_scaling
         return rendering_data
 
     def render_o3d_image(self, results, current_cam):
@@ -583,6 +612,24 @@ class SLAM_GUI:
             depth = (depth).byte().permute(1, 2, 0).contiguous().cpu().numpy()
             render_img = o3d.geometry.Image(depth)
 
+        elif self.normals_chbox.checked:
+            if self.origin_pose is None:
+                self.origin_pose = current_cam.T[0:3, 0:3].float()
+            normal = results["rend_normal"].view(3, -1)
+            normal_world = self.origin_pose @ normal.float()
+            normal_world = normal_world.view(
+                3, current_cam.image_height, current_cam.image_width
+            )
+            normal_world = normal_world * 0.5 + 0.5
+            normal_rgb = (
+                (torch.clamp(normal_world, min=0, max=1.0) * 255)
+                .byte()
+                .permute(1, 2, 0)
+                .contiguous()
+                .cpu()
+                .numpy()
+            )
+            render_img = o3d.geometry.Image(normal_rgb)
         elif self.opacity_chbox.checked:
             opacity = results["opacity"]
             opacity = opacity[0, :, :].detach().cpu().numpy()
@@ -624,6 +671,15 @@ class SLAM_GUI:
             self.gaussians_gl.scale = self.gaussian_cur.get_scaling.cpu().numpy()
             self.gaussians_gl.rot = self.gaussian_cur.get_rotation.cpu().numpy()
             self.gaussians_gl.sh = self.gaussian_cur.get_features.cpu().numpy()[:, 0, :]
+
+            self.gaussians_gl.scale = np.concatenate(
+                [
+                    self.gaussians_gl.scale,
+                    np.ones((self.gaussians_gl.scale.shape[0], 1)) * 1e-6,
+                ],
+                axis=-1,
+            )
+            self.gaussians_gl.scale = self.gaussians_gl.scale.astype(np.float32)
 
             self.update_activated_renderer_state(self.gaussians_gl)
             self.g_renderer.sort_and_update(self.g_camera)
