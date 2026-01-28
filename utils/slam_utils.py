@@ -569,8 +569,44 @@ def get_loss_mapping_plane_constraint(gaussians, viewpoint, loss_type=None):
 #         target_normal = target_normal_permuted.permute(2, 0, 1)  # [3, H, W]
 #
 #     return target_normal
+
 def build_plane_normal_gt(viewpoint):
-    pass
+    H, W = viewpoint.image_height, viewpoint.image_width
+    plane_equations, label_map, num_planes = prepare_plane_data(viewpoint)
+    # 如果数据缺失，返回全0的法线图
+    if not isinstance(plane_equations, torch.Tensor) or not isinstance(label_map, torch.Tensor):
+        return torch.zeros((3, H, W), dtype=torch.float32, device="cuda")
+
+    if isinstance(label_map, np.ndarray):
+        label_map = torch.from_numpy(label_map).long().cuda()
+
+    # 初始化为 0（三通道）
+    target_normal = torch.zeros((3, H, W), dtype=torch.float32, device=plane_equations.device)
+
+    is_planar_mask = (label_map < num_planes) & (label_map >= 0)
+    if is_planar_mask.sum() == 0:
+        return target_normal
+
+    valid_plane_ids = label_map[is_planar_mask]  # [N]
+    plane_normals_cam = plane_equations[valid_plane_ids, :3]  # [N,3]
+
+    # 坐标系对齐（与文件中其他函数保持一致）
+    axis_flip = torch.tensor([1.0, -1.0, -1.0], device=plane_normals_cam.device, dtype=plane_normals_cam.dtype)
+    plane_normals_cam = plane_normals_cam * axis_flip
+
+    # 旋转到世界坐标系
+    R_w2c = viewpoint.world_view_transform[:3, :3]
+    plane_normals_world = plane_normals_cam @ R_w2c.T
+    plane_normals_world = torch.nn.functional.normalize(plane_normals_world, dim=1)
+
+    # 写回到 [3, H, W]
+    target_normal_permuted = target_normal.permute(1, 2, 0)  # [H, W, 3]
+    target_normal_permuted[is_planar_mask] = plane_normals_world
+    target_normal = target_normal_permuted.permute(2, 0, 1)  # [3, H, W]
+
+    return target_normal
+
+
 def build_combined_normal_gt(viewpoint):
 
     """

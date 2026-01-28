@@ -13,7 +13,7 @@ from utils.pose_utils import update_pose
 from utils.slam_utils import (get_loss_mapping,get_loss_mapping_plane_constraint,
                               get_depth_dist_loss,get_normal_consistency_loss,
                               _save_normal_pair, _save_rendered_rgb,_save_gt_normal,
-                              build_combined_normal_gt,prepare_plane_data)
+                              build_combined_normal_gt,build_plane_normal_gt)
 
 # 它主要负责全局地图构建（Mapping）和光束法平差（Bundle Adjustment）
 # BackEnd 的核心设计模式是维护全局一致性。前端只关心“当前在哪里”，而后端关心“整个地图长什么样以及历史轨迹是否准确”。
@@ -44,7 +44,13 @@ class BackEnd(mp.Process):
 
         self.use_normal = config["Training"]["sagsslam"]["use_normal"]
         # self.use_plane_constraint = config["Training"]["sagsslam"]["use_plane_constraint"]
+        # 读取模式字符串
+        self.normal_mode = config["Training"]["sagsslam"]["normal_mode"]
 
+        # 可选：简单的参数校验，防止写错
+        valid_modes = ["sensor", "plane", "mixed"]
+        if self.use_normal and self.normal_mode not in valid_modes:
+            raise ValueError(f"Invalid normal_mode: {self.normal_mode}. Must be one of {valid_modes}")
 
     def set_hyperparams(self):
         self.save_results = self.config["Results"]["save_results"]
@@ -233,29 +239,6 @@ class BackEnd(mp.Process):
                     self.config, image, depth, viewpoint, opacity
                 ) #0.1886
 
-                #-----------------------------------------------
-                # [核心修改]: 法线监督逻辑
-                #if is_recent_frame and self.use_normal:
-                #if self.use_normal:
-                    #rend_normal = render_pkg["rend_normal"]  # 预测值 (World Space)
-                    #surf_normal = render_pkg["surf_normal"]  # 弱监督值 (World Space)
-                    # [修改点 1] 获取传感器法线 (Camera Space)
-                    # 注意：viewpoint.normal 是 (1, 3, H, W)，我们需要把它转到 GPU
-                    #sensor_normal = viewpoint.normal
-                    # 1. 准备平面数据 (plane_equations 是 Camera Space)
-                    #plane_equations, label_map, num_planes = prepare_plane_data(viewpoint)
-
-                    # 2. 构建混合监督目标 (内部会自动转到 World Space)
-                    #gt_normal = build_combined_normal_gt(
-                    #    viewpoint, sensor_normal, label_map, plane_equations, num_planes
-                    #)
-                    #_save_gt_normal(gt_normal,"/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid)
-                    #_save_normal_pair(render_pkg,"/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid)
-                    # 3. 计算法线 Loss
-                    #normal_error = (1 - (rend_normal * sensor_normal).sum(dim=0))[None]
-                    #normal_loss = self.config["opt_params"]["lambda_normal"] * normal_error.mean() #0.05*0.8122=0.04061
-                    #loss_mapping += normal_loss
-
                 viewspace_point_tensor_acm.append(viewspace_point_tensor)
                 visibility_filter_acm.append(visibility_filter)
                 radii_acm.append(radii)
@@ -302,20 +285,41 @@ class BackEnd(mp.Process):
             isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
             loss_mapping += 0.1 * isotropic_loss.mean() #0.1*0.0024=0.00024
             # -----------------------------------------------
-            if self.use_normal and viewpoint.normal is not None and itr==0:
+            if self.use_normal and viewpoint.normal is not None and itr == 0:
                 rend_normal = render_pkg["rend_normal"]
-                # 确保深度图也是当前视角的
                 depth_pixel_mask = (viewpoint.gt_depth > 0.01).view(*depth.shape)
-                # gt_normal = viewpoint.normal
-                gt_normal = build_combined_normal_gt(viewpoint)
-                # 转换法线到世界坐标系或其他需要的坐标系
-                # gt_normal = (viewpoint.T[0:3, 0:3].T @ gt_normal.view(3, -1)).view(
-                #     image.shape[0], image.shape[1], image.shape[2]
-                # ) #(3,H,W)
-                #normal_mask = gt_normal > 0
-                normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean() #0.9128
+                # ==========================================
+                # 模式 1: 纯传感器法线 (Sensor only)
+                # ==========================================
+                if self.normal_mode == "sensor":
+                    # 获取传感器法线并转到世界坐标系
+                    sensor_normal = viewpoint.normal
+                    # 注意：这里假设 viewpoint.T 是 World2Cam，具体转换需根据你的坐标系定义确认
+                    gt_normal = (viewpoint.T[0:3, 0:3].T @ sensor_normal.view(3, -1)).view(
+                        image.shape[0], image.shape[1], image.shape[2]
+                    )
+                    _save_gt_normal(gt_normal, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/", viewpoint.uid)
+                    normal_mask = gt_normal > 0
+                    normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask * normal_mask).sum(dim=0))[None].mean() #0.9128
+                    loss_mapping += (self.config["opt_params"]["lambda_normal"] * normal_error)
+                # ==========================================
+                # 模式 2: 纯平面先验 (Plane only)
+                # ==========================================
+                elif self.normal_mode == "plane":
+                    # 假设 build_plane_normal_gt 返回世界坐标系的法线
+                    gt_normal = build_plane_normal_gt(viewpoint)
+                    normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()  # 0.9128
 
-                loss_mapping += (self.config["opt_params"]["lambda_normal"] * normal_error) #0.9128*0.001=0.0009128
+                    loss_mapping += (self.config["opt_params"]["lambda_normal"] * normal_error)
+                # ==========================================
+                # 模式 3: 混合监督 (Mixed)
+                # ==========================================
+                elif self.normal_mode == "mixed":
+                    # 假设 build_combined_normal_gt 内部处理了传感器法线与平面的融合，并返回世界坐标系法线
+                    gt_normal = build_combined_normal_gt(viewpoint)
+                    normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()  # 0.9128
+
+                    loss_mapping += (self.config["opt_params"]["lambda_normal"] * normal_error)
 
 
             loss_mapping.backward()
