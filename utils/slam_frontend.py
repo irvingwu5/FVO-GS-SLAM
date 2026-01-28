@@ -182,7 +182,7 @@ class FrontEnd(mp.Process):
         pose_optimizer = torch.optim.Adam(opt_params)
         for tracking_itr in range(self.tracking_itr_num):
             render_pkg = render(
-                viewpoint, self.gaussians, self.pipeline_params, self.background
+                viewpoint, self.gaussians, self.pipeline_params, self.background, surf=False
             )
             image, depth, opacity = (
                 render_pkg["render"],
@@ -366,7 +366,7 @@ class FrontEnd(mp.Process):
 
     def cleanup(self, cur_frame_idx):
         self.cameras[cur_frame_idx].clean()
-        if cur_frame_idx % 10 == 0:
+        if cur_frame_idx % 5 == 0: #10->5
             torch.cuda.empty_cache()
     '''
     -------------------前端 SLAM 主循环---------------------

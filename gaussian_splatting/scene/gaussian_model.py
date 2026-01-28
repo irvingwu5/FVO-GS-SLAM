@@ -147,10 +147,10 @@ class GaussianModel:
             downsample_factor = self.config["Dataset"]["pcd_downsample_init"]
         else:
             downsample_factor = self.config["Dataset"]["pcd_downsample"]
-        point_size = self.config["Dataset"]["point_size"]
+        point_size = self.config["Dataset"]["point_size"] #point_size->dist2(每个点到最近邻距离平方)->log(sqrt(dist2))->scales
         if "adaptive_pointsize" in self.config["Dataset"]:
             if self.config["Dataset"]["adaptive_pointsize"]:
-                point_size = min(0.05, point_size * np.median(depth))
+                point_size = min(0.05, point_size * np.median(depth)) #按场景尺度把初始像素/单位大小转成与深度相匹配的实际尺度（深度通常以米为单位），这样远处场景会产生更大的投影半径，近处则更小。
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
             rgb,
             depth,
@@ -739,7 +739,7 @@ class GaussianModel:
             new_kf_ids=new_kf_id,
             new_n_obs=new_n_obs,
         )
-
+    # densify(分裂split和克隆clone,高斯数量增)+prune(剪枝,高斯数量减)
     # 位置梯度阈值、最小透明度、场景半径(最近最远相机中心连线长度*1.1)、2D高斯最大半径(通过计算2D协方差矩阵的特征值，取其最大值的平方根，再乘以3并向上取整得到的)、3D高斯半径
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom # (N,1)每个高斯点的累积位置(均值)梯度/每个高斯点被更新的次数，计算了每个高斯点的位置(均值)平均梯度。这样可以得到每个高斯点的累积梯度的平均值，用于后续的密化和剪枝操作

@@ -2,19 +2,19 @@ Results:
   save_results: True
   save_dir: "runtime_results"
   save_trj: True
-  save_trj_kf_intv: 20
+  save_trj_kf_intv: 20 #20->40
   use_gui: True
   eval_rendering: False
   use_wandb: False
 
 Dataset:
   sensor_type: 'depth'
-  pcd_downsample: 64
-  pcd_downsample_init: 32
-  adaptive_pointsize: True
-  point_size: 0.05 #0.05->0.1
+  pcd_downsample: 64 #其他阶段下采样因子，保留1/64%点云
+  pcd_downsample_init: 32 #初始阶段下采样因子
+  adaptive_pointsize: True #点大小乘中值深度得到场景中点的实际大小，限制最小为0.05
+  point_size: 0.01 # 影响scales的初始化
   type: 'replica'
-  use_label: False
+  use_label: True
   Calibration:
     fx: 600.0
     fy: 600.0
@@ -32,37 +32,39 @@ Dataset:
 
 
 Training:
-  init_itr_num: 1050
-  init_gaussian_update: 100
-  init_gaussian_reset: 500
-  init_gaussian_th: 0.005
-  init_gaussian_extent: 30
-  tracking_itr_num: 100
-  mapping_itr_num: 150
-  gaussian_update_every: 150
-  gaussian_update_offset: 50
-  gaussian_th: 0.7
-  gaussian_extent: 1.0
-  gaussian_reset: 2001
-  size_threshold: 20 #20->50
-  kf_interval: 4 #4->5
-  window_size: 10
-  pose_window: 5
-  edge_threshold: 4
+  init_itr_num: 1050 # 首帧初始化时优化的迭代次数
+  init_gaussian_update: 100 #每隔多少次进行一次gs密化和修剪
+  init_gaussian_reset: 500 #当总迭代次数iter_count达到该值时，把gs不透明度重置为0.01
+  init_gaussian_th: 0.005 #该值设置必须小于0.01，由于reset opacity为0.01<0.02，则全员gs被剪枝，0.005->0.02
+  init_gaussian_extent: 30 #对densify的影响:值越大倾向于clone,值越小倾向于split,对prune的影响:值越大浮空伪影无法被剔除，值越小容易过度剔除，背景空洞
+  tracking_itr_num: 100 #每帧跟踪优化的迭代次数
+  mapping_itr_num: 5 #建图阶段每处理一个新关键帧时的优化迭代次数150->4dtam 5
+  gaussian_update_every: 150 #每隔多少次进行一次gs密化和修剪,
+  gaussian_update_offset: 50 #当总迭代次数为50、50+150、50+2*150、50+3*150...时进行gs密化和修剪
+  gaussian_th: 0.7 #0.7->4dtam 0.4 控制高斯点的不透明度下限，小于该值的gs会被剔除
+  gaussian_extent: 30.0 #4dtam 30.0 #gs的scaling>该值*camera_extent*0.1时被剔除
+  gaussian_reset: 2001 #当总迭代次数iter_count达到该值时，把gs不透明度重置为0.01
+  size_threshold: 20 #20->50, 如果max_radii2d(好像全0)>投影gs尺寸阈值，则被剔除
+  kf_interval: 4 #4->5，创建关键帧的间隔帧数
+  window_size: 8 #关键帧滑动窗口
+  pose_window: 5 #5->4dtam 3,只更新滑动窗口中位姿优化窗口内的相机位姿
+  edge_threshold: 4 #4->4dtam 1.1
   rgb_boundary_threshold: 0.01
 
   kf_translation: 0.04
-  kf_min_translation: 0.02
-  kf_overlap: 0.95 #0.95->0.85
+  kf_min_translation: 0.02 #0.02->4dtam 0.05
+  kf_overlap: 0.95 #0.95->4dtam 0.9
   prune_mode: 'slam'
-  single_thread: True
+  single_thread: False
   spherical_harmonics: False
   lr:
     cam_rot_delta: 0.003
     cam_trans_delta: 0.001
   sagsslam:
     use_normal: True
-    use_dist: True
+    # 互斥选择: "sensor", "plane", "mixed"
+    #sensor_depthnomal_supervision、plane_normal_supervision、mixed_normal_supervision
+    normal_mode: "mixed"
     use_plane_constraint: False
     loss_type: "Huber"  # "l1" or "l2"
     warmup_iter: 2500
@@ -79,13 +81,12 @@ opt_params:
   rotation_lr: 0.001
   percent_dense: 0.01 #0.01->0.03
   lambda_dssim: 0.2
-  lambda_dist: 500 #depth distortion loss weight
-  lambda_normal: 0.05 #normal consistency loss weight
+  lambda_normal: 0.006 #normal consistency loss weight
   densification_interval: 100
   opacity_reset_interval: 3000
-  densify_from_iter: 500
+  densify_from_iter: 500 #当总迭代次iter_count数达到该值时，把gs不透明度重置为0.01
   densify_until_iter: 15000
-  densify_grad_threshold: 0.0002 #0.0002->0.0004
+  densify_grad_threshold: 0.0002 #0.0002->0.0006
 
 model_params:
   sh_degree: 0

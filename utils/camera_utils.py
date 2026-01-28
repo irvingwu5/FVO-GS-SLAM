@@ -185,11 +185,11 @@ class Camera(nn.Module):
             )[None]
 
             depth = self.gt_depth.unsqueeze(0)
-            points = get_cam_coords(self.intrins_inv, depth)
+            points = get_cam_coords(self.intrins_inv, depth) #右x、下y、深度z OpenCV相机坐标系
             normal, valid_mask = d2n_tblr(points, d_min=1e-3, d_max=1000.0)
             normal = normal * valid_mask
-            self.normal = normal
-            self.normal_raw = self.normal.squeeze(0).permute(1, 2, 0).cpu().numpy() #相机坐标系下的法向量
+            self.normal = normal #(1,3,H,W)相机坐标系下的法向量
+            self.normal_raw = self.normal.squeeze(0).permute(1, 2, 0).cpu().numpy() #(H,W,3)相机坐标系下的法向量
             self.mask = valid_mask
 
         if self.mask is not None:

@@ -41,6 +41,8 @@ class ReplicaParser:
             frame = {
                 "file_path": self.color_paths[i],
                 "depth_path": self.depth_paths[i],
+                "label_path": self.label_paths[i] if hasattr(self, 'label_paths') else None,
+                "plane_eq_path": self.plane_params[i] if hasattr(self, 'plane_params') else None,
                 "transform_matrix": pose.tolist(),
             }
 
@@ -86,15 +88,15 @@ class TUMParser:
         image_list = os.path.join(datapath, "rgb.txt") # 文件绝对路径，文件内容包含时间戳及其相对应图像相对路径
         depth_list = os.path.join(datapath, "depth.txt")
         if has_label:
-            label_list = os.path.join(datapath, "plane.txt") # 平面标签文件绝对路径，文件内容包含时间戳及其相对应标签文件相对路径
-
+            label_list = os.path.join(datapath, "plane_label.txt") # 平面标签文件绝对路径，文件内容包含时间戳及其相对应标签文件相对路径
+            plane_eq_list = os.path.join(datapath, "plane_eq.txt") # 平面参数文件绝对路径，文件内容包含时间戳及其相对应平面参数文件相对路径
         # image、depth、gtpose的时间戳可能不完全对应，需要进行关联
         image_data = self.parse_list(image_list) #(613,2) 第一列时间戳，第二列时间戳对应的图像相对路径
         depth_data = self.parse_list(depth_list) #(595,2) 第一列时间戳，第二列时间戳对应的深度图相对路径
         pose_data = self.parse_list(pose_list, skiprows=1) #字符串类型numpy数组(2335,8) 第一列时间戳，第二到第四列平移，第五到第八列四元数
         pose_vecs = pose_data[:, 0:].astype(np.float64) #转换为浮点型numpy数组
         label_data = self.parse_list(label_list) if has_label is True else None #(613,2) 第一列时间戳，第二列时间戳对应的标签文件相对路径
-
+        plane_eq_data = self.parse_list(plane_eq_list) if has_label is True else None #(613,2) 第一列时间戳，第二列时间戳对应的平面参数文件相对路径
         tstamp_image = image_data[:, 0].astype(np.float64) # 第0列图片时间戳(613,)
         tstamp_depth = depth_data[:, 0].astype(np.float64) # 第0列深度图时间戳(595,)
         tstamp_pose = pose_data[:, 0].astype(np.float64) # 第0列pose时间戳(2335,)
@@ -110,7 +112,7 @@ class TUMParser:
             if t1 - t0 > 1.0 / frame_rate:
                 indicies += [i]
 
-        self.color_paths, self.poses, self.depth_paths, self.frames, self.label_paths = [], [], [], [], []
+        self.color_paths, self.poses, self.depth_paths, self.frames, self.label_paths, self.plane_eq_paths = [], [], [], [], [], []
 
         for ix in indicies: # 遍历被保留的关联项索引列表
             (i, j, k) = associations[ix] # 获取图像索引i、深度图索引j、位姿索引k
@@ -118,6 +120,7 @@ class TUMParser:
             self.depth_paths += [os.path.join(datapath, depth_data[j, 1])]
             if has_label:
                 self.label_paths += [os.path.join(datapath, label_data[i, 1])] # 行索引i 时间戳(列索引0)、相对路径(列索引1)，最终保存的是标签文件的绝对路径
+                self.plane_eq_paths += [os.path.join(datapath, plane_eq_data[i, 1])] # 行索引i 时间戳(列索引0)、相对路径(列索引1)，最终保存的是平面参数文件的绝对路径
             quat = pose_vecs[k][4:] # 行索引k 时间戳(列索引0)、平移(列索引1-3)、四元数(列索引4-7)，(4,)
             trans = pose_vecs[k][1:4] # (3,)
             T = trimesh.transformations.quaternion_matrix(np.roll(quat, 1)) # 四元数转为(4,4)变换矩阵填充3*3旋转矩阵部分，注意np.roll(quat,1)将四元数循环右移一位从(x,y,z,w)变为(w,x,y,z)
@@ -128,6 +131,7 @@ class TUMParser:
                 "file_path": str(os.path.join(datapath, image_data[i, 1])), # 挑选出来的rgb的绝对路径
                 "depth_path": str(os.path.join(datapath, depth_data[j, 1])), # 挑选出来的depth的绝对路径
                 "label_path": str(os.path.join(datapath, label_data[i, 1])) if has_label is True else None, # 挑选出来的label的绝对路径
+                "plane_eq_path": str(os.path.join(datapath, plane_eq_data[i, 1])) if has_label is True else None, # 挑选出来的plane_param的绝对路径
                 "transform_matrix": (np.linalg.inv(T)).tolist(), # 对应的相机位姿矩阵c2w
             }
 
@@ -480,7 +484,8 @@ class TUMDataset(MonocularDataset):
         self.depth_paths = parser.depth_paths
         self.poses = parser.poses
         self.label_paths = parser.label_paths if self.has_label else None
-        self.plane_params = parser.plane_params if self.has_label else None  # 存储平面参数文件路径
+        self.plane_params = parser.plane_eq_paths if self.has_label else None  # 存储平面参数文件路径
+
 
 
 class ReplicaDataset(MonocularDataset):

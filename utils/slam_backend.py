@@ -10,7 +10,10 @@ from gaussian_splatting.utils.loss_utils import l1_loss, ssim
 from utils.logging_utils import Log
 from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
-from utils.slam_utils import get_loss_mapping,get_loss_mapping_plane_constraint,get_depth_dist_loss,get_normal_consistency_loss,_save_normal_pair, _save_rendered_rgb
+from utils.slam_utils import (get_loss_mapping,get_loss_mapping_plane_constraint,
+                              get_depth_dist_loss,get_normal_consistency_loss,
+                              _save_normal_pair, _save_rendered_rgb,_save_gt_normal,
+                              build_combined_normal_gt,prepare_plane_data)
 
 # 它主要负责全局地图构建（Mapping）和光束法平差（Bundle Adjustment）
 # BackEnd 的核心设计模式是维护全局一致性。前端只关心“当前在哪里”，而后端关心“整个地图长什么样以及历史轨迹是否准确”。
@@ -40,8 +43,8 @@ class BackEnd(mp.Process):
         self.keyframe_optimizers = None
 
         self.use_normal = config["Training"]["sagsslam"]["use_normal"]
-        self.use_dist = config["Training"]["sagsslam"]["use_dist"]
-        self.use_plane_constraint = config["Training"]["sagsslam"]["use_plane_constraint"]
+        # self.use_plane_constraint = config["Training"]["sagsslam"]["use_plane_constraint"]
+
 
     def set_hyperparams(self):
         self.save_results = self.config["Results"]["save_results"]
@@ -50,16 +53,18 @@ class BackEnd(mp.Process):
         self.init_gaussian_update = self.config["Training"]["init_gaussian_update"] # 初始化期间执行高斯点分裂/修剪的间隔次数
         self.init_gaussian_reset = self.config["Training"]["init_gaussian_reset"] # 初始化期间重置不透明度的迭代步数
         self.init_gaussian_th = self.config["Training"]["init_gaussian_th"] # 初始化期间用于高斯密化（新增点）的梯度阈值
+        # 对densify(clone and split)的影响:init_gs_extent值越大，阈值=percent_dense*该值，更多gs被判为小，倾向于clone,该值越小，阈值越小，更多gs被判为大，倾向于split
+        # 对prune的影响:init_gs_extent值越大,容忍上限变高,巨大浮空伪影无法被剔除导致画面朦胧，该值越小,容忍上限变低,正常背景墙面地板可能因为尺寸稍大而被误删，导致背景出现空洞
         self.init_gaussian_extent = (
             self.cameras_extent * self.config["Training"]["init_gaussian_extent"]
-        ) # 初始化期间场景范围180
+        )
         self.mapping_itr_num = self.config["Training"]["mapping_itr_num"] # 建图阶段每处理一个新关键帧时的优化迭代次数150
         self.gaussian_update_every = self.config["Training"]["gaussian_update_every"] # 建图期间执行高斯点分裂/修剪的间隔次数
         self.gaussian_update_offset = self.config["Training"]["gaussian_update_offset"] # 建图期间首次执行高斯更新的起始偏移量
         self.gaussian_th = self.config["Training"]["gaussian_th"] # 建图期间用于高斯密化（新增点）的梯度阈值
         self.gaussian_extent = (
             self.cameras_extent * self.config["Training"]["gaussian_extent"]
-        ) # 建图期间场景范围6.0
+        ) # 建图期间场景范围6.0*30=180.0m，gs scaling>该值*0.1时被剔除
         self.gaussian_reset = self.config["Training"]["gaussian_reset"] # 建图期间重置不透明度的周期（用于去除漂浮物/噪声）
         self.size_threshold = self.config["Training"]["size_threshold"] # 高斯点的修剪阈值（过大的点会被移除）
         self.window_size = self.config["Training"]["window_size"] # 滑动窗口的大小（参与联合优化/BA的关键帧数量）
@@ -94,12 +99,14 @@ class BackEnd(mp.Process):
     清空旧地图。
     基于第一帧生成的点云初始化高斯模型。
     执行高频的迭代优化（init_itr_num），快速建立初始场景几何，为前端跟踪提供基础。
+    #初始化阶段只需要把场景几何/颜色的高斯模型尽快收敛到一个可用的状态，位姿保持固定（单位矩阵）并不参与优化。
+    在没有位姿优化的情况下快速建立稳定的几何/颜色基础，给前端提供可靠的跟踪基准（后续帧和 BA 才会优化相机位姿）。
     '''
-    def initialize_map(self, cur_frame_idx, viewpoint):
+    def initialize_map(self, cur_frame_idx, viewpoint): #第一帧多次迭代优化，每次迭代独立计算并及时更新高斯参数，不是多次迭代累积梯度
         for mapping_iteration in range(self.init_itr_num):
             self.iteration_count += 1
             render_pkg = render(
-                viewpoint, self.gaussians, self.pipeline_params, self.background
+                viewpoint, self.gaussians, self.pipeline_params, self.background, surf=False
             )
             (
                 image,
@@ -122,9 +129,9 @@ class BackEnd(mp.Process):
             loss_init = get_loss_mapping(
                 self.config, image, depth, viewpoint, opacity, initialization=True
             ) #0.4255
-            loss_init.backward()
+            loss_init.backward() #计算对gs模型参数的梯度（此阶段不更新相机位姿）
 
-            with torch.no_grad():
+            with torch.no_grad(): #更新统计量
                 self.gaussians.max_radii2D[visibility_filter] = torch.max(
                     self.gaussians.max_radii2D[visibility_filter],
                     radii[visibility_filter],
@@ -132,21 +139,22 @@ class BackEnd(mp.Process):
                 self.gaussians.add_densification_stats(
                     viewspace_point_tensor, visibility_filter
                 )
-                if mapping_iteration % self.init_gaussian_update == 0:
+                #
+                if mapping_iteration % self.init_gaussian_update == 0: #在初始化建图阶段每隔self.init_gaussian_update次迭代执行一次高斯点的密化（densify）与修剪（prune）
                     self.gaussians.densify_and_prune(
-                        self.opt_params.densify_grad_threshold,
-                        self.init_gaussian_th,
-                        self.init_gaussian_extent,
+                        self.opt_params.densify_grad_threshold, #基于梯度的密化阈值，表示哪些区域的梯度足够大，需要在该处增加新的高斯点以补充细节。
+                        self.init_gaussian_th, #用于密化时的另一个阈值（如亮度/不透明度/半径方面的门限），限制新增点的条件
+                        self.init_gaussian_extent, #在初始化阶段限定新增高斯点的空间范围（场景范围），防止在太远或不相关区域创建高斯。
                         None,
                     )
 
                 if self.iteration_count == self.init_gaussian_reset or (
                     self.iteration_count == self.opt_params.densify_from_iter
                 ):
-                    self.gaussians.reset_opacity()
+                    self.gaussians.reset_opacity() #将gs不透明度重置为0.01
 
-                self.gaussians.optimizer.step()
-                self.gaussians.optimizer.zero_grad(set_to_none=True)
+                self.gaussians.optimizer.step() #执行gs参数更新
+                self.gaussians.optimizer.zero_grad(set_to_none=True) #清空梯度
 
         self.occ_aware_visibility[cur_frame_idx] = (n_touched > 0).long()
         Log("Initialized map")
@@ -174,6 +182,8 @@ class BackEnd(mp.Process):
                 continue
             random_viewpoint_stack.append(viewpoint)
 
+        # 获取当前窗口中最新的帧的索引（假设 current_window 是按时间顺序排列的）
+        # 通常 current_window[-1] 是最新的帧
         for itr in range(iters):
             self.iteration_count += 1
             self.last_sent += 1
@@ -185,12 +195,21 @@ class BackEnd(mp.Process):
             n_touched_acm = []
             keyframes_opt = []
             # 对多帧渲染计算联合损失，对当前滑动窗口内的关键帧进行优化
-            for cam_idx in range(len(current_window)):
-                viewpoint = viewpoint_stack[cam_idx]
+            # =========================================================
+            # 循环 1: 当前窗口 (Current Window) window_size=10
+            # 分级优化策略，最新帧：几何最不稳定强约束、次新帧：几何尚未完全收敛适度约束、窗口尾部老帧：几何基本稳定，可以降级处理
+            # 几何活跃窗口：最近的2-3帧，开启surf=true计算法线和失真损失、光度活跃窗口:剩下的7-8帧，surf=false只计算光度损失
+            # =========================================================
+            # current_window 通常是 [oldest, ..., newest]
+            # 我们倒序遍历，先处理新帧
+            for i in range(len(current_window)):
+                viewpoint = viewpoint_stack[i]
                 keyframes_opt.append(viewpoint)
+
                 render_pkg = render(
-                    viewpoint, self.gaussians, self.pipeline_params, self.background,surf=True
+                    viewpoint, self.gaussians, self.pipeline_params, self.background,surf=False
                 )
+                # 解包数据 (注意：如果 surf=False，rend_normal/dist 会是 None 或无效值)
                 (
                     image,
                     viewspace_point_tensor,
@@ -212,25 +231,31 @@ class BackEnd(mp.Process):
                 #_save_rendered_rgb(render_pkg, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/runtime_results/", cam_idx)
                 loss_mapping += get_loss_mapping(
                     self.config, image, depth, viewpoint, opacity
-                ) #0.0202
-                #-----------------------------------------------
-                if self.use_normal:
-                    rend_normal = render_pkg["rend_normal"]
-                    surf_normal = render_pkg["surf_normal"]
-                    normal_error = (1 - (rend_normal * (-surf_normal).detach()).sum(dim=0))[None]
-                    normal_loss = self.config["opt_params"]["lambda_normal"] * normal_error.mean()
-                    loss_mapping += normal_loss
+                ) #0.1886
 
-                # 如果启用了 use_dist
-                # 2DGS SLAM 对几何非常敏感，Distortion Loss 主要是为了压实表面。如果你的 Raw Loss 一直非常小（比如 1e-6 级别），
-                # 说明你的高斯在光线方向上已经很“薄”了，甚至可能不需要太强的 Distortion Loss，此时该损失的意义主要在于防止未来产生新的浮空垃圾
-                if self.use_dist:
-                    # 你的 __init__.py 已经返回了 "rend_dist"
-                    rend_dist = render_pkg["rend_dist"]
-                    # 建议权重在 0.001 ~ 0.01 之间
-                    loss_mapping += self.config["opt_params"][
-                                        "lambda_dist"] * rend_dist.mean()  # 500*6.3175e-06=3.1587e-07
-                #--------------------------------------------------
+                #-----------------------------------------------
+                # [核心修改]: 法线监督逻辑
+                #if is_recent_frame and self.use_normal:
+                #if self.use_normal:
+                    #rend_normal = render_pkg["rend_normal"]  # 预测值 (World Space)
+                    #surf_normal = render_pkg["surf_normal"]  # 弱监督值 (World Space)
+                    # [修改点 1] 获取传感器法线 (Camera Space)
+                    # 注意：viewpoint.normal 是 (1, 3, H, W)，我们需要把它转到 GPU
+                    #sensor_normal = viewpoint.normal
+                    # 1. 准备平面数据 (plane_equations 是 Camera Space)
+                    #plane_equations, label_map, num_planes = prepare_plane_data(viewpoint)
+
+                    # 2. 构建混合监督目标 (内部会自动转到 World Space)
+                    #gt_normal = build_combined_normal_gt(
+                    #    viewpoint, sensor_normal, label_map, plane_equations, num_planes
+                    #)
+                    #_save_gt_normal(gt_normal,"/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid)
+                    #_save_normal_pair(render_pkg,"/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid)
+                    # 3. 计算法线 Loss
+                    #normal_error = (1 - (rend_normal * sensor_normal).sum(dim=0))[None]
+                    #normal_loss = self.config["opt_params"]["lambda_normal"] * normal_error.mean() #0.05*0.8122=0.04061
+                    #loss_mapping += normal_loss
+
                 viewspace_point_tensor_acm.append(viewspace_point_tensor)
                 visibility_filter_acm.append(visibility_filter)
                 radii_acm.append(radii)
@@ -240,7 +265,7 @@ class BackEnd(mp.Process):
             for cam_idx in torch.randperm(len(random_viewpoint_stack))[:2]:
                 viewpoint = random_viewpoint_stack[cam_idx]
                 render_pkg = render(
-                    viewpoint, self.gaussians, self.pipeline_params, self.background
+                    viewpoint, self.gaussians, self.pipeline_params, self.background, surf=False
                 )
                 (
                     image,
@@ -266,37 +291,32 @@ class BackEnd(mp.Process):
                 visibility_filter_acm.append(visibility_filter)
                 radii_acm.append(radii)
 
-            # [修改点] 历史帧也要应用同样的 Warm-up 策略
-            # if self.use_plane_constraint:
-            #     lambda_plane = self.config["Training"]["sagsslam"]["weight"]
-            #     loss_type = self.config["Training"]["sagsslam"]["loss_type"]
-            #     warmup_iter = self.config["Training"]["sagsslam"]["warmup_iter"]
-            #
-            #     if self.iteration_count < warmup_iter:
-            #         actual_lambda_plane = 0.0
-            #     else:
-            #         actual_lambda_plane = lambda_plane
-            #
-            #     if actual_lambda_plane > 0:
-            #         loss_mapping += actual_lambda_plane * get_loss_mapping_plane_constraint(
-            #             self.gaussians, viewpoint, loss_type
-            #         )
+            # =========================================================
+            # [位置 2] 各向同性/标度损失 (Isotropic Loss) 放在这里！
+            # 原因：
+            # 1. 这是对高斯球本身的形状做正则化 (self.gaussians)，是全局的。
+            # 2. 它不依赖于具体的相机视角 (Viewpoint)。
+            # 3. 如果在循环内计算，会导致每次渲染一个帧就加一次 loss，导致权重翻倍，梯度爆炸。
+            # =========================================================
+            scaling = self.gaussians.get_scaling
+            isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
+            loss_mapping += 0.1 * isotropic_loss.mean() #0.1*0.0024=0.00024
+            # -----------------------------------------------
+            if self.use_normal and viewpoint.normal is not None and itr==0:
+                rend_normal = render_pkg["rend_normal"]
+                # 确保深度图也是当前视角的
+                depth_pixel_mask = (viewpoint.gt_depth > 0.01).view(*depth.shape)
+                # gt_normal = viewpoint.normal
+                gt_normal = build_combined_normal_gt(viewpoint)
+                # 转换法线到世界坐标系或其他需要的坐标系
+                # gt_normal = (viewpoint.T[0:3, 0:3].T @ gt_normal.view(3, -1)).view(
+                #     image.shape[0], image.shape[1], image.shape[2]
+                # ) #(3,H,W)
+                #normal_mask = gt_normal > 0
+                normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean() #0.9128
 
-            # if self.use_normal:
-            #     rend_normal = render_pkg["rend_normal"]
-            #     surf_normal = render_pkg["surf_normal"]
-            #     normal_error =(1 - (rend_normal * (-surf_normal).detach()).sum(dim=0))[None]
-            #     normal_loss = self.config["opt_params"]["lambda_normal"] * normal_error.mean()
-            #     loss_mapping += normal_loss
-            #
-            # # 如果启用了 use_dist
-            # #2DGS SLAM 对几何非常敏感，Distortion Loss 主要是为了压实表面。如果你的 Raw Loss 一直非常小（比如 1e-6 级别），
-            # # 说明你的高斯在光线方向上已经很“薄”了，甚至可能不需要太强的 Distortion Loss，此时该损失的意义主要在于防止未来产生新的浮空垃圾
-            # if self.use_dist:
-            #     # 你的 __init__.py 已经返回了 "rend_dist"
-            #     rend_dist = render_pkg["rend_dist"]
-            #     # 建议权重在 0.001 ~ 0.01 之间
-            #     loss_mapping += self.config["opt_params"]["lambda_dist"] * rend_dist.mean() #500*6.3175e-06=3.1587e-07
+                loss_mapping += (self.config["opt_params"]["lambda_normal"] * normal_error) #0.9128*0.001=0.0009128
+
 
             loss_mapping.backward()
             gaussian_split = False
@@ -358,7 +378,7 @@ class BackEnd(mp.Process):
                 update_gaussian = (
                     self.iteration_count % self.gaussian_update_every
                     == self.gaussian_update_offset
-                )
+                ) #同余条件,固定周期带偏移，every=N,offset=m,则在m,m+N,m+2N,...迭代执行高斯更新
                 if update_gaussian:
                     self.gaussians.densify_and_prune(
                         self.opt_params.densify_grad_threshold,
@@ -383,10 +403,10 @@ class BackEnd(mp.Process):
                 self.gaussians.update_learning_rate(self.iteration_count)
                 self.keyframe_optimizers.step()
                 self.keyframe_optimizers.zero_grad(set_to_none=True)
-                # Pose update
-                for cam_idx in range(min(frames_to_optimize, len(current_window))):
+                # Pose update 只更新位姿优化窗口内的相机位姿
+                for cam_idx in range(min(frames_to_optimize, len(current_window))): #min(3,2)[5,0]
                     viewpoint = viewpoint_stack[cam_idx]
-                    if viewpoint.uid == 0:
+                    if viewpoint.uid == 0: #世界坐标系/第一帧位姿固定不变
                         continue
                     update_pose(viewpoint)
         return gaussian_split

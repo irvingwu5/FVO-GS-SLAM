@@ -191,7 +191,7 @@ def render(
     # for unbounded scene, use expected depth, i.e., depth_ration = 0, to reduce disk anliasing.
     surf_depth = render_depth_expected * (1 - pipe.depth_ratio) + (pipe.depth_ratio) * render_depth_median
 
-    if surf: #深度图计算出来的法线图，宏观几何，后续让每个surfels都朝向对应的宏观法线方向，
+    if surf: #渲染深度图计算出来的法线图，宏观几何，后续让每个surfels都朝向对应的宏观法线方向，
         surf_normal = depth_to_normal(viewpoint_camera, surf_depth) #已经转换到了世界坐标系下，assume the depth points form the 'surface' and generate psudo surface normal for regularizations.
         surf_normal = surf_normal.permute(2, 0, 1)
         surf_normal = surf_normal * (render_alpha).detach() #remember to multiply with accum_alpha since render_normal is unnormalized.
