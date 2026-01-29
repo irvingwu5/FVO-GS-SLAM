@@ -54,7 +54,11 @@ class SLAM:
             self.use_gui = True
         self.eval_rendering = self.config["Results"]["eval_rendering"] # False or True
 
-        model_params.sh_degree = 3 if self.use_spherical_harmonics else 0 # true设置为3，false设置为0
+        #model_params.sh_degree = 3 if self.use_spherical_harmonics else 0 # true设置为3，false设置为0
+        # [修改] 尊重 yaml 配置。只有当开关关闭时，才强制设为 0。
+        # 如果开关开启，则保留 model_params 中读取到的值 (比如 1 或 2)
+        if not self.use_spherical_harmonics:
+            model_params.sh_degree = 0
         # 初始化高斯模型和数据集
         self.gaussians = GaussianModel(model_params.sh_degree, config=self.config) # 执行__init_函数初始化高斯各属性
         self.gaussians.init_lr(6.0)

@@ -252,7 +252,7 @@ class FrontEnd(mp.Process):
         ).count_nonzero() #计算交集：当前帧看到的点 AND 上一帧看到的点
         point_ratio_2 = intersection / union # 计算重叠比率 (Intersection over Union)如果比率很低，说明当前帧看到了很多新东西，或者旧东西看不到了。
         '''
-        返回 True 的条件（即 选为关键帧）是以下两者之一：  
+        返回 True 的条件（即选为关键帧）是以下两者之一：  
         1.视觉变化显著且有一定位移 (point_ratio_2 < kf_overlap and dist_check2)：  
         当前的视野内容与上一帧重叠度低（point_ratio_2 小于阈值），说明环境变了。
         并且，相机发生了至少一小段位移 (dist_check2)。防止因旋转或噪声导致的虚假低重叠。

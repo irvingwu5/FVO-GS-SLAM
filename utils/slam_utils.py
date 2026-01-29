@@ -205,7 +205,8 @@ def world2camera(viewpoint, points_world):
     # P_cam = P_world @ R^T + t
     # Or if using the matrix directly: P_cam = P_world @ world_view_transform
     # We explicitly separate R and T for clarity matching standard math.
-    w2c = viewpoint.world_view_transform.transpose(0, 1)  # Transpose back to [4, 4] row-major standard
+    #要切断对相机位姿的梯度，同时保留对高斯点的梯度,.detach() 会创建一个新的 Tensor，它与原 Tensor 共享数据，但不再存在于计算图中。因此，反向传播走到这里就会停止，不会更新生成该矩阵的相机参数。
+    w2c = viewpoint.world_view_transform.transpose(0, 1).detach()  # Transpose back to [4, 4] row-major standard
     R = w2c[:3, :3]
     T = w2c[:3, 3]
     # Transform: (M, 3) @ (3, 3).T + (1, 3)
@@ -328,8 +329,8 @@ def get_loss_mapping_plane_constraint(gaussians, viewpoint, loss_type=None):
     # [新增优化 2]: 深度一致性剔除 (Outlier Rejection)
     # -----------------------------------------------------------
     # 如果点到平面的距离本来就非常大(例如 > 10cm)，说明可能是误匹配(遮挡边界等)
-    # 强行拉扯会破坏结构。我们只优化那些"离平面不远"的点。
-    valid_dist_mask = torch.abs(dist) < 0.10  # 10cm 阈值
+    # 强行拉扯会破坏结构。我们只优化那些"离平面不远"的点。# 只优化距离平面 2cm 以内的点，超过的视为杂物，不优化
+    valid_dist_mask = torch.abs(dist) < 0.02  # 2cm 阈值
     if valid_dist_mask.sum() == 0: return torch.tensor(0.0, device="cuda")
 
     dist_filtered = dist[valid_dist_mask]

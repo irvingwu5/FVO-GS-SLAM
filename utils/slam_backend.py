@@ -43,7 +43,7 @@ class BackEnd(mp.Process):
         self.keyframe_optimizers = None
 
         self.use_normal = config["Training"]["sagsslam"]["use_normal"]
-        # self.use_plane_constraint = config["Training"]["sagsslam"]["use_plane_constraint"]
+        self.use_plane_constraint = config["Training"]["sagsslam"]["use_plane_constraint"]
         # 读取模式字符串
         self.normal_mode = config["Training"]["sagsslam"]["normal_mode"]
 
@@ -298,7 +298,7 @@ class BackEnd(mp.Process):
                     gt_normal = (viewpoint.T[0:3, 0:3].T @ sensor_normal.view(3, -1)).view(
                         image.shape[0], image.shape[1], image.shape[2]
                     )
-                    _save_gt_normal(gt_normal, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/", viewpoint.uid)
+                    #_save_gt_normal(gt_normal, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/", viewpoint.uid)
                     normal_mask = gt_normal > 0
                     normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask * normal_mask).sum(dim=0))[None].mean() #0.9128
                     loss_mapping += (self.config["opt_params"]["lambda_normal"] * normal_error)
@@ -309,7 +309,6 @@ class BackEnd(mp.Process):
                     # 假设 build_plane_normal_gt 返回世界坐标系的法线
                     gt_normal = build_plane_normal_gt(viewpoint)
                     normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()  # 0.9128
-
                     loss_mapping += (self.config["opt_params"]["lambda_normal"] * normal_error)
                 # ==========================================
                 # 模式 3: 混合监督 (Mixed)
@@ -318,9 +317,11 @@ class BackEnd(mp.Process):
                     # 假设 build_combined_normal_gt 内部处理了传感器法线与平面的融合，并返回世界坐标系法线
                     gt_normal = build_combined_normal_gt(viewpoint)
                     normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()  # 0.9128
-
                     loss_mapping += (self.config["opt_params"]["lambda_normal"] * normal_error)
 
+            if self.use_plane_constraint and itr == 0:
+                proj_loss = get_loss_mapping_plane_constraint(self.gaussians, viewpoint,'huber') #0.0001
+                loss_mapping += self.config["opt_params"]["lambda_plane"] * proj_loss #10*0.0001
 
             loss_mapping.backward()
             gaussian_split = False
@@ -449,14 +450,17 @@ class BackEnd(mp.Process):
             gt_depth_mask = gt_depth > 0.0
             Ll1_depth = l1_loss(depth * gt_depth_mask, gt_depth * gt_depth_mask)
             #------------------------
-            # scaling = self.gaussians.get_scaling
-            # isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
+            scaling = self.gaussians.get_scaling
+            isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
             #------------------------
             # loss = (1.0 - self.opt_params.lambda_dssim) * (
             #     Ll1
             # ) + self.opt_params.lambda_dssim * (1.0 - ssim(image, gt_image))
+            # python
+            loss = (1.0 - self.opt_params.lambda_dssim) * Ll1 + self.opt_params.lambda_dssim * (
+                        1.0 - ssim(image, gt_image)) + 0.1 * isotropic_loss.mean() + 0.01 * Ll1_depth
             #loss = Ll1 + 0.1 * isotropic_loss.mean() + 0.01 * Ll1_depth
-            loss = Ll1 + 0.01 * Ll1_depth
+            #loss = Ll1 + 0.01 * Ll1_depth
             #------------------------
             if self.use_normal:
                 rend_normal = render_pkg["rend_normal"]
@@ -475,6 +479,7 @@ class BackEnd(mp.Process):
                 self.gaussians.optimizer.zero_grad(set_to_none=True)
                 self.gaussians.update_learning_rate(iteration)
         Log("Map refinement done")
+
     '''
     -------------------前后端同步模块(Frontend Sync)------------------
     作用: 将后端优化后的最新地图状态反馈给前端。
