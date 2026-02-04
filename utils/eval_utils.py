@@ -132,6 +132,9 @@ def eval_rendering(
     cal_lpips = LearnedPerceptualImagePatchSimilarity(
         net_type="alex", normalize=True
     ).to("cuda")
+    #创建保存渲染图片的文件夹
+    render_dir = os.path.join(save_dir, "rendering")
+    mkdir_p(render_dir)
     for idx in range(0, end_idx, interval):
         if idx in kf_indices:
             continue
@@ -148,6 +151,7 @@ def eval_rendering(
         )
         gt = cv2.cvtColor(gt, cv2.COLOR_BGR2RGB)
         pred = cv2.cvtColor(pred, cv2.COLOR_BGR2RGB)
+        #cv2.imwrite(f"{render_dir}/pred_{idx}.png", pred) #添加保存渲染图片
         img_pred.append(pred)
         img_gt.append(gt)
 

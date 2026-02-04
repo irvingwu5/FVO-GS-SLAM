@@ -308,6 +308,7 @@ class BackEnd(mp.Process):
                 elif self.normal_mode == "plane":
                     # 假设 build_plane_normal_gt 返回世界坐标系的法线
                     gt_normal = build_plane_normal_gt(viewpoint)
+                    #_save_gt_normal(gt_normal, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid)
                     normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()  # 0.9128
                     loss_mapping += (self.config["opt_params"]["lambda_normal"] * normal_error)
                 # ==========================================
@@ -316,6 +317,7 @@ class BackEnd(mp.Process):
                 elif self.normal_mode == "mixed":
                     # 假设 build_combined_normal_gt 内部处理了传感器法线与平面的融合，并返回世界坐标系法线
                     gt_normal = build_combined_normal_gt(viewpoint)
+                    #_save_gt_normal(gt_normal, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid)
                     normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()  # 0.9128
                     loss_mapping += (self.config["opt_params"]["lambda_normal"] * normal_error)
 

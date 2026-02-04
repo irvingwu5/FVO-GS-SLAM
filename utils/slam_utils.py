@@ -255,353 +255,187 @@ def world2camera(viewpoint, points_world):
 
 def get_loss_mapping_plane_constraint(gaussians, viewpoint, loss_type=None):
     """
-        计算点到平面的几何约束 Loss (基于当前视锥投影，解决跨帧ID不连续问题)
-
-        Args:
-            gaussians: GaussianModel 对象
-            viewpoint: 当前视角的相机对象，需包含:
-                       - world_view_transform: W2C 矩阵 [4, 4] (通常是转置的)
-                       - projection_matrix: 投影矩阵 (用于获取FOV等，或直接使用 fx/fy)
-                       - plane_params: 当前帧的平面参数 Tensor [K, 4] (ax+by+cz+d=0)
-                       - plane_map: 当前帧的平面语义分割图 Tensor [H, W] (内容为 int 类型的 plane_id)
-            loss_type: 'l1' 或 'l2'
+    更加鲁棒的平面约束 Loss 计算，避免越界索引导致的 CUDA device-side assert。
     """
-
     # 1. Check & Prepare Data: plane_equations: [N, 4], label_map: [H, W], num_planes: int
     plane_equations, label_map, num_planes = prepare_plane_data(viewpoint)
-    # -----------------------------------------------------------
-    # [新增优化 1]: 筛选高质量高斯点 (Opacity Filtering)
-    # -----------------------------------------------------------
-    # 只约束比较"实"的点，忽略半透明的雾状点
+
+    # 验证 prepare_plane_data 返回值
+    if not (isinstance(plane_equations, torch.Tensor) and isinstance(label_map, torch.Tensor)):
+        return torch.tensor(0.0, device="cuda")
+
+    # 确保 plane_equations 是二维且至少有一行
+    if plane_equations.ndim != 2 or plane_equations.shape[1] < 4 or plane_equations.shape[0] == 0:
+        return torch.tensor(0.0, device="cuda")
+
+    # 同步 num_planes 与实际 plane_equations 大小，避免 mismatch
+    num_planes_actual = int(plane_equations.shape[0])
+    try:
+        num_planes = int(num_planes)
+    except Exception:
+        num_planes = num_planes_actual
+    num_planes = min(num_planes, num_planes_actual)
+
+    # 2. Opacity filtering
     opacity = gaussians.get_opacity
     valid_opacity_mask = (opacity > 0.5).squeeze()
-
     if valid_opacity_mask.sum() == 0:
         return torch.tensor(0.0, device="cuda")
 
-    # 提取符合条件的点
     points_world = gaussians.get_xyz[valid_opacity_mask]  # [M, 3]
-    # 2. Extract XYZ from World Space
-    #points_world = gaussians.get_xyz  # [M, 3]
-    # --- 显存优化: 随机采样 (VRAM Fix) ---
-    # 计算全部点的投影和索引极其消耗显存。采样 100k 点计算 Loss 已足够。
     total_points = points_world.shape[0]
     SAMPLE_SIZE = 100000
     if total_points > SAMPLE_SIZE:
-        # 使用 randint 随机采样索引
-        indices = torch.randint(0, total_points, (SAMPLE_SIZE,), device="cuda")
+        indices = torch.randint(0, total_points, (SAMPLE_SIZE,), device=points_world.device)
         points_world = points_world[indices]
-    # -----------------------------------
-    # 3. Transform World -> Camera Coordinate System -> Frustum Culling -> Projection to Pixel Coordinates
-    points_cam, u, v, valid_z_mask, valid_pixel_mask = world2camera(viewpoint, points_world)
-    # 4.Get Plane IDs and Parameters
-    # Sample the plane ID for each projected point from the label map
-    # Note: v corresponds to rows (height), u to columns (width)
-    sampled_plane_ids = label_map[v, u]  # [M_final]
-    is_plane_mask = (sampled_plane_ids < num_planes)
 
-    if is_plane_mask.sum() == 0:
+    # 3. world2camera 可能返回标量表示失败，先判断
+    w2c_out = world2camera(viewpoint, points_world)
+    if isinstance(w2c_out, torch.Tensor) and w2c_out.dim() == 0:
         return torch.tensor(0.0, device="cuda")
 
-    # Apply mask
+    try:
+        points_cam, u, v, valid_z_mask, valid_pixel_mask = w2c_out
+    except Exception:
+        return torch.tensor(0.0, device="cuda")
+
+    # 再次检查投影结果有效性
+    if not (isinstance(points_cam, torch.Tensor) and isinstance(u, torch.Tensor) and isinstance(v, torch.Tensor)):
+        return torch.tensor(0.0, device="cuda")
+
+    H, W = viewpoint.image_height, viewpoint.image_width
+    # 确保 u,v 在 [0,W-1]/[0,H-1] 范围内，否则过滤
+    # u,v 可能已经是 long，但强制转 long
+    u = u.long()
+    v = v.long()
+    within_x = (u >= 0) & (u < W)
+    within_y = (v >= 0) & (v < H)
+    within_both = within_x & within_y
+
+    if within_both.sum() == 0:
+        return torch.tensor(0.0, device="cuda")
+
+    u_valid = u[within_both]
+    v_valid = v[within_both]
+    points_cam_valid = points_cam[within_both]
+
+    # 4. Sample plane ids safely
+    # label_map 应该为 long 在 GPU 上
+    if label_map.device != u_valid.device:
+        label_map = label_map.to(device=u_valid.device)
+    sampled_plane_ids = label_map[v_valid, u_valid]
+
+    # 强制为 long，防止类型问题
+    sampled_plane_ids = sampled_plane_ids.long()
+
+    # 过滤有效 plane id：非负并且小于实际 plane 数量
+    is_plane_mask = (sampled_plane_ids >= 0) & (sampled_plane_ids < num_planes)
+    if is_plane_mask.sum() == 0:
+        return torch.tensor(0.0, device=plane_equations.device)
+
     final_plane_ids = sampled_plane_ids[is_plane_mask]
-    final_points = points_cam[is_plane_mask]
+    final_points = points_cam_valid[is_plane_mask]
 
-    # Gather plane parameters: (a, b, c, d)
-    # plane_equations is [Num_Planes, 4]
-    target_plane_params = plane_equations[final_plane_ids]  # [K, 4]
-    # 5. Compute Plane Constraint Loss
-    # -----------------------------------------------------------
-    # Plane Equation: ax + by + cz + d = 0
-    # Your `parse_plane_param_from_file` returns normals (a,b,c) and d computed as -(n.center)
-    # So we want to minimize: | n . p + d |
+    # 再次确保 final_plane_ids 全为合法的索引范围（防御式编程）
+    # clamp 为最后保险措施（但应尽量发现数据来源错误）
+    final_plane_ids_clamped = torch.clamp(final_plane_ids, 0, plane_equations.shape[0] - 1).long()
 
-    # Extract normal (a,b,c) and d
+    # Gather plane parameters safely
+    target_plane_params = plane_equations[final_plane_ids_clamped]
+
+    # 5. Compute Plane Constraint Loss (same as 原实现，但更稳健)
     n = target_plane_params[:, :3]
     d = target_plane_params[:, 3]
 
-    # Compute dot product (n . p)
     dot_prod = (final_points * n).sum(dim=1)
-
-    # Distance to plane
     dist = dot_prod + d
-    # -----------------------------------------------------------
-    # [新增优化 2]: 深度一致性剔除 (Outlier Rejection)
-    # -----------------------------------------------------------
-    # 如果点到平面的距离本来就非常大(例如 > 10cm)，说明可能是误匹配(遮挡边界等)
-    # 强行拉扯会破坏结构。我们只优化那些"离平面不远"的点。# 只优化距离平面 2cm 以内的点，超过的视为杂物，不优化
-    valid_dist_mask = torch.abs(dist) < 0.02  # 2cm 阈值
-    if valid_dist_mask.sum() == 0: return torch.tensor(0.0, device="cuda")
+
+    # Outlier rejection
+    valid_dist_mask = torch.abs(dist) < 0.02
+    if valid_dist_mask.sum() == 0:
+        return torch.tensor(0.0, device=plane_equations.device)
 
     dist_filtered = dist[valid_dist_mask]
 
-    # ===========================================================
-    # [修改点]: 添加基于置信度的动态加权 (Confidence-based Weighting)
-    # ===========================================================
-
-    # 1. 计算每个点的基础 Loss (注意：必须使用 reduction='none' 以获得逐点 Loss)
-    #if loss_type == "l1":
-    #    per_point_loss = torch.abs(dist_filtered)
-    #elif loss_type == "l2":
-    #    per_point_loss = dist_filtered ** 2
-    #else:
-        # Huber loss 默认 reduction='mean'，这里必须改为 'none' 才能和权重相乘
-    #    per_point_loss = torch.nn.functional.huber_loss(
-    #        dist_filtered,
-    #        torch.zeros_like(dist_filtered),
-    #        delta=0.05,
-    #        reduction='none'  # <--- 关键修改
-    #    )
-
-    # 2. 计算置信度权重 (Gaussian Kernel)
-    # 逻辑：距离越小(dist -> 0)，权重越接近 1；距离越大(dist -> 10cm)，权重迅速衰减
-    # sigma 控制衰减速度，建议设为 0.05 (5cm)
-    #sigma = 0.05
-    #confidence_weight = torch.exp(- (dist_filtered ** 2) / (sigma ** 2))
-
-    # [可选] 停止梯度的传递给权重，防止网络试图通过移动点来增加权重（虽然在此场景下通常不需要，但更严谨）
-    #confidence_weight = confidence_weight.detach()
-
-    # 3. 计算加权后的 Loss
-    # 方式 A (Soft Constraint - 推荐): 简单的加权平均。
-    # 离得远的点不仅 Loss 大，但权重小，最终梯度会被抑制，不会强行拉扯。
-    #loss = (per_point_loss * confidence_weight).mean()
-    # -----------------------------------------------------------
-    # [新增优化 3]: 使用 Huber Loss
-    # -----------------------------------------------------------
     if loss_type == "l1":
         loss = torch.abs(dist_filtered).mean()
     elif loss_type == "l2":
         loss = (dist_filtered ** 2).mean()
-    else: # Huber (默认推荐)
-        # delta=0.01 (1cm): 小于1cm用L2平滑逼近，大于1cm用L1线性惩罚
+    else:
+        # Huber (delta=0.01)
         loss = torch.nn.functional.huber_loss(dist_filtered, torch.zeros_like(dist_filtered), delta=0.01)
 
-    return loss #1.2667
+    return loss
 
-
-# 在 slam_utils.py 或 map 函数外部辅助函数
-
-# def build_combined_normal_gt(viewpoint, surf_normal, label_map, plane_equations, num_planes):
-#     """
-#     构建混合法线监督目标 (World Space)
-#     """
-#
-#     # 获取旋转矩阵 (用于转换平面法线)
-#     R_w2c = viewpoint.world_view_transform[:3, :3]
-#
-#     target_normal = surf_normal.clone().detach()  # [3, H, W]
-#
-#     # 2. 生成平面掩码
-#     if isinstance(label_map, np.ndarray):
-#         label_map = torch.from_numpy(label_map).long().cuda()
-#
-#     is_planar_mask = (label_map < num_planes) & (label_map >= 0)
-#
-#     if is_planar_mask.sum() > 0:
-#         valid_plane_ids = label_map[is_planar_mask]
-#
-#         # 提取平面法线 (Camera Space)
-#         plane_normals_cam = plane_equations[valid_plane_ids, :3]
-#
-#         # =========================================================
-#         # [修正 2]: 保持平面法线的处理逻辑 (这个是对的)
-#         # =========================================================
-#         # 1. 坐标系对齐 (OpenCV -> OpenGL/3DGS)
-#         axis_flip = torch.tensor([1.0, -1.0, -1.0], device="cuda", dtype=plane_normals_cam.dtype)
-#         plane_normals_cam = plane_normals_cam * axis_flip
-#
-#         # 2. 旋转到世界坐标系 (Camera -> World)
-#         plane_normals_world = plane_normals_cam @ R_w2c.T
-#
-#         # 3. 归一化
-#         plane_normals_world = torch.nn.functional.normalize(plane_normals_world, dim=1)
-#         # ========================================================
-#         # [DEBUG START]: 插入调试代码查看数值
-#         # ========================================================
-#         # 为了避免每一帧都打印刷屏，建议只针对第0帧或者特定频率打印
-#         # if viewpoint.uid == 0:
-#         #     # 提取同一区域（Mask区域）的 surf_normal (Reference) 和 plane_normal (Candidate)
-#         #     # target_normal 是 [3, H, W]，需要转置一下取 mask
-#         #     surf_vectors = target_normal.permute(1, 2, 0)[is_planar_mask]  # [N, 3]
-#         #     plane_vectors = plane_normals_world  # [N, 3]
-#         #
-#         #     # 计算均值
-#         #     surf_mean = surf_vectors.mean(dim=0).cpu().numpy()
-#         #     plane_mean = plane_vectors.mean(dim=0).cpu().numpy()
-#         #
-#         #     print(f"\n>>> DEBUG Normals (Frame {viewpoint.uid}) <<<")
-#         #     print(f"Target (Surf) Mean: [{surf_mean[0]:.4f}, {surf_mean[1]:.4f}, {surf_mean[2]:.4f}]")
-#         #     print(f"Pred   (Plane) Mean: [{plane_mean[0]:.4f}, {plane_mean[1]:.4f}, {plane_mean[2]:.4f}]")
-#         #
-#         #     # 自动判断差异
-#         #     diff = surf_mean * plane_mean  # 逐元素相乘
-#         #     axes = ['X', 'Y', 'Z']
-#         #
-#         #     print("--- Axis Check ---")
-#         #     for i in range(3):
-#         #         # 如果两个向量在某轴上的乘积是负数，且绝对值比较大（说明不是噪声），则该轴反了
-#         #         if abs(surf_mean[i]) > 0.1:  # 只检查主要分量，忽略接近0的噪声轴
-#         #             status = "✅ MATCH" if diff[i] > 0 else "❌ FLIPPED (Need to verify)"
-#         #             print(f"Axis {axes[i]}: {status} (Val: {surf_mean[i]:.4f} vs {plane_mean[i]:.4f})")
-#         #         else:
-#         #             print(f"Axis {axes[i]}: IGNORE (Value too small: {surf_mean[i]:.4f})")
-#         #     print("==========================================\n")
-#         # ========================================================
-#         # 5. 替换 Target 中平面区域的值
-#         target_normal_permuted = target_normal.permute(1, 2, 0)
-#         target_normal_permuted[is_planar_mask] = plane_normals_world
-#         target_normal = target_normal_permuted.permute(2, 0, 1)
-#
-#     return target_normal
-
-# def build_combined_normal_gt(viewpoint, sensor_normal, label_map, plane_equations, num_planes):
-#     """
-#     构建混合法线监督目标 (World Space)
-#     输入:
-#         sensor_normal: [1, 3, H, W] 或 [3, H, W] (Camera Space, OpenCV定义)
-#         plane_equations: [M, 4] (Camera Space)
-#     输出:
-#         target_normal: [3, H, W] (World Space)
-#     """
-#     H, W = viewpoint.image_height, viewpoint.image_width
-#
-#     # 确保输入是 [3, H, W]
-#     if sensor_normal.dim() == 4:
-#         sensor_normal = sensor_normal.squeeze(0)  # 右x、下y、前z (OpenCV相机坐标系)
-#
-#     # =========================================================
-#     # [关键修改]: 将 sensor_normal 从 Camera Space 转到 World Space
-#     # =========================================================
-#     # 1. 维度变换 [3, H, W] -> [N, 3] 以便矩阵乘法
-#     normal_cam = sensor_normal.permute(1, 2, 0).reshape(-1, 3)
-#
-#     # 2. 坐标系对齐 (OpenCV -> OpenGL/3DGS)
-#     # 必须与下面平面法线的处理保持一致！
-#     axis_flip = torch.tensor([1.0, -1.0, -1.0], device="cuda", dtype=normal_cam.dtype)
-#     normal_cam = normal_cam * axis_flip
-#
-#     # 3. 旋转到世界坐标系
-#     # R_w2c 是 World-to-Camera 矩阵 (通常是 row-major 的 rotation)
-#     # 所以 Camera-to-World 的变换是乘 R_w2c.T
-#     R_w2c = viewpoint.world_view_transform[:3, :3]  # 右x、上y、后z (OpenGL坐标系)
-#     normal_world = normal_cam @ R_w2c.T
-#
-#     # 4. 归一化 (防止插值或计算误差)
-#     normal_world = torch.nn.functional.normalize(normal_world, dim=1)
-#
-#     # 5. 还原形状 [N, 3] -> [3, H, W] 并作为基础 target
-#     # 此时 target_normal 存储的是全图的 Sensor Normal (World Space)
-#     target_normal = normal_world.reshape(H, W, 3).permute(2, 0, 1)
-#
-#     # =========================================================
-#     # 平面区域替换逻辑 (保持不变)
-#     # =========================================================
-#     if isinstance(label_map, np.ndarray):
-#         label_map = torch.from_numpy(label_map).long().cuda()
-#
-#     is_planar_mask = (label_map < num_planes) & (label_map >= 0)
-#
-#     if is_planar_mask.sum() > 0:
-#         valid_plane_ids = label_map[is_planar_mask]
-#
-#         # 提取平面法线 (Camera Space)
-#         plane_normals_cam = plane_equations[valid_plane_ids, :3]
-#
-#         # [修正 2]: 保持平面法线的处理逻辑
-#         # 这里的 axis_flip 已经定义过了，直接复用逻辑
-#         plane_normals_cam = plane_normals_cam * axis_flip
-#
-#         # 旋转到世界坐标系 (Camera -> World)
-#         plane_normals_world = plane_normals_cam @ R_w2c.T
-#
-#         # 归一化
-#         plane_normals_world = torch.nn.functional.normalize(plane_normals_world, dim=1)
-#
-#         # ========================================================
-#         # [DEBUG START]: 检查同一区域的 Sensor Normal 和 Plane Normal 是否一致
-#         # ========================================================
-#         # 建议仅在特定帧打印，防止刷屏 (例如第0帧或每100帧)
-#         if viewpoint.uid == 0:
-#             # 1. 提取 Mask 区域内的 Sensor Normal (作为 Reference)
-#             # target_normal 目前是 [3, H, W]，先转为 [H, W, 3] 再用 mask 索引
-#             sensor_vectors = target_normal.permute(1, 2, 0)[is_planar_mask]  # Shape: [N_planar, 3]
-#
-#             # 2. 获取对应的 Plane Normal (作为 Candidate)
-#             plane_vectors = plane_normals_world  # Shape: [N_planar, 3]
-#
-#             # 3. 计算均值对比 (用于检查轴是否翻转)
-#             s_mean = sensor_vectors.mean(dim=0).cpu().numpy()
-#             p_mean = plane_vectors.mean(dim=0).cpu().numpy()
-#
-#             # 4. 计算余弦相似度 (点积)
-#             # dim=1 表示对每个像素的 xyz 向量做点积
-#             dot_prod = torch.sum(sensor_vectors * plane_vectors, dim=1)
-#             mean_sim = dot_prod.mean().item()
-#
-#             print(f"\n>>> DEBUG Normals Alignment (Frame {viewpoint.uid}) <<<")
-#             print(f"  Sensor Mean (World): [{s_mean[0]:.4f}, {s_mean[1]:.4f}, {s_mean[2]:.4f}]")
-#             print(f"  Plane  Mean (World): [{p_mean[0]:.4f}, {p_mean[1]:.4f}, {p_mean[2]:.4f}]")
-#             print(f"  Mean Cosine Similarity: {mean_sim:.4f}")
-#
-#             # 自动诊断
-#             if mean_sim > 0.8:
-#                 print("  ✅ ALIGNMENT: EXCELLENT (方向一致)")
-#             elif mean_sim < -0.8:
-#                 print("  ❌ ALIGNMENT: INVERTED (方向差180度) -> 需要给其中一个取反")
-#             else:
-#                 print("  ⚠️ ALIGNMENT: MISMATCH (可能轴错位或坐标系定义不同)")
-#
-#             # 轴向检查
-#             axes = ['X', 'Y', 'Z']
-#             print("  --- Axis Check ---")
-#             for i in range(3):
-#                 # 只有当分量绝对值足够大时才值得比较正负号
-#                 if abs(s_mean[i]) > 0.1:
-#                     match = "MATCH" if (s_mean[i] * p_mean[i] > 0) else "FLIPPED"
-#                     print(f"  Axis {axes[i]}: {match} (Val: {s_mean[i]:.4f} vs {p_mean[i]:.4f})")
-#             print("=======================================================\n")
-#         # ========================================================
-#         # [DEBUG END]
-#
-#         # 5. 替换 Target 中平面区域的值
-#         target_normal_permuted = target_normal.permute(1, 2, 0)  # [H, W, 3]
-#         target_normal_permuted[is_planar_mask] = plane_normals_world
-#         target_normal = target_normal_permuted.permute(2, 0, 1)  # [3, H, W]
-#
-#     return target_normal
 
 def build_plane_normal_gt(viewpoint):
     H, W = viewpoint.image_height, viewpoint.image_width
     plane_equations, label_map, num_planes = prepare_plane_data(viewpoint)
+
     # 如果数据缺失，返回全0的法线图
     if not isinstance(plane_equations, torch.Tensor) or not isinstance(label_map, torch.Tensor):
         return torch.zeros((3, H, W), dtype=torch.float32, device="cuda")
 
-    if isinstance(label_map, np.ndarray):
-        label_map = torch.from_numpy(label_map).long().cuda()
+    # 确保 label_map 与 plane_equations 在同一 device 且为 long
+    if label_map.device != plane_equations.device:
+        label_map = label_map.to(device=plane_equations.device)
+    label_map = label_map.long()
+    plane_equations = plane_equations.float().to(device=plane_equations.device)
 
     # 初始化为 0（三通道）
     target_normal = torch.zeros((3, H, W), dtype=torch.float32, device=plane_equations.device)
 
-    is_planar_mask = (label_map < num_planes) & (label_map >= 0)
+    # 安全地将 num_planes 转为 int
+    try:
+        num_planes_int = int(num_planes)
+    except Exception:
+        num_planes_int = int(plane_equations.shape[0])
+
+    # 构造平面掩码并早期返回
+    is_planar_mask = (label_map < num_planes_int) & (label_map >= 0)
     if is_planar_mask.sum() == 0:
         return target_normal
 
-    valid_plane_ids = label_map[is_planar_mask]  # [N]
-    plane_normals_cam = plane_equations[valid_plane_ids, :3]  # [N,3]
+    # 从 label_map 中按掩码取出 plane id，并防护性 clamp 避免越界
+    valid_plane_ids = label_map[is_planar_mask].long()
+    if valid_plane_ids.numel() == 0:
+        return target_normal
+    valid_plane_ids = torch.clamp(valid_plane_ids, 0, plane_equations.shape[0] - 1)
+
+    # 索引获取平面法线（相机系）
+    try:
+        plane_normals_cam = plane_equations[valid_plane_ids, :3]  # [N,3]
+    except Exception:
+        return target_normal
+
+    # 防护：去除 NaN/Inf
+    if not torch.isfinite(plane_normals_cam).all():
+        plane_normals_cam = torch.nan_to_num(plane_normals_cam, nan=0.0, posinf=1e3, neginf=-1e3)
 
     # 坐标系对齐（与文件中其他函数保持一致）
     axis_flip = torch.tensor([1.0, -1.0, -1.0], device=plane_normals_cam.device, dtype=plane_normals_cam.dtype)
     plane_normals_cam = plane_normals_cam * axis_flip
 
-    # 旋转到世界坐标系
-    R_w2c = viewpoint.world_view_transform[:3, :3]
+    # 旋转到世界坐标系，确保 R 在相同 device
+    R_w2c = viewpoint.world_view_transform[:3, :3].to(device=plane_normals_cam.device, dtype=plane_normals_cam.dtype)
     plane_normals_world = plane_normals_cam @ R_w2c.T
     plane_normals_world = torch.nn.functional.normalize(plane_normals_world, dim=1)
 
-    # 写回到 [3, H, W]
-    target_normal_permuted = target_normal.permute(1, 2, 0)  # [H, W, 3]
+    # 写回到 [3, H, W]（以 boolean mask 的顺序对应上面的 valid_plane_ids）
+    target_normal_permuted = target_normal.permute(1, 2, 0).contiguous()  # [H, W, 3]
+    # 确保掩码数量匹配，否则保守返回
+    if plane_normals_world.shape[0] != is_planar_mask.sum().item():
+        # 尝试使用 positions 索引写回，保证顺序一致
+        positions = is_planar_mask.nonzero(as_tuple=False)
+        if plane_normals_world.shape[0] == positions.shape[0]:
+            rows = positions[:, 0]
+            cols = positions[:, 1]
+            target_normal_permuted[rows, cols] = plane_normals_world
+            target_normal = target_normal_permuted.permute(2, 0, 1)
+            return target_normal
+        return target_normal
+
+    # 直接按布尔掩码写回
     target_normal_permuted[is_planar_mask] = plane_normals_world
     target_normal = target_normal_permuted.permute(2, 0, 1)  # [3, H, W]
 
@@ -609,120 +443,87 @@ def build_plane_normal_gt(viewpoint):
 
 
 def build_combined_normal_gt(viewpoint):
-
     """
-    构建混合法线监督目标 (World Space)
-    输入:
-        sensor_normal: [1, 3, H, W] 或 [3, H, W] (Camera Space, OpenCV定义)
-        plane_equations: [M, 4] (Camera Space)
-    输出:
-        target_normal: [3, H, W] (World Space)
+    用平面法线替换网络/传感器法线的平面区域，增加越界与设备检查以避免 CUDA device-side assert。
     """
-    # 获取传感器法线,将法线从相机空间转换到世界空间
-    H, W = viewpoint.image_height, viewpoint.image_width
-    sensor_depth2normal = viewpoint.normal #(1,3,H,W)
-    sensor_depth2normal_world = (viewpoint.T[0:3, 0:3].T @ sensor_depth2normal.view(3, -1)).view(3, H, W) # (3,H,W)
-    # 网络估计法线
+    try:
+        H, W = viewpoint.image_height, viewpoint.image_width
 
-    # 属于平面的像素对应网络估计的法线，非平面的像素对应传感器法线
+        # 传感器法线 -> world (保持原实现思路)
+        sensor_depth2normal = viewpoint.normal  # 形状 (1,3,H,W) 或 (3,H,W)
+        device = sensor_depth2normal.device if isinstance(sensor_depth2normal, torch.Tensor) else torch.device("cuda")
+        sensor_depth2normal = sensor_depth2normal.to(device)
+        sensor_depth2normal_world = (viewpoint.T[0:3, 0:3].T @ sensor_depth2normal.view(3, -1)).view(3, H, W)
 
-    # 2. 坐标系对齐 (OpenCV -> OpenGL/3DGS)
-    # 必须与下面平面法线的处理保持一致！
-    axis_flip = torch.tensor([1.0, -1.0, -1.0], device="cuda", dtype=sensor_depth2normal.dtype)
-    # normal_cam = normal_cam * axis_flip
+        target_normal = sensor_depth2normal_world  # 基础目标
 
-    # 3. 旋转到世界坐标系
-    # R_w2c 是 World-to-Camera 矩阵 (通常是 row-major 的 rotation)
-    # 所以 Camera-to-World 的变换是乘 R_w2c.T
-    R_w2c = viewpoint.world_view_transform[:3, :3]  # 右x、上y、后z (OpenGL坐标系)
-    # normal_world = normal_cam @ R_w2c.T
+        # 获取平面数据（prepare_plane_data 已做初步转换）
+        plane_equations, label_map, num_planes = prepare_plane_data(viewpoint)
 
-    # 4. 归一化 (防止插值或计算误差)
-    # normal_world = torch.nn.functional.normalize(normal_world, dim=1)
+        # 验证平面数据有效性
+        if not (isinstance(plane_equations, torch.Tensor) and isinstance(label_map, torch.Tensor)):
+            return target_normal
 
-    # 5. 还原形状 [N, 3] -> [3, H, W] 并作为基础 target
-    # 此时 target_normal 存储的是全图的 Sensor Normal (World Space)
-    #target_normal = normal_world.reshape(H, W, 3).permute(2, 0, 1)
-    target_normal = sensor_depth2normal_world  # [3, H, W]
+        # 统一 device/dtype
+        if plane_equations.device != device:
+            plane_equations = plane_equations.to(device)
+        if label_map.device != device:
+            label_map = label_map.to(device)
+        plane_equations = plane_equations.float()
 
-    # =========================================================
-    # 平面区域替换逻辑 (保持不变)
-    # =========================================================
-    plane_equations, label_map, num_planes = prepare_plane_data(viewpoint)
+        # 构造平面掩码（仅标记在 [0, num_planes-1] 范围内的平面像素）
+        try:
+            num_planes_int = int(num_planes)
+        except Exception:
+            num_planes_int = int(plane_equations.shape[0])
+        is_planar_mask = (label_map < num_planes_int) & (label_map >= 0)
 
-    if isinstance(label_map, np.ndarray):
-        label_map = torch.from_numpy(label_map).long().cuda()
+        if is_planar_mask.sum() == 0:
+            return target_normal
 
-    is_planar_mask = (label_map < num_planes) & (label_map >= 0)
+        # 获取所有平面像素的平面 id
+        valid_plane_ids = label_map[is_planar_mask]  # [N]
+        # 过滤掉超出 plane_equations 范围的 id
+        valid_id_mask = (valid_plane_ids >= 0) & (valid_plane_ids < plane_equations.shape[0])
+        if valid_id_mask.sum() == 0:
+            return target_normal
 
-    if is_planar_mask.sum() > 0:
-        valid_plane_ids = label_map[is_planar_mask]
+        # 获取对应像素坐标（row, col），按同样顺序过滤
+        positions = is_planar_mask.nonzero(as_tuple=False)  # [N, 2] -> (row, col)
+        positions = positions[valid_id_mask]
+        plane_ids_filtered = valid_plane_ids[valid_id_mask].long()
 
-        # 提取平面法线 (Camera Space)
-        plane_normals_cam = plane_equations[valid_plane_ids, :3]
+        # 从 plane_equations 安全索引平面法线
+        plane_normals_cam = plane_equations[plane_ids_filtered, :3].float().to(device)
+        # 防护：去除 NaN/Inf
+        if not torch.isfinite(plane_normals_cam).all():
+            plane_normals_cam = torch.nan_to_num(plane_normals_cam, nan=0.0, posinf=1e3, neginf=-1e3)
 
-        # [修正 2]: 保持平面法线的处理逻辑
-        # 这里的 axis_flip 已经定义过了，直接复用逻辑
+        # 坐标系对齐 & 旋转到 world（保持与代码库一致的 axis_flip 与 R）
+        axis_flip = torch.tensor([1.0, -1.0, -1.0], device=device, dtype=plane_normals_cam.dtype)
         plane_normals_cam = plane_normals_cam * axis_flip
 
-        # 旋转到世界坐标系 (Camera -> World)
+        R_w2c = viewpoint.world_view_transform[:3, :3].to(device)
         plane_normals_world = plane_normals_cam @ R_w2c.T
-        # 归一化
         plane_normals_world = torch.nn.functional.normalize(plane_normals_world, dim=1)
 
-        # ========================================================
-        # [DEBUG START]: 检查同一区域的 Sensor Normal 和 Plane Normal 是否一致
-        # ========================================================
-        # 建议仅在特定帧打印，防止刷屏 (例如第0帧或每100帧)
-        # if viewpoint.uid == 0:
-        #     # 1. 提取 Mask 区域内的 Sensor Normal (作为 Reference)
-        #     # target_normal 目前是 [3, H, W]，先转为 [H, W, 3] 再用 mask 索引
-        #     sensor_vectors = target_normal.permute(1, 2, 0)[is_planar_mask]  # Shape: [N_planar, 3]
-        #
-        #     # 2. 获取对应的 Plane Normal (作为 Candidate)
-        #     plane_vectors = plane_normals_world  # Shape: [N_planar, 3]
-        #
-        #     # 3. 计算均值对比 (用于检查轴是否翻转)
-        #     s_mean = sensor_vectors.mean(dim=0).cpu().numpy()
-        #     p_mean = plane_vectors.mean(dim=0).cpu().numpy()
-        #
-        #     # 4. 计算余弦相似度 (点积)
-        #     # dim=1 表示对每个像素的 xyz 向量做点积
-        #     dot_prod = torch.sum(sensor_vectors * plane_vectors, dim=1)
-        #     mean_sim = dot_prod.mean().item()
-        #
-        #     print(f"\n>>> DEBUG Normals Alignment (Frame {viewpoint.uid}) <<<")
-        #     print(f"  Sensor Mean (World): [{s_mean[0]:.4f}, {s_mean[1]:.4f}, {s_mean[2]:.4f}]")
-        #     print(f"  Plane  Mean (World): [{p_mean[0]:.4f}, {p_mean[1]:.4f}, {p_mean[2]:.4f}]")
-        #     print(f"  Mean Cosine Similarity: {mean_sim:.4f}")
-        #
-        #     # 自动诊断
-        #     if mean_sim > 0.8:
-        #         print("  ✅ ALIGNMENT: EXCELLENT (方向一致)")
-        #     elif mean_sim < -0.8:
-        #         print("  ❌ ALIGNMENT: INVERTED (方向差180度) -> 需要给其中一个取反")
-        #     else:
-        #         print("  ⚠️ ALIGNMENT: MISMATCH (可能轴错位或坐标系定义不同)")
-        #
-        #     # 轴向检查
-        #     axes = ['X', 'Y', 'Z']
-        #     print("  --- Axis Check ---")
-        #     for i in range(3):
-        #         # 只有当分量绝对值足够大时才值得比较正负号
-        #         if abs(s_mean[i]) > 0.1:
-        #             match = "MATCH" if (s_mean[i] * p_mean[i] > 0) else "FLIPPED"
-        #             print(f"  Axis {axes[i]}: {match} (Val: {s_mean[i]:.4f} vs {p_mean[i]:.4f})")
-        #     print("=======================================================\n")
-        # ========================================================
-        # [DEBUG END]
+        # 最后安全赋值：使用显式 (row, col) 索引，保证行数一致
+        if plane_normals_world.shape[0] != positions.shape[0]:
+            # 不匹配则保守返回原目标以避免崩溃
+            return target_normal
 
-        # 5. 替换 Target 中平面区域的值
-        target_normal_permuted = target_normal.permute(1, 2, 0)  # [H, W, 3]
-        target_normal_permuted[is_planar_mask] = plane_normals_world
-        target_normal = target_normal_permuted.permute(2, 0, 1)  # [3, H, W]
+        target_normal_permuted = target_normal.permute(1, 2, 0).contiguous()  # [H, W, 3]
+        rows = positions[:, 0]
+        cols = positions[:, 1]
+        # 逐像素批量赋值（形状对齐： [K,3]）
+        target_normal_permuted[rows, cols] = plane_normals_world
+        target_normal = target_normal_permuted.permute(2, 0, 1)
 
-    return target_normal
+        return target_normal
 
+    except Exception:
+        # 出任何异常都返回基础传感器法线，避免进程崩溃（也可以在 debug 时打印错误）
+        return sensor_depth2normal_world
 
 
 def get_depth_dist_loss(render_pkg):
