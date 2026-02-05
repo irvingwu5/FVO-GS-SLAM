@@ -413,12 +413,12 @@ def build_plane_normal_gt(viewpoint):
         plane_normals_cam = torch.nan_to_num(plane_normals_cam, nan=0.0, posinf=1e3, neginf=-1e3)
 
     # 坐标系对齐（与文件中其他函数保持一致）
-    axis_flip = torch.tensor([1.0, -1.0, -1.0], device=plane_normals_cam.device, dtype=plane_normals_cam.dtype)
+    axis_flip = torch.tensor([-1.0, 1.0, 1.0], device=plane_normals_cam.device, dtype=plane_normals_cam.dtype)
     plane_normals_cam = plane_normals_cam * axis_flip
 
     # 旋转到世界坐标系，确保 R 在相同 device
     R_w2c = viewpoint.world_view_transform[:3, :3].to(device=plane_normals_cam.device, dtype=plane_normals_cam.dtype)
-    plane_normals_world = plane_normals_cam @ R_w2c.T
+    plane_normals_world = plane_normals_cam @ R_w2c
     plane_normals_world = torch.nn.functional.normalize(plane_normals_world, dim=1)
 
     # 写回到 [3, H, W]（以 boolean mask 的顺序对应上面的 valid_plane_ids）
@@ -444,34 +444,42 @@ def build_plane_normal_gt(viewpoint):
 
 def build_combined_normal_gt(viewpoint):
     """
-    用平面法线替换网络/传感器法线的平面区域，增加越界与设备检查以避免 CUDA device-side assert。
+    统一坐标系变换逻辑：将传感器法线与平面先验法线融合并转换至世界坐标系。
+    采用 GS 渲染器兼容的 OpenGL 风格变换：n_world = (n_cam * axis_flip) @ R_w2c
     """
     try:
         H, W = viewpoint.image_height, viewpoint.image_width
+        device = torch.device("cuda")
 
-        # 传感器法线 -> world (保持原实现思路)
-        sensor_depth2normal = viewpoint.normal  # 形状 (1,3,H,W) 或 (3,H,W)
-        device = sensor_depth2normal.device if isinstance(sensor_depth2normal, torch.Tensor) else torch.device("cuda")
-        sensor_depth2normal = sensor_depth2normal.to(device)
-        sensor_depth2normal_world = (viewpoint.T[0:3, 0:3].T @ sensor_depth2normal.view(3, -1)).view(3, H, W)
+        # 1. 获取基础旋转矩阵 R_w2c (从 viewpoint.world_view_transform 提取)
+        # 注意：GS 框架中此矩阵通常已是行优先存储
+        R_w2c = viewpoint.world_view_transform[:3, :3].to(device)
+        axis_flip = torch.tensor([-1.0, 1.0, 1.0], device=device).float()
+        # 2. 处理传感器法线 (Sensor Depth-to-Normal)
+        sensor_depth2normal = viewpoint.normal.to(device)  # 预期形状 [3, H, W]
 
-        target_normal = sensor_depth2normal_world  # 基础目标
+        # 将传感器法线转换到世界系，逻辑必须与平面法线完全一致
+        sensor_flat = sensor_depth2normal.view(3, -1).permute(1, 0).contiguous()  # [HW, 3]
+        sensor_flat = sensor_flat * axis_flip
+        sensor_world_flat = sensor_flat @ R_w2c
+        sensor_depth2normal_world = sensor_world_flat.permute(1, 0).view(3, H, W)
+        # 归一化，确保单位向量一致性
+        sensor_depth2normal_world = torch.nn.functional.normalize(sensor_depth2normal_world, dim=0)
 
-        # 获取平面数据（prepare_plane_data 已做初步转换）
+        # 初始目标设为传感器法线图
+        target_normal = sensor_depth2normal_world
+
+        # 3. 获取平面数据并进行融合
         plane_equations, label_map, num_planes = prepare_plane_data(viewpoint)
 
-        # 验证平面数据有效性
+        # 验证平面数据有效性，若无效则直接返回传感器法线
         if not (isinstance(plane_equations, torch.Tensor) and isinstance(label_map, torch.Tensor)):
             return target_normal
 
-        # 统一 device/dtype
-        if plane_equations.device != device:
-            plane_equations = plane_equations.to(device)
-        if label_map.device != device:
-            label_map = label_map.to(device)
-        plane_equations = plane_equations.float()
+        plane_equations = plane_equations.to(device).float()
+        label_map = label_map.to(device).long()
 
-        # 构造平面掩码（仅标记在 [0, num_planes-1] 范围内的平面像素）
+        # 构造平面掩码
         try:
             num_planes_int = int(num_planes)
         except Exception:
@@ -481,50 +489,45 @@ def build_combined_normal_gt(viewpoint):
         if is_planar_mask.sum() == 0:
             return target_normal
 
-        # 获取所有平面像素的平面 id
-        valid_plane_ids = label_map[is_planar_mask]  # [N]
-        # 过滤掉超出 plane_equations 范围的 id
+        # 获取平面区域像素的 ID 和位置
+        valid_plane_ids = label_map[is_planar_mask]
         valid_id_mask = (valid_plane_ids >= 0) & (valid_plane_ids < plane_equations.shape[0])
+
         if valid_id_mask.sum() == 0:
             return target_normal
 
-        # 获取对应像素坐标（row, col），按同样顺序过滤
-        positions = is_planar_mask.nonzero(as_tuple=False)  # [N, 2] -> (row, col)
-        positions = positions[valid_id_mask]
-        plane_ids_filtered = valid_plane_ids[valid_id_mask].long()
+        positions = is_planar_mask.nonzero(as_tuple=False)[valid_id_mask]
+        plane_ids_filtered = valid_plane_ids[valid_id_mask]
 
-        # 从 plane_equations 安全索引平面法线
-        plane_normals_cam = plane_equations[plane_ids_filtered, :3].float().to(device)
-        # 防护：去除 NaN/Inf
+        # 4. 转换平面法线到世界系
+        plane_normals_cam = plane_equations[plane_ids_filtered, :3]
+        # 防护 NaN/Inf
         if not torch.isfinite(plane_normals_cam).all():
-            plane_normals_cam = torch.nan_to_num(plane_normals_cam, nan=0.0, posinf=1e3, neginf=-1e3)
+            plane_normals_cam = torch.nan_to_num(plane_normals_cam, nan=0.0)
 
-        # 坐标系对齐 & 旋转到 world（保持与代码库一致的 axis_flip 与 R）
-        axis_flip = torch.tensor([1.0, -1.0, -1.0], device=device, dtype=plane_normals_cam.dtype)
+        # 应用相同的坐标轴翻转与旋转
         plane_normals_cam = plane_normals_cam * axis_flip
-
-        R_w2c = viewpoint.world_view_transform[:3, :3].to(device)
-        plane_normals_world = plane_normals_cam @ R_w2c.T
+        plane_normals_world = plane_normals_cam @ R_w2c
         plane_normals_world = torch.nn.functional.normalize(plane_normals_world, dim=1)
 
-        # 最后安全赋值：使用显式 (row, col) 索引，保证行数一致
-        if plane_normals_world.shape[0] != positions.shape[0]:
-            # 不匹配则保守返回原目标以避免崩溃
-            return target_normal
-
+        # 5. 安全写回到目标法线图
         target_normal_permuted = target_normal.permute(1, 2, 0).contiguous()  # [H, W, 3]
         rows = positions[:, 0]
         cols = positions[:, 1]
-        # 逐像素批量赋值（形状对齐： [K,3]）
-        target_normal_permuted[rows, cols] = plane_normals_world
+
+        # 用高精度的平面法线覆盖传感器法线区域
+        target_normal_permuted[rows, cols] = plane_normals_world.to(target_normal_permuted.dtype)
+
+        # 转回 [3, H, W]
         target_normal = target_normal_permuted.permute(2, 0, 1)
 
         return target_normal
 
-    except Exception:
-        # 出任何异常都返回基础传感器法线，避免进程崩溃（也可以在 debug 时打印错误）
-        return sensor_depth2normal_world
-
+    except Exception as e:
+        # 打印错误详情有助于调试坐标系问题
+        print(f"[Error in build_combined_normal_gt]: {e}")
+        # 出错时返回单位化的原法线防止崩溃
+        return torch.nn.functional.normalize(viewpoint.normal, dim=0).to(viewpoint.normal.device)
 
 def get_depth_dist_loss(render_pkg):
     rend_dist = render_pkg["rend_dist"]
@@ -597,6 +600,46 @@ def _save_gt_normal(tensor, save_dir, cam_idx, basename="normal_gt"):
 
     file_path = os.path.join(save_dir, f"{basename}_{cam_idx}.png")
     _save_tensor_as_image(vis_tensor, file_path, normal_map=True)
+
+
+def check_normal_dir(rend_normal, gt_normal, mask=None):
+    """
+    检查渲染法线和真值法线的方向一致性
+    rend_normal: [3, H, W]
+    gt_normal: [3, H, W]
+    """
+    with torch.no_grad():
+        if mask is not None:
+            # 仅在有效区域检查
+            r_n = rend_normal[:, mask > 0]
+            g_n = gt_normal[:, mask > 0]
+        else:
+            r_n = rend_normal.flatten(1)
+            g_n = gt_normal.flatten(1)
+
+        # 1. 计算点积 (Cosine Similarity)
+        cos_sim = (r_n * g_n).sum(dim=0)
+        avg_cos = cos_sim.mean().item()
+
+        # 2. 计算平均角度 (Degrees)
+        # 限制范围在 [-1, 1] 防止 acos 报错
+        angle = torch.acos(cos_sim.clamp(-1.0, 1.0)) * (180.0 / 3.1415926)
+        avg_angle = angle.mean().item()
+
+        # 3. 检查各分量的对齐情况 (X, Y, Z)
+        # 如果某一个轴的均值是负数，说明该轴镜像反了
+        axis_alignment = (r_n * g_n).mean(dim=1)
+
+        print("-" * 30)
+        print(f"[Normal Check] Avg Cosine Similarity: {avg_cos:.4f}")
+        print(f"[Normal Check] Avg Angle Error: {avg_angle:.2f} degrees")
+        print(f"[Normal Check] Axis Alignment (X, Y, Z): {axis_alignment.tolist()}")
+
+        if avg_cos < 0:
+            print("警告：法线方向整体相反（钝角）！请检查坐标系定义。")
+        elif abs(avg_cos) < 0.1:
+            print("警告：法线几乎正交！极有可能是坐标轴顺序 (e.g., XYZ vs YZX) 错误。")
+        print("-" * 30)
 
 
 def _save_rendered_rgb(render_pkg, save_dir, cam_idx, basename="rgb"):

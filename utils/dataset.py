@@ -22,7 +22,7 @@ class ReplicaParser:
         self.color_paths = sorted(glob.glob(f"{self.input_folder}/image/*.jpg"))
         self.depth_paths = sorted(glob.glob(f"{self.input_folder}/depth/*.png"))
         if has_label:
-            self.label_paths = sorted(glob.glob(f"{self.input_folder}/plane/*label.txt")) # 添加标签文件路径
+            self.label_paths = sorted(glob.glob(f"{self.input_folder}/label/*label.txt")) # 添加标签文件路径
             self.plane_params = sorted(glob.glob(f"{self.input_folder}/plane/*data.txt")) # 添加平面参数文件路径
         self.n_img = len(self.color_paths)
         self.load_poses(f"{self.input_folder}/traj.txt")

@@ -13,7 +13,7 @@ from utils.pose_utils import update_pose
 from utils.slam_utils import (get_loss_mapping,get_loss_mapping_plane_constraint,
                               get_depth_dist_loss,get_normal_consistency_loss,
                               _save_normal_pair, _save_rendered_rgb,_save_gt_normal,
-                              build_combined_normal_gt,build_plane_normal_gt)
+                              build_combined_normal_gt,build_plane_normal_gt,check_normal_dir)
 
 # 它主要负责全局地图构建（Mapping）和光束法平差（Bundle Adjustment）
 # BackEnd 的核心设计模式是维护全局一致性。前端只关心“当前在哪里”，而后端关心“整个地图长什么样以及历史轨迹是否准确”。
@@ -183,10 +183,10 @@ class BackEnd(mp.Process):
         frames_to_optimize = self.config["Training"]["pose_window"]
 
         current_window_set = set(current_window)
-        for cam_idx, viewpoint in self.viewpoints.items():
-            if cam_idx in current_window_set:
+        for cam_idx, viewpoint in self.viewpoints.items(): #遍历窗口内所有关键帧
+            if cam_idx in current_window_set: #跳过当前窗口内的帧
                 continue
-            random_viewpoint_stack.append(viewpoint)
+            random_viewpoint_stack.append(viewpoint) #其余帧加入随机采样列表
 
         # 获取当前窗口中最新的帧的索引（假设 current_window 是按时间顺序排列的）
         # 通常 current_window[-1] 是最新的帧
@@ -201,13 +201,7 @@ class BackEnd(mp.Process):
             n_touched_acm = []
             keyframes_opt = []
             # 对多帧渲染计算联合损失，对当前滑动窗口内的关键帧进行优化
-            # =========================================================
-            # 循环 1: 当前窗口 (Current Window) window_size=10
-            # 分级优化策略，最新帧：几何最不稳定强约束、次新帧：几何尚未完全收敛适度约束、窗口尾部老帧：几何基本稳定，可以降级处理
-            # 几何活跃窗口：最近的2-3帧，开启surf=true计算法线和失真损失、光度活跃窗口:剩下的7-8帧，surf=false只计算光度损失
-            # =========================================================
             # current_window 通常是 [oldest, ..., newest]
-            # 我们倒序遍历，先处理新帧
             for i in range(len(current_window)):
                 viewpoint = viewpoint_stack[i]
                 keyframes_opt.append(viewpoint)
@@ -309,7 +303,8 @@ class BackEnd(mp.Process):
                     # 假设 build_plane_normal_gt 返回世界坐标系的法线
                     gt_normal = build_plane_normal_gt(viewpoint)
                     #_save_gt_normal(gt_normal, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid)
-                    normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()  # 0.9128
+                    #_save_gt_normal(rend_normal, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid,"rend")
+                    normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()  #
                     loss_mapping += (self.config["opt_params"]["lambda_normal"] * normal_error)
                 # ==========================================
                 # 模式 3: 混合监督 (Mixed)
@@ -318,12 +313,14 @@ class BackEnd(mp.Process):
                     # 假设 build_combined_normal_gt 内部处理了传感器法线与平面的融合，并返回世界坐标系法线
                     gt_normal = build_combined_normal_gt(viewpoint)
                     #_save_gt_normal(gt_normal, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid)
-                    normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()  # 0.9128
+                    #_save_gt_normal(rend_normal,"/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid, "rend")
+                    #check_normal_dir(rend_normal, gt_normal)
+                    normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()  # 0.6849
                     loss_mapping += (self.config["opt_params"]["lambda_normal"] * normal_error)
 
             if self.use_plane_constraint and itr == 0:
-                proj_loss = get_loss_mapping_plane_constraint(self.gaussians, viewpoint,'huber') #0.0001
-                loss_mapping += self.config["opt_params"]["lambda_plane"] * proj_loss #10*0.0001
+                proj_loss = get_loss_mapping_plane_constraint(self.gaussians, viewpoint,'huber') #5.3299e-05
+                loss_mapping += self.config["opt_params"]["lambda_plane"] * proj_loss #
 
             loss_mapping.backward()
             gaussian_split = False
@@ -453,23 +450,31 @@ class BackEnd(mp.Process):
             Ll1_depth = l1_loss(depth * gt_depth_mask, gt_depth * gt_depth_mask)
             #------------------------
             scaling = self.gaussians.get_scaling
-            isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
+            isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1)).mean()
             #------------------------
             # loss = (1.0 - self.opt_params.lambda_dssim) * (
             #     Ll1
             # ) + self.opt_params.lambda_dssim * (1.0 - ssim(image, gt_image))
-            # python
-            loss = (1.0 - self.opt_params.lambda_dssim) * Ll1 + self.opt_params.lambda_dssim * (
-                        1.0 - ssim(image, gt_image)) + 0.1 * isotropic_loss.mean() + 0.01 * Ll1_depth
+            # loss = (1.0 - self.opt_params.lambda_dssim) * Ll1 + self.opt_params.lambda_dssim * (
+            #             1.0 - ssim(image, gt_image)) + 0.1 * isotropic_loss.mean() + 0.01 * Ll1_depth
             #loss = Ll1 + 0.1 * isotropic_loss.mean() + 0.01 * Ll1_depth
-            #loss = Ll1 + 0.01 * Ll1_depth
+            # 2. 权重退火（关键优化：后期减弱几何约束以冲刺 PSNR）
+            # 初始权重设为 0.1，后期线性减小
+            lambda_dist = 0.1 if iteration < 15000 else 0.1 * (1 - (iteration - 15000) / 11000)
+            lambda_iso = 0.1 if iteration < 15000 else 0.1 * (1 - (iteration - 15000) / 11000)
+
+            loss = Ll1 + lambda_iso * isotropic_loss + 0.01 * Ll1_depth
             #------------------------
             if self.use_normal:
                 rend_normal = render_pkg["rend_normal"]
                 surf_normal = render_pkg["surf_normal"]
                 normal_error =(1 - (rend_normal * (-surf_normal)).sum(dim=0))[None]
                 normal_loss = 0.005 * normal_error.mean()
-                loss += normal_loss
+                # 加入 Distortion Loss
+                dist_loss = get_depth_dist_loss(render_pkg)
+
+                loss += normal_loss + lambda_dist * dist_loss
+
             #------------------------
             loss.backward()
             with torch.no_grad():
