@@ -1,5 +1,7 @@
 import torch
 import numpy as np
+import matplotlib.pyplot as plt
+import os
 
 def image_gradient(image):
     # Compute image gradient using Scharr Filter
@@ -368,7 +370,7 @@ def get_loss_mapping_plane_constraint(gaussians, viewpoint, loss_type=None):
     return loss
 
 
-def build_plane_normal_gt(viewpoint):
+def build_plane_normal_gt(viewpoint, config=None):
     H, W = viewpoint.image_height, viewpoint.image_width
     plane_equations, label_map, num_planes = prepare_plane_data(viewpoint)
 
@@ -413,12 +415,19 @@ def build_plane_normal_gt(viewpoint):
         plane_normals_cam = torch.nan_to_num(plane_normals_cam, nan=0.0, posinf=1e3, neginf=-1e3)
 
     # 坐标系对齐（与文件中其他函数保持一致）
-    axis_flip = torch.tensor([-1.0, 1.0, 1.0], device=plane_normals_cam.device, dtype=plane_normals_cam.dtype)
-    plane_normals_cam = plane_normals_cam * axis_flip
+    # if config["Dataset"]["type"] == "tum": #opencv
+    #     axis_flip = torch.tensor([1.0, -1.0, -1.0], device=plane_normals_cam.device, dtype=plane_normals_cam.dtype)
+    # else: #openGL
+    #     axis_flip = torch.tensor([-1.0, -1.0, -1.0], device=plane_normals_cam.device, dtype=plane_normals_cam.dtype)
+    #plane_normals_cam = plane_normals_cam * axis_flip
 
     # 旋转到世界坐标系，确保 R 在相同 device
     R_w2c = viewpoint.world_view_transform[:3, :3].to(device=plane_normals_cam.device, dtype=plane_normals_cam.dtype)
-    plane_normals_world = plane_normals_cam @ R_w2c
+    if config["Dataset"]["type"] == "tum":
+        plane_normals_world = plane_normals_cam @ R_w2c.T
+    else:
+        plane_normals_world = plane_normals_cam @ R_w2c.T
+
     plane_normals_world = torch.nn.functional.normalize(plane_normals_world, dim=1)
 
     # 写回到 [3, H, W]（以 boolean mask 的顺序对应上面的 valid_plane_ids）
@@ -454,14 +463,14 @@ def build_combined_normal_gt(viewpoint):
         # 1. 获取基础旋转矩阵 R_w2c (从 viewpoint.world_view_transform 提取)
         # 注意：GS 框架中此矩阵通常已是行优先存储
         R_w2c = viewpoint.world_view_transform[:3, :3].to(device)
-        axis_flip = torch.tensor([-1.0, 1.0, 1.0], device=device).float()
+        axis_flip = torch.tensor([-1.0, -1.0, -1.0], device=device).float()
         # 2. 处理传感器法线 (Sensor Depth-to-Normal)
         sensor_depth2normal = viewpoint.normal.to(device)  # 预期形状 [3, H, W]
 
         # 将传感器法线转换到世界系，逻辑必须与平面法线完全一致
         sensor_flat = sensor_depth2normal.view(3, -1).permute(1, 0).contiguous()  # [HW, 3]
         sensor_flat = sensor_flat * axis_flip
-        sensor_world_flat = sensor_flat @ R_w2c
+        sensor_world_flat = sensor_flat @ R_w2c.T
         sensor_depth2normal_world = sensor_world_flat.permute(1, 0).view(3, H, W)
         # 归一化，确保单位向量一致性
         sensor_depth2normal_world = torch.nn.functional.normalize(sensor_depth2normal_world, dim=0)
@@ -507,7 +516,7 @@ def build_combined_normal_gt(viewpoint):
 
         # 应用相同的坐标轴翻转与旋转
         plane_normals_cam = plane_normals_cam * axis_flip
-        plane_normals_world = plane_normals_cam @ R_w2c
+        plane_normals_world = plane_normals_cam @ R_w2c.T
         plane_normals_world = torch.nn.functional.normalize(plane_normals_world, dim=1)
 
         # 5. 安全写回到目标法线图
@@ -544,6 +553,40 @@ def get_normal_consistency_loss(render_pkg):
     #normal_loss = (render_alpha - dot_product).mean()
     return normal_loss
 
+
+def save_normal_as_quiver(normal_tensor, save_path, step=20, scale=0.5):
+    """
+    将法线张量可视化为箭头图。
+    :param normal_tensor: [3, H, W] 的 torch.Tensor，范围 [-1, 1]
+    :param save_path: 保存路径
+    :param step: 采样步长，每隔 step 个像素画一个箭头（防止画面太密）
+    :param scale: 箭头长度缩放
+    """
+    # 转换到 CPU 和 numpy [H, W, 3]
+    n = normal_tensor.detach().cpu().permute(1, 2, 0).numpy()
+    h, w, _ = n.shape
+
+    # 创建网格索引
+    y, x = np.mgrid[0:h:step, 0:w:step]
+
+    # 提取下采样后的法线向量
+    u = n[0:h:step, 0:w:step, 0]  # X 分量
+    v = n[0:h:step, 0:w:step, 1]  # Y 分量
+    w_comp = n[0:h:step, 0:w:step, 2]  # Z 分量 (颜色映射可用)
+
+    plt.figure(figsize=(10, 10 * h / w))
+
+    # 画箭头：(x, y) 是起点，(u, -v) 是方向
+    # 注意：图片坐标系 y 轴向下，但 quiver 默认向上，所以 v 可能需要取反或根据需求调整
+    q = plt.quiver(x, y, u, -v, w_comp, cmap='jet', pivot='mid', scale=None, units='xy')
+
+    plt.gca().invert_yaxis()  # 翻转坐标系使其符合图像展示习惯
+    plt.title(f"Normal Quiver Plot (Step: {step})")
+    plt.axis('off')
+    plt.savefig(save_path, bbox_inches='tight', pad_inches=0)
+    plt.close()
+
+
 def _save_tensor_as_image(tensor, path, normal_map=False):
     import os
     from PIL import Image
@@ -571,6 +614,8 @@ def _save_tensor_as_image(tensor, path, normal_map=False):
         img = (t2 - t2.min()) / (t2.max() - t2.min() + 1e-8)
         arr = (img.numpy() * 255).astype(np.uint8)
         Image.fromarray(arr).convert("L").save(path)
+
+
 
 def _save_normal_pair(render_pkg, save_dir, cam_idx, basename="normal"):
     import os

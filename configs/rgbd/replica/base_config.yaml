@@ -64,7 +64,7 @@ Training:
     use_normal: True
     # 互斥选择: "sensor", "plane", "mixed"
     #sensor_depthnomal_supervision、plane_normal_supervision、mixed_normal_supervision
-    normal_mode: "sensor"
+    normal_mode: "plane"
     use_plane_constraint: False
     loss_type: "Huber"  # "l1" or "l2"
     warmup_iter: 2500

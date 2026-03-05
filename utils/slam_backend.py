@@ -4,7 +4,7 @@ import time
 import torch
 import torch.multiprocessing as mp
 from tqdm import tqdm
-
+import os
 from gaussian_splatting.gaussian_renderer import render
 from gaussian_splatting.utils.loss_utils import l1_loss, ssim
 from utils.logging_utils import Log
@@ -12,7 +12,7 @@ from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
 from utils.slam_utils import (get_loss_mapping,get_loss_mapping_plane_constraint,
                               get_depth_dist_loss,get_normal_consistency_loss,
-                              _save_normal_pair, _save_rendered_rgb,_save_gt_normal,
+                              _save_normal_pair, _save_rendered_rgb,_save_gt_normal,save_normal_as_quiver,
                               build_combined_normal_gt,build_plane_normal_gt,check_normal_dir)
 
 # 它主要负责全局地图构建（Mapping）和光束法平差（Bundle Adjustment）
@@ -275,52 +275,69 @@ class BackEnd(mp.Process):
             # 2. 它不依赖于具体的相机视角 (Viewpoint)。
             # 3. 如果在循环内计算，会导致每次渲染一个帧就加一次 loss，导致权重翻倍，梯度爆炸。
             # =========================================================
-            scaling = self.gaussians.get_scaling
-            isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
-            loss_mapping += 0.1 * isotropic_loss.mean() #0.1*0.0024=0.00024
+            # scaling = self.gaussians.get_scaling
+            # isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
+            # loss_mapping += 10 * isotropic_loss.mean() #0.1*0.0024=0.00024
             # -----------------------------------------------
-            if self.use_normal and viewpoint.normal is not None and itr == 0:
-                rend_normal = render_pkg["rend_normal"]
-                depth_pixel_mask = (viewpoint.gt_depth > 0.01).view(*depth.shape)
-                # ==========================================
-                # 模式 1: 纯传感器法线 (Sensor only)
-                # ==========================================
-                if self.normal_mode == "sensor":
-                    # 获取传感器法线并转到世界坐标系
-                    sensor_normal = viewpoint.normal
-                    # 注意：这里假设 viewpoint.T 是 World2Cam，具体转换需根据你的坐标系定义确认
-                    gt_normal = (viewpoint.T[0:3, 0:3].T @ sensor_normal.view(3, -1)).view(
-                        image.shape[0], image.shape[1], image.shape[2]
-                    )
-                    #_save_gt_normal(gt_normal, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/", viewpoint.uid)
-                    normal_mask = gt_normal > 0
-                    normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask * normal_mask).sum(dim=0))[None].mean() #0.9128
-                    loss_mapping += (self.config["opt_params"]["lambda_normal"] * normal_error)
-                # ==========================================
-                # 模式 2: 纯平面先验 (Plane only)
-                # ==========================================
-                elif self.normal_mode == "plane":
-                    # 假设 build_plane_normal_gt 返回世界坐标系的法线
-                    gt_normal = build_plane_normal_gt(viewpoint)
-                    #_save_gt_normal(gt_normal, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid)
-                    #_save_gt_normal(rend_normal, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid,"rend")
-                    normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()  #
-                    loss_mapping += (self.config["opt_params"]["lambda_normal"] * normal_error)
-                # ==========================================
-                # 模式 3: 混合监督 (Mixed)
-                # ==========================================
-                elif self.normal_mode == "mixed":
-                    # 假设 build_combined_normal_gt 内部处理了传感器法线与平面的融合，并返回世界坐标系法线
-                    gt_normal = build_combined_normal_gt(viewpoint)
-                    #_save_gt_normal(gt_normal, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid)
-                    #_save_gt_normal(rend_normal,"/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid, "rend")
-                    #check_normal_dir(rend_normal, gt_normal)
-                    normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()  # 0.6849
-                    loss_mapping += (self.config["opt_params"]["lambda_normal"] * normal_error)
-
-            if self.use_plane_constraint and itr == 0:
-                proj_loss = get_loss_mapping_plane_constraint(self.gaussians, viewpoint,'huber') #5.3299e-05
-                loss_mapping += self.config["opt_params"]["lambda_plane"] * proj_loss #
+            # if self.use_normal and viewpoint.normal is not None and itr == 0:
+            #     rend_normal = render_pkg["rend_normal"]
+            #     depth_pixel_mask = (viewpoint.gt_depth > 0.01).view(*depth.shape)
+            #     # ==========================================
+            #     # 模式 1: 纯传感器法线 (Sensor only)
+            #     # ==========================================
+            #     if self.normal_mode == "sensor":
+            #         # 获取传感器法线并转到世界坐标系
+            #         sensor_normal = viewpoint.normal
+            #         # 注意：这里假设 viewpoint.T 是 World2Cam，具体转换需根据你的坐标系定义确认
+            #         gt_normal = (viewpoint.T[0:3, 0:3].T @ sensor_normal.view(3, -1)).view(
+            #             image.shape[0], image.shape[1], image.shape[2]
+            #         )
+            #         _save_gt_normal(gt_normal, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/", viewpoint.uid)
+            #         _save_gt_normal(rend_normal,"/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid, "rend")
+            #         # --- 新增：保存箭头图 ---
+            #         #quiver_save_dir = "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/quivers/"
+            #         #os.makedirs(quiver_save_dir, exist_ok=True)
+            #         #save_normal_as_quiver(gt_normal, os.path.join(quiver_save_dir, f"gt_{viewpoint.uid}.png"))
+            #         # 保存渲染结果的箭头图
+            #         #save_normal_as_quiver(rend_normal, os.path.join(quiver_save_dir, f"rend_{viewpoint.uid}.png"))
+            #         normal_mask = gt_normal > 0
+            #         normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask * normal_mask).sum(dim=0))[None].mean() #0.9128
+            #         loss_mapping += (self.config["opt_params"]["lambda_normal"] * normal_error)
+            #     # ==========================================
+            #     # 模式 2: 纯平面先验 (Plane only)
+            #     # ==========================================
+            #     elif self.normal_mode == "plane":
+            #         # 假设 build_plane_normal_gt 返回世界坐标系的法线
+            #         gt_normal = build_plane_normal_gt(viewpoint,config=self.config)
+            #         # --- 新增：保存箭头图 ---
+            #         #quiver_save_dir = "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/quivers/"
+            #         #os.makedirs(quiver_save_dir, exist_ok=True)
+            #         _save_gt_normal(gt_normal, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid)
+            #         _save_gt_normal(rend_normal, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid,"rend")
+            #         # 保存 GT 的箭头图
+            #         #save_normal_as_quiver(gt_normal, os.path.join(quiver_save_dir, f"gt_{viewpoint.uid}.png"))
+            #         # 保存渲染结果的箭头图
+            #         #save_normal_as_quiver(rend_normal, os.path.join(quiver_save_dir, f"rend_{viewpoint.uid}.png"))
+            #         # -----------------------
+            #         #check_normal_dir(rend_normal, gt_normal)
+            #         normal_mask = gt_normal > 0
+            #         normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask*normal_mask).sum(dim=0))[None].mean()
+            #         loss_mapping += (self.config["opt_params"]["lambda_normal"] * normal_error)
+            #     # ==========================================
+            #     # 模式 3: 混合监督 (Mixed)
+            #     # ==========================================
+            #     elif self.normal_mode == "mixed":
+            #         # 假设 build_combined_normal_gt 内部处理了传感器法线与平面的融合，并返回世界坐标系法线
+            #         gt_normal = build_combined_normal_gt(viewpoint)
+            #         #_save_gt_normal(gt_normal, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid)
+            #         #_save_gt_normal(rend_normal,"/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid, "rend")
+            #         #check_normal_dir(rend_normal, gt_normal)
+            #         normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()  # 0.6849
+            #         loss_mapping += (self.config["opt_params"]["lambda_normal"] * normal_error)
+            #
+            # if self.use_plane_constraint and itr == 0:
+            #     proj_loss = get_loss_mapping_plane_constraint(self.gaussians, viewpoint,'huber') #5.3299e-05
+            #     loss_mapping += self.config["opt_params"]["lambda_plane"] * proj_loss
 
             loss_mapping.backward()
             gaussian_split = False
@@ -430,7 +447,7 @@ class BackEnd(mp.Process):
             )
             viewpoint_cam = self.viewpoints[viewpoint_cam_idx]
             render_pkg = render(
-                viewpoint_cam, self.gaussians, self.pipeline_params, self.background, surf=True
+                viewpoint_cam, self.gaussians, self.pipeline_params, self.background, surf=False
             )
             image, viewspace_point_tensor, visibility_filter, radii, depth, opacity, n_touched = (
                 render_pkg["render"],
@@ -445,35 +462,35 @@ class BackEnd(mp.Process):
             gt_image = viewpoint_cam.original_image.cuda()
             Ll1 = l1_loss(image, gt_image)
             #------------------------
-            gt_depth = viewpoint_cam.gt_depth
-            gt_depth_mask = gt_depth > 0.0
-            Ll1_depth = l1_loss(depth * gt_depth_mask, gt_depth * gt_depth_mask)
+            # gt_depth = viewpoint_cam.gt_depth
+            # gt_depth_mask = gt_depth > 0.0
+            # Ll1_depth = l1_loss(depth * gt_depth_mask, gt_depth * gt_depth_mask)
+            # #------------------------
+            # scaling = self.gaussians.get_scaling
+            # isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1)).mean()
             #------------------------
-            scaling = self.gaussians.get_scaling
-            isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1)).mean()
-            #------------------------
-            # loss = (1.0 - self.opt_params.lambda_dssim) * (
-            #     Ll1
-            # ) + self.opt_params.lambda_dssim * (1.0 - ssim(image, gt_image))
+            loss = (1.0 - self.opt_params.lambda_dssim) * (
+                Ll1
+            ) + self.opt_params.lambda_dssim * (1.0 - ssim(image, gt_image))
             # loss = (1.0 - self.opt_params.lambda_dssim) * Ll1 + self.opt_params.lambda_dssim * (
             #             1.0 - ssim(image, gt_image)) + 0.1 * isotropic_loss.mean() + 0.01 * Ll1_depth
             #loss = Ll1 + 0.1 * isotropic_loss.mean() + 0.01 * Ll1_depth
             # 2. 权重退火（关键优化：后期减弱几何约束以冲刺 PSNR）
             # 初始权重设为 0.1，后期线性减小
-            lambda_dist = 0.1 if iteration < 15000 else 0.1 * (1 - (iteration - 15000) / 11000)
-            lambda_iso = 0.1 if iteration < 15000 else 0.1 * (1 - (iteration - 15000) / 11000)
-
-            loss = Ll1 + lambda_iso * isotropic_loss + 0.01 * Ll1_depth
+            # lambda_dist = 0.1 if iteration < 15000 else 0.1 * (1 - (iteration - 15000) / 11000)
+            # lambda_iso = 0.1 if iteration < 15000 else 0.1 * (1 - (iteration - 15000) / 11000)
+            #
+            # loss = Ll1 + lambda_iso * isotropic_loss + 0.01 * Ll1_depth
             #------------------------
-            if self.use_normal:
-                rend_normal = render_pkg["rend_normal"]
-                surf_normal = render_pkg["surf_normal"]
-                normal_error =(1 - (rend_normal * (-surf_normal)).sum(dim=0))[None]
-                normal_loss = 0.005 * normal_error.mean()
-                # 加入 Distortion Loss
-                dist_loss = get_depth_dist_loss(render_pkg)
-
-                loss += normal_loss + lambda_dist * dist_loss
+            # if self.use_normal:
+            #     rend_normal = render_pkg["rend_normal"]
+            #     surf_normal = render_pkg["surf_normal"]
+            #     normal_error =(1 - (rend_normal * (-surf_normal)).sum(dim=0))[None]
+            #     normal_loss = 0.005 * normal_error.mean()
+            #     # 加入 Distortion Loss
+            #     dist_loss = get_depth_dist_loss(render_pkg)
+            #
+            #     loss += normal_loss + lambda_dist * dist_loss
 
             #------------------------
             loss.backward()
