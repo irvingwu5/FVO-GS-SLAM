@@ -2,7 +2,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import os
-
+import torch.nn.functional as F
 def image_gradient(image):
     # Compute image gradient using Scharr Filter
     c = image.shape[0]
@@ -63,61 +63,64 @@ def get_loss_tracking(config, image, depth, opacity, viewpoint, initialization=F
     return get_loss_tracking_rgbd(config, image_ab, depth, opacity, viewpoint)
 
 
-# def get_loss_tracking_rgb(config, image, depth, opacity, viewpoint): #主要用于计算 RGB 颜色跟踪损失 (Tracking Loss)。在 SLAM 系统中，这个损失值用于衡量当前渲染出的图像与真实观测图像之间的差异，通常用于优化当前的相机位姿（Tracking 过程）。
-#     gt_image = viewpoint.original_image.cuda()
-#     _, h, w = gt_image.shape
-#     mask_shape = (1, h, w)
-#     rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
-#     rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*mask_shape) #只要像素的 RGB 值之和大于该阈值，就被视为有效像素。这通常用于过滤掉全黑的图像边界或无效区域
-#     rgb_pixel_mask = rgb_pixel_mask * viewpoint.grad_mask #进一步通过外部提供的梯度掩码来筛选纹理丰富区域
-#     # 计算渲染图像与真值图像之间的绝对差值 (L1 Error)，并乘以不透明度掩码，确保只考虑那些被高置信度渲染的像素，这意味着模型渲染出不透明度高（实体表面）的区域，其颜色误差对损失函数的贡献更大；而透明或半透明区域的颜色误差权重较低
-#     l1 = opacity * torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
-#     return l1.mean() #返回整个图像所有像素误差的平均值
-def get_loss_tracking_rgb(config, image, depth, opacity, viewpoint):
+def get_loss_tracking_rgb(config, image, depth, opacity, viewpoint): #主要用于计算 RGB 颜色跟踪损失 (Tracking Loss)。在 SLAM 系统中，这个损失值用于衡量当前渲染出的图像与真实观测图像之间的差异，通常用于优化当前的相机位姿（Tracking 过程）。
     gt_image = viewpoint.original_image.cuda()
-    l1 = opacity * torch.abs(
-        image * viewpoint.rgb_pixel_mask - gt_image * viewpoint.rgb_pixel_mask
-    )
-    # huberloss = torch.nn.HuberLoss(reduction='mean', delta=0.005)
+    _, h, w = gt_image.shape
+    mask_shape = (1, h, w)
+    rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
+    rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*mask_shape) #只要像素的 RGB 值之和大于该阈值，就被视为有效像素。这通常用于过滤掉全黑的图像边界或无效区域
+    rgb_pixel_mask = rgb_pixel_mask * viewpoint.grad_mask #进一步通过外部提供的梯度掩码来筛选纹理丰富区域
+    # 计算渲染图像与真值图像之间的绝对差值 (L1 Error)，并乘以不透明度掩码，确保只考虑那些被高置信度渲染的像素，这意味着模型渲染出不透明度高（实体表面）的区域，其颜色误差对损失函数的贡献更大；而透明或半透明区域的颜色误差权重较低
+    l1 = opacity * torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
+    return l1.mean() #返回整个图像所有像素误差的平均值
 
-    # l1 = opacity * huberloss(image * viewpoint.rgb_pixel_mask,
-    #  gt_image * viewpoint.rgb_pixel_mask)
+# def get_loss_tracking_rgb(config, image, depth, opacity, viewpoint):
+#     gt_image = viewpoint.original_image.cuda()
+#     l1 = opacity * torch.abs(
+#         image * viewpoint.rgb_pixel_mask - gt_image * viewpoint.rgb_pixel_mask
+#     )
+#     # huberloss = torch.nn.HuberLoss(reduction='mean', delta=0.005)
+#
+#     # l1 = opacity * huberloss(image * viewpoint.rgb_pixel_mask,
+#     #  gt_image * viewpoint.rgb_pixel_mask)
+#
+#     return l1.mean()
 
-    return l1.mean()
+
+def get_loss_tracking_rgbd(
+    config, image, depth, opacity, viewpoint, initialization=False
+):
+    alpha = config["Training"]["alpha"] if "alpha" in config["Training"] else 0.95
+
+    gt_depth = torch.from_numpy(viewpoint.depth).to(
+        dtype=torch.float32, device=image.device
+    )[None]
+    depth_pixel_mask = (gt_depth > 0.01).view(*depth.shape)
+    opacity_mask = (opacity > 0.95).view(*depth.shape)
+
+    l1_rgb = get_loss_tracking_rgb(config, image, depth, opacity, viewpoint) #l1加权损失
+    depth_mask = depth_pixel_mask * opacity_mask
+    l1_depth = torch.abs(depth * depth_mask - gt_depth * depth_mask)
+    return alpha * l1_rgb + (1 - alpha) * l1_depth.mean()
 
 
 # def get_loss_tracking_rgbd(
 #     config, image, depth, opacity, viewpoint, initialization=False
 # ):
 #     alpha = config["Training"]["alpha"] if "alpha" in config["Training"] else 0.95
-#
-#     gt_depth = torch.from_numpy(viewpoint.depth).to(
-#         dtype=torch.float32, device=image.device
-#     )[None]
-#     depth_pixel_mask = (gt_depth > 0.01).view(*depth.shape)
+#     depth_pixel_mask = (viewpoint.gt_depth > 0.01).view(*depth.shape)
 #     opacity_mask = (opacity > 0.95).view(*depth.shape)
 #
-#     l1_rgb = get_loss_tracking_rgb(config, image, depth, opacity, viewpoint) #l1加权损失
+#     # if viewpoint.mask is not None:
+#     #     depth_pixel_mask = depth_pixel_mask * viewpoint.mask
+#
+#     l1_rgb = get_loss_tracking_rgb(config, image, depth, opacity, viewpoint)
 #     depth_mask = depth_pixel_mask * opacity_mask
-#     l1_depth = torch.abs(depth * depth_mask - gt_depth * depth_mask)
+#     l1_depth = torch.abs(depth * depth_mask - viewpoint.gt_depth * depth_mask)
+#     # huberloss = torch.nn.HuberLoss(reduction='mean', delta=0.0005)
+#     # l1_depth =huberloss(depth * depth_mask, viewpoint.gt_depth * depth_mask)
+#
 #     return alpha * l1_rgb + (1 - alpha) * l1_depth.mean()
-def get_loss_tracking_rgbd(
-    config, image, depth, opacity, viewpoint, initialization=False
-):
-    alpha = config["Training"]["alpha"] if "alpha" in config["Training"] else 0.95
-    depth_pixel_mask = (viewpoint.gt_depth > 0.01).view(*depth.shape)
-    opacity_mask = (opacity > 0.95).view(*depth.shape)
-
-    # if viewpoint.mask is not None:
-    #     depth_pixel_mask = depth_pixel_mask * viewpoint.mask
-
-    l1_rgb = get_loss_tracking_rgb(config, image, depth, opacity, viewpoint)
-    depth_mask = depth_pixel_mask * opacity_mask
-    l1_depth = torch.abs(depth * depth_mask - viewpoint.gt_depth * depth_mask)
-    # huberloss = torch.nn.HuberLoss(reduction='mean', delta=0.0005)
-    # l1_depth =huberloss(depth * depth_mask, viewpoint.gt_depth * depth_mask)
-
-    return alpha * l1_rgb + (1 - alpha) * l1_depth.mean()
 
 
 def get_loss_mapping(config, image, depth, viewpoint, opacity, initialization=False):
@@ -130,56 +133,61 @@ def get_loss_mapping(config, image, depth, viewpoint, opacity, initialization=Fa
     return get_loss_mapping_rgbd(config, image_ab, depth, viewpoint)
 
 
-# def get_loss_mapping_rgb(config, image, depth, viewpoint):
-#     gt_image = viewpoint.original_image.cuda()
-#     _, h, w = gt_image.shape
-#     mask_shape = (1, h, w)
-#     rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
-#
-#     rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*mask_shape)
-#     l1_rgb = torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
-#
-#     return l1_rgb.mean()
 def get_loss_mapping_rgb(config, image, depth, viewpoint):
     gt_image = viewpoint.original_image.cuda()
-    l1_rgb = torch.abs(
-        image * viewpoint.rgb_pixel_mask_mapping
-        - gt_image * viewpoint.rgb_pixel_mask_mapping
-    )
+    _, h, w = gt_image.shape
+    mask_shape = (1, h, w)
+    rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
+
+    rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*mask_shape)
+    l1_rgb = torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
 
     return l1_rgb.mean()
 
-# def get_loss_mapping_rgbd(config, image, depth, viewpoint, initialization=False):
-#     alpha = config["Training"]["alpha"] if "alpha" in config["Training"] else 0.95
-#     rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
+
+# def get_loss_mapping_rgb(config, image, depth, viewpoint):
 #     gt_image = viewpoint.original_image.cuda()
+#     l1_rgb = torch.abs(
+#         image * viewpoint.rgb_pixel_mask_mapping
+#         - gt_image * viewpoint.rgb_pixel_mask_mapping
+#     )
 #
-#     gt_depth = torch.from_numpy(viewpoint.depth).to(
-#         dtype=torch.float32, device=image.device
-#     )[None]
-#     rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*depth.shape)
-#     depth_pixel_mask = (gt_depth > 0.01).view(*depth.shape)
-#
-#     l1_rgb = torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
-#     l1_depth = torch.abs(depth * depth_pixel_mask - gt_depth * depth_pixel_mask)
-#
-#     return alpha * l1_rgb.mean() + (1 - alpha) * l1_depth.mean()
+#     return l1_rgb.mean()
+
+
 def get_loss_mapping_rgbd(config, image, depth, viewpoint, initialization=False):
     alpha = config["Training"]["alpha"] if "alpha" in config["Training"] else 0.95
+    rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
     gt_image = viewpoint.original_image.cuda()
 
-    rgb_pixel_mask = viewpoint.rgb_pixel_mask_mapping
-
-    depth_pixel_mask = (viewpoint.gt_depth > 0.01).view(*depth.shape)
-    # if viewpoint.mask is not None:
-    #     depth_pixel_mask = depth_pixel_mask * viewpoint.mask
+    gt_depth = torch.from_numpy(viewpoint.depth).to(
+        dtype=torch.float32, device=image.device
+    )[None]
+    rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*depth.shape)
+    depth_pixel_mask = (gt_depth > 0.01).view(*depth.shape)
 
     l1_rgb = torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
-    l1_depth = torch.abs(
-        depth * depth_pixel_mask - viewpoint.gt_depth * depth_pixel_mask
-    )
+    l1_depth = torch.abs(depth * depth_pixel_mask - gt_depth * depth_pixel_mask)
 
     return alpha * l1_rgb.mean() + (1 - alpha) * l1_depth.mean()
+
+
+# def get_loss_mapping_rgbd(config, image, depth, viewpoint, initialization=False):
+#     alpha = config["Training"]["alpha"] if "alpha" in config["Training"] else 0.95
+#     gt_image = viewpoint.original_image.cuda()
+#
+#     rgb_pixel_mask = viewpoint.rgb_pixel_mask_mapping
+#
+#     depth_pixel_mask = (viewpoint.gt_depth > 0.01).view(*depth.shape)
+#     # if viewpoint.mask is not None:
+#     #     depth_pixel_mask = depth_pixel_mask * viewpoint.mask
+#
+#     l1_rgb = torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
+#     l1_depth = torch.abs(
+#         depth * depth_pixel_mask - viewpoint.gt_depth * depth_pixel_mask
+#     )
+#
+#     return alpha * l1_rgb.mean() + (1 - alpha) * l1_depth.mean()
 
 def prepare_plane_data(viewpoint):
     # ------------准备数据，提取当前帧的平面参数和平面id----------------
@@ -371,84 +379,219 @@ def get_loss_mapping_plane_constraint(gaussians, viewpoint, loss_type=None):
 
 
 def build_plane_normal_gt(viewpoint, config=None):
-    H, W = viewpoint.image_height, viewpoint.image_width
+    """
+    根据 Plane Data 和 Label 构建当前帧的世界坐标系 GT 法线图和掩码
+    Returns:
+        gt_normal_world: [3, H, W] 对应像素的世界坐标系法线
+        plane_mask: [1, H, W] bool 类型，表示该像素是否属于检测到的平面
+    """
+    # 1. 获取解析好的数据
     plane_equations, label_map, num_planes = prepare_plane_data(viewpoint)
+    H, W = label_map.shape
 
-    # 如果数据缺失，返回全0的法线图
-    if not isinstance(plane_equations, torch.Tensor) or not isinstance(label_map, torch.Tensor):
-        return torch.zeros((3, H, W), dtype=torch.float32, device="cuda")
+    # 防御性判断：如果没有检测到平面
+    if num_planes == 0:
+        return torch.zeros((3, H, W), device="cuda"), torch.zeros((1, H, W), dtype=torch.bool, device="cuda")
 
-    # 确保 label_map 与 plane_equations 在同一 device 且为 long
-    if label_map.device != plane_equations.device:
-        label_map = label_map.to(device=plane_equations.device)
-    label_map = label_map.long()
-    plane_equations = plane_equations.float().to(device=plane_equations.device)
+    # 2. 提取相机坐标系下的平面法线 (假设 txt 文件中的 nx, ny, nz 存放在前三列)
+    # shape: [num_planes, 3]
+    plane_normals_cam = plane_equations[:, :3]
 
-    # 初始化为 0（三通道）
-    target_normal = torch.zeros((3, H, W), dtype=torch.float32, device=plane_equations.device)
+    # 归一化法线以防精度误差
+    plane_normals_cam = F.normalize(plane_normals_cam, p=2, dim=1)
 
-    # 安全地将 num_planes 转为 int
-    try:
-        num_planes_int = int(num_planes)
-    except Exception:
-        num_planes_int = int(plane_equations.shape[0])
+    # 3. 统一法线朝向 (非常重要！)
+    # 在 OpenCV 相机坐标系(X右，Y下，Z前)中，面向相机的平面，其法线的 Z 分量必须小于 0
+    # 如果 Z > 0 说明法线背向相机，需要将其翻转
+    sign = torch.sign(plane_normals_cam[:, 2:3])  # [num_planes, 1]
+    plane_normals_cam = torch.where(sign > 0, -plane_normals_cam, plane_normals_cam)
+    # ==========================================
+    # 3.5 [核心修复] OpenCV -> OpenGL 坐标系转换
+    # 2DGS 的 world_view_transform 是基于 OpenGL 的
+    # 所以需要翻转 Y 轴和 Z 轴
+    # ==========================================
+    plane_normals_cam[:, 1] = -plane_normals_cam[:, 1]  # Y 下 -> Y 上
+    plane_normals_cam[:, 2] = -plane_normals_cam[:, 2]  # Z 前 -> Z 后
+    # 4. 填充背景（无效）像素的法线为 [0, 0, 0]
+    background_normal = torch.zeros((1, 3), device="cuda", dtype=plane_normals_cam.dtype)
+    # shape: [num_planes + 1, 3]
+    plane_normals_padded = torch.cat([plane_normals_cam, background_normal], dim=0)
 
-    # 构造平面掩码并早期返回
-    is_planar_mask = (label_map < num_planes_int) & (label_map >= 0)
-    if is_planar_mask.sum() == 0:
-        return target_normal
+    # 5. 根据 label_map 映射到全图
+    # (背景/不属于任何平面的像素的 label 默认是 num_planes)
+    # gt_normal_cam shape: [H, W, 3]
+    gt_normal_cam = plane_normals_padded[label_map]
 
-    # 从 label_map 中按掩码取出 plane id，并防护性 clamp 避免越界
-    valid_plane_ids = label_map[is_planar_mask].long()
-    if valid_plane_ids.numel() == 0:
-        return target_normal
-    valid_plane_ids = torch.clamp(valid_plane_ids, 0, plane_equations.shape[0] - 1)
+    # 6. 将相机坐标系下的 GT 法线变换到世界坐标系
+    # 注意：这里的变换必须与你计算 render_normal 时的一模一样
+    R_w2c = viewpoint.world_view_transform[:3, :3]  # 取出 3x3 旋转矩阵
 
-    # 索引获取平面法线（相机系）
-    try:
-        plane_normals_cam = plane_equations[valid_plane_ids, :3]  # [N,3]
-    except Exception:
-        return target_normal
+    # [H, W, 3] @ [3, 3].T -> [H, W, 3]
+    gt_normal_world = torch.matmul(gt_normal_cam, R_w2c.T)
 
-    # 防护：去除 NaN/Inf
-    if not torch.isfinite(plane_normals_cam).all():
-        plane_normals_cam = torch.nan_to_num(plane_normals_cam, nan=0.0, posinf=1e3, neginf=-1e3)
+    # 调整维度为 [3, H, W]
+    gt_normal_world = gt_normal_world.permute(2, 0, 1)
 
-    # 坐标系对齐（与文件中其他函数保持一致）
-    # if config["Dataset"]["type"] == "tum": #opencv
-    #     axis_flip = torch.tensor([1.0, -1.0, -1.0], device=plane_normals_cam.device, dtype=plane_normals_cam.dtype)
-    # else: #openGL
-    #     axis_flip = torch.tensor([-1.0, -1.0, -1.0], device=plane_normals_cam.device, dtype=plane_normals_cam.dtype)
-    #plane_normals_cam = plane_normals_cam * axis_flip
+    # 7. 生成有效平面像素掩码
+    # Label 小于 num_planes 的是有效平面
+    plane_mask = (label_map < num_planes).unsqueeze(0)  # shape: [1, H, W]
 
-    # 旋转到世界坐标系，确保 R 在相同 device
-    R_w2c = viewpoint.world_view_transform[:3, :3].to(device=plane_normals_cam.device, dtype=plane_normals_cam.dtype)
-    if config["Dataset"]["type"] == "tum":
-        plane_normals_world = plane_normals_cam @ R_w2c.T
-    else:
-        plane_normals_world = plane_normals_cam @ R_w2c.T
+    return gt_normal_world, plane_mask
 
-    plane_normals_world = torch.nn.functional.normalize(plane_normals_world, dim=1)
+# def build_plane_normal_gt(viewpoint, config=None):
+#     # 1. 获取解析好的数据
+#     plane_equations, label_map, num_planes = prepare_plane_data(viewpoint) #相机坐标系下的平面参数、每个像素的平面 ID 标签、检测到的平面数量
+#     H, W = label_map.shape
+#
+#     # 防御性判断
+#     if num_planes == 0:
+#         return torch.zeros((3, H, W), device="cuda"), torch.zeros((1, H, W), dtype=torch.bool, device="cuda")
+#
+#     # 2. 提取法线并归一化
+#     plane_normals_raw = plane_equations[:, :3]
+#     plane_normals_raw = F.normalize(plane_normals_raw, p=2, dim=1)
+#
+#     # ==========================================
+#     # 3. 统一处理 OpenCV 相机坐标系 (TUM 和 Replica 均为 OpenCV RDF)
+#     # ==========================================
+#     # 面向相机的平面，Z 分量必须小于 0
+#     sign = torch.sign(plane_normals_raw[:, 2:3])
+#     plane_normals_cam = torch.where(sign > 0, -plane_normals_raw, plane_normals_raw)
+#
+#     # OpenCV -> OpenGL 坐标系转换 (Y 下 -> Y 上, Z 前 -> Z 后)
+#     plane_normals_cam[:, 1] = -plane_normals_cam[:, 1]
+#     plane_normals_cam[:, 2] = -plane_normals_cam[:, 2]
+#     # ==========================================
+#     # 🌟 修复 Replica 的 Z-up / Y-up 坐标轴错位 🌟
+#     # ==========================================
+#     if config["Dataset"]["type"] == "replica":
+#     #     # 在映射成全图之前，直接对平面法线的 Y 和 Z 轴进行交换
+#          plane_normals_cam = plane_normals_cam[:, [2, 1, 0]]
+#
+#         # 💡 提示：单纯交换两轴会导致坐标系手性翻转（左手系变右手系）。
+#         # 如果你运行后发现法线颜色对了，但 Loss 降不下去或者建图崩了，
+#         # 说明需要加一个负号，比如：plane_normals_cam[:, 2] = -plane_normals_cam[:, 2]
+#     # 4.填充背景并映射到全图
+#     background_normal = torch.zeros((1, 3), device="cuda", dtype=plane_normals_cam.dtype)
+#     plane_normals_padded = torch.cat([plane_normals_cam, background_normal], dim=0)
+#     gt_normal_cam = plane_normals_padded[label_map]
+#
+#     # ==========================================
+#     # 5. 统一的矩阵乘法 (3DGS 矩阵预转置复原)
+#     # ==========================================
+#     R_w2c = viewpoint.world_view_transform[:3, :3]
+#     #R_w2c = viewpoint.T[:3, :3]
+#     # [H, W, 3] @ [3, 3] -> [H, W, 3]
+#     gt_normal_world = torch.matmul(gt_normal_cam, R_w2c.T)
+#
+#     # 6. 调整维度并生成 Mask
+#     gt_normal_world = gt_normal_world.permute(2, 0, 1)
+#     plane_mask = (label_map < num_planes).unsqueeze(0)
+#
+#     return gt_normal_world, plane_mask
+# def build_plane_normal_gt(viewpoint, config=None):
+#     # 1. 获取解析好的数据
+#     plane_equations, label_map, num_planes = prepare_plane_data(viewpoint) #相机坐标系下的平面参数、每个像素的平面 ID 标签、检测到的平面数量
+#     H, W = label_map.shape
+#
+#     # 防御性判断
+#     if num_planes == 0:
+#         return torch.zeros((3, H, W), device="cuda"), torch.zeros((1, H, W), dtype=torch.bool, device="cuda")
+#
+#     # 2. 提取法线并归一化
+#     plane_normals_raw = plane_equations[:, :3]
+#     plane_normals_raw = F.normalize(plane_normals_raw, p=2, dim=1)
+#
+#     # ==========================================
+#     # 3. 统一处理 OpenCV 相机坐标系 (TUM 和 Replica 均为 OpenCV RDF)
+#     # ==========================================
+#     # 面向相机的平面，Z 分量必须小于 0
+#     sign = torch.sign(plane_normals_raw[:, 2:3])
+#     plane_normals_cam = torch.where(sign > 0, -plane_normals_raw, plane_normals_raw)
+#
+#     # # OpenCV -> OpenGL 坐标系转换 (Y 下 -> Y 上, Z 前 -> Z 后)
+#     # plane_normals_cam[:, 1] = -plane_normals_cam[:, 1]
+#     # plane_normals_cam[:, 2] = -plane_normals_cam[:, 2]
+#     # # ==========================================
+#     # # 🌟 修复 Replica 的 Z-up / Y-up 坐标轴错位 🌟
+#     # # ==========================================
+#     # if config["Dataset"]["type"] == "replica":
+#     # #     # 在映射成全图之前，直接对平面法线的 Y 和 Z 轴进行交换
+#     #      plane_normals_cam = plane_normals_cam[:, [2, 1, 0]]
+#     #
+#     #     # 💡 提示：单纯交换两轴会导致坐标系手性翻转（左手系变右手系）。
+#     #     # 如果你运行后发现法线颜色对了，但 Loss 降不下去或者建图崩了，
+#     #     # 说明需要加一个负号，比如：plane_normals_cam[:, 2] = -plane_normals_cam[:, 2]
+#     # 4.填充背景并映射到全图
+#     background_normal = torch.zeros((1, 3), device="cuda", dtype=plane_normals_cam.dtype)
+#     plane_normals_padded = torch.cat([plane_normals_cam, background_normal], dim=0)
+#     gt_normal_cam = plane_normals_padded[label_map]
+#
+#     # ==========================================
+#     # 5. 统一的矩阵乘法 (3DGS 矩阵预转置复原)
+#     # ==========================================
+#     #R_w2c = viewpoint.world_view_transform[:3, :3]
+#     R_c2w = viewpoint.world_view_transform[:3, :3].T
+#     #R_c2w = viewpoint.T[:3, :3].T
+#     # [H, W, 3] @ [3, 3] -> [H, W, 3]
+#     gt_normal_world = torch.matmul(gt_normal_cam, R_c2w)
+#
+#     # 6. 调整维度并生成 Mask
+#     gt_normal_world = gt_normal_world.permute(2, 0, 1)
+#     plane_mask = (label_map < num_planes).unsqueeze(0)
+#
+#     return gt_normal_world, plane_mask
 
-    # 写回到 [3, H, W]（以 boolean mask 的顺序对应上面的 valid_plane_ids）
-    target_normal_permuted = target_normal.permute(1, 2, 0).contiguous()  # [H, W, 3]
-    # 确保掩码数量匹配，否则保守返回
-    if plane_normals_world.shape[0] != is_planar_mask.sum().item():
-        # 尝试使用 positions 索引写回，保证顺序一致
-        positions = is_planar_mask.nonzero(as_tuple=False)
-        if plane_normals_world.shape[0] == positions.shape[0]:
-            rows = positions[:, 0]
-            cols = positions[:, 1]
-            target_normal_permuted[rows, cols] = plane_normals_world
-            target_normal = target_normal_permuted.permute(2, 0, 1)
-            return target_normal
-        return target_normal
-
-    # 直接按布尔掩码写回
-    target_normal_permuted[is_planar_mask] = plane_normals_world
-    target_normal = target_normal_permuted.permute(2, 0, 1)  # [3, H, W]
-
-    return target_normal
+# def build_plane_normal_gt(viewpoint, config=None):
+#     # 1. 获取解析好的数据
+#     plane_equations, label_map, num_planes = prepare_plane_data(viewpoint)
+#     H, W = label_map.shape
+#
+#     # 防御性判断
+#     if num_planes == 0:
+#         return torch.zeros((3, H, W), device="cuda"), torch.zeros((1, H, W), dtype=torch.bool, device="cuda")
+#
+#     # 2. 提取法线并归一化
+#     plane_normals_raw = plane_equations[:, :3]
+#     plane_normals_raw = F.normalize(plane_normals_raw, p=2, dim=1)
+#
+#     dataset_type = config["Dataset"]["type"]
+#     R_w2c = viewpoint.world_view_transform[:3, :3]
+#
+#     # 3. 核心分支：处理不同数据集的坐标系朝向与 Dataloader 矩阵转置差异
+#     if dataset_type == "replica":
+#         # OpenGL 相机坐标系 (Z朝前/后不同，面向相机的平面通常 Z > 0)
+#         sign = torch.sign(plane_normals_raw[:, 2:3])
+#         plane_normals_cam = torch.where(sign < 0, -plane_normals_raw, plane_normals_raw)
+#
+#         # 填充背景
+#         background_normal = torch.zeros((1, 3), device="cuda", dtype=plane_normals_cam.dtype)
+#         plane_normals_padded = torch.cat([plane_normals_cam, background_normal], dim=0)
+#         gt_normal_cam = plane_normals_padded[label_map]
+#
+#         # Replica 的 DataLoader 传入的 R_w2c 没有经过转置
+#         gt_normal_world = torch.matmul(gt_normal_cam, R_w2c)
+#
+#     else:
+#         # TUM 等传统 OpenCV 提取的法线流程
+#         sign = torch.sign(plane_normals_raw[:, 2:3])
+#         plane_normals_cam = torch.where(sign > 0, -plane_normals_raw, plane_normals_raw)
+#         plane_normals_cam[:, 1] = -plane_normals_cam[:, 1]
+#         plane_normals_cam[:, 2] = -plane_normals_cam[:, 2]
+#
+#         # 填充背景
+#         background_normal = torch.zeros((1, 3), device="cuda", dtype=plane_normals_cam.dtype)
+#         plane_normals_padded = torch.cat([plane_normals_cam, background_normal], dim=0)
+#         gt_normal_cam = plane_normals_padded[label_map]
+#
+#         # TUM (遵循原始 3DGS) DataLoader 传入的 R_w2c 是转置过的，需要 .T 还原
+#         gt_normal_world = torch.matmul(gt_normal_cam, R_w2c.T)
+#
+#     # 4. 调整维度为 [3, H, W] 并生成 Mask
+#     gt_normal_world = gt_normal_world.permute(2, 0, 1)
+#     plane_mask = (label_map < num_planes).unsqueeze(0)
+#
+#     return gt_normal_world, plane_mask
 
 
 def build_combined_normal_gt(viewpoint):

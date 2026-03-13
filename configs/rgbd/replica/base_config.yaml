@@ -14,7 +14,7 @@ Dataset:
   adaptive_pointsize: True #点大小乘中值深度得到场景中点的实际大小，限制最小为0.05
   point_size: 0.01 # 影响scales的初始化
   type: 'replica'
-  use_label: True
+  use_label: False
   Calibration:
     fx: 600.0
     fy: 600.0
@@ -61,10 +61,10 @@ Training:
     cam_rot_delta: 0.003
     cam_trans_delta: 0.001
   sagsslam:
-    use_normal: True
+    use_normal: False
     # 互斥选择: "sensor", "plane", "mixed"
     #sensor_depthnomal_supervision、plane_normal_supervision、mixed_normal_supervision
-    normal_mode: "plane"
+    normal_mode: "sensor"
     use_plane_constraint: False
     loss_type: "Huber"  # "l1" or "l2"
     warmup_iter: 2500

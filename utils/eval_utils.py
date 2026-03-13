@@ -151,7 +151,7 @@ def eval_rendering(
         )
         gt = cv2.cvtColor(gt, cv2.COLOR_BGR2RGB)
         pred = cv2.cvtColor(pred, cv2.COLOR_BGR2RGB)
-        #cv2.imwrite(f"{render_dir}/pred_{idx}.png", pred) #添加保存渲染图片
+        cv2.imwrite(f"{render_dir}/pred_{idx}.png", pred) #添加保存渲染图片
         img_pred.append(pred)
         img_gt.append(gt)
 
@@ -196,3 +196,4 @@ def save_gaussians(gaussians, name, iteration, final=False):
             name, "point_cloud/iteration_{}".format(str(iteration))
         )
     gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+    gaussians.save_pointcloud_ply(os.path.join(point_cloud_path, "point_cloud_points.ply"))

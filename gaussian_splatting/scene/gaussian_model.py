@@ -401,6 +401,40 @@ class GaussianModel:
         el = PlyElement.describe(elements, "vertex")
         PlyData([el]).write(path)
 
+    def save_pointcloud_ply(self, path):
+        mkdir_p(os.path.dirname(path))
+
+        # 从高斯中心导出点位置
+        points = self._xyz.detach().cpu().numpy().astype(np.float32)
+
+        # 从旋转四元数提取法向量（旋转矩阵第三列 = 局部 Z 轴 = 2DGS 法向量）
+        rot_matrix = build_rotation(self._rotation).detach().cpu().numpy()  # (N,3,3)
+        normals = rot_matrix[:, :, 2].astype(np.float32)  # (N,3) 取第三列
+
+        # 从 _features_dc 恢复 RGB 颜色（逆 SH -> RGB）
+        if self.ply_input is not None:
+            colors = np.asarray(self.ply_input.colors, dtype=np.float32)
+            if colors.shape[0] != points.shape[0]:
+                colors = np.zeros_like(points, dtype=np.float32)
+        else:
+            colors = np.zeros_like(points, dtype=np.float32)
+
+        # 规范化颜色到 [0, 1]
+        colors = np.clip(colors, 0.0, 1.0).astype(np.float32)
+
+        dtype = [
+            ("x", "f4"), ("y", "f4"), ("z", "f4"),
+            ("nx", "f4"), ("ny", "f4"), ("nz", "f4"),
+            ("red", "f4"), ("green", "f4"), ("blue", "f4"),
+        ]
+        elements = np.empty(points.shape[0], dtype=dtype)
+        attributes = np.concatenate((points, normals, colors), axis=1)
+        elements[:] = list(map(tuple, attributes))
+
+        el = PlyElement.describe(elements, "vertex")
+        PlyData([el]).write(path)
+
+
     def reset_opacity(self):
         opacities_new = inverse_sigmoid(torch.ones_like(self.get_opacity) * 0.01)
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")

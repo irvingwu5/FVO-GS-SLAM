@@ -14,7 +14,7 @@ from utils.slam_utils import (get_loss_mapping,get_loss_mapping_plane_constraint
                               get_depth_dist_loss,get_normal_consistency_loss,
                               _save_normal_pair, _save_rendered_rgb,_save_gt_normal,save_normal_as_quiver,
                               build_combined_normal_gt,build_plane_normal_gt,check_normal_dir)
-
+import torch.nn.functional as F
 # 它主要负责全局地图构建（Mapping）和光束法平差（Bundle Adjustment）
 # BackEnd 的核心设计模式是维护全局一致性。前端只关心“当前在哪里”，而后端关心“整个地图长什么样以及历史轨迹是否准确”。
 class BackEnd(mp.Process):
@@ -135,6 +135,17 @@ class BackEnd(mp.Process):
             loss_init = get_loss_mapping(
                 self.config, image, depth, viewpoint, opacity, initialization=True
             ) #0.4255
+            # =========================================================
+            # 2DGS 专属损失 1: 深度失真损失 (Depth Distortion Loss)
+            # =========================================================
+            # 你的 diff-surfel-rasterization 渲染器在 surf=False/True 时，
+            # 通常会返回渲染过程中的 distortion 值。
+            if "rend_dist" in render_pkg:
+                distortion_loss = render_pkg["rend_dist"].mean()
+                # 权重通常设为 1000 到 3000，具体取决于场景尺度
+                lambda_dist = self.config.get("opt_params", {}).get("lambda_dist", 1000.0)
+                loss_init += lambda_dist * distortion_loss
+
             loss_init.backward() #计算对gs模型参数的梯度（此阶段不更新相机位姿）
 
             with torch.no_grad(): #更新统计量
@@ -231,7 +242,17 @@ class BackEnd(mp.Process):
                 #_save_rendered_rgb(render_pkg, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/runtime_results/", cam_idx)
                 loss_mapping += get_loss_mapping(
                     self.config, image, depth, viewpoint, opacity
-                ) #0.1886
+                ) #0.2503
+                # =========================================================
+                # 2DGS 专属损失 1: 深度失真损失 (Depth Distortion Loss)
+                # =========================================================
+                # 你的 diff-surfel-rasterization 渲染器在 surf=False/True 时，
+                # 通常会返回渲染过程中的 distortion 值。
+                if "rend_dist" in render_pkg:
+                    distortion_loss = render_pkg["rend_dist"].mean() #3.9473e-06
+                    # 权重通常设为 1000 到 3000，具体取决于场景尺度
+                    lambda_dist = self.config.get("opt_params", {}).get("lambda_dist", 1000.0)
+                    loss_mapping += lambda_dist * distortion_loss
 
                 viewspace_point_tensor_acm.append(viewspace_point_tensor)
                 visibility_filter_acm.append(visibility_filter)
@@ -281,6 +302,7 @@ class BackEnd(mp.Process):
             # -----------------------------------------------
             # if self.use_normal and viewpoint.normal is not None and itr == 0:
             #     rend_normal = render_pkg["rend_normal"]
+            #     #rend_normal = F.normalize(rend_normal, p=2, dim=0)
             #     depth_pixel_mask = (viewpoint.gt_depth > 0.01).view(*depth.shape)
             #     # ==========================================
             #     # 模式 1: 纯传感器法线 (Sensor only)
@@ -300,29 +322,35 @@ class BackEnd(mp.Process):
             #         #save_normal_as_quiver(gt_normal, os.path.join(quiver_save_dir, f"gt_{viewpoint.uid}.png"))
             #         # 保存渲染结果的箭头图
             #         #save_normal_as_quiver(rend_normal, os.path.join(quiver_save_dir, f"rend_{viewpoint.uid}.png"))
-            #         normal_mask = gt_normal > 0
-            #         normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask * normal_mask).sum(dim=0))[None].mean() #0.9128
+            #         #normal_mask = gt_normal > 0
+            #         #normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask * normal_mask).sum(dim=0))[None].mean() #0.9128
+            #         normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()
             #         loss_mapping += (self.config["opt_params"]["lambda_normal"] * normal_error)
             #     # ==========================================
             #     # 模式 2: 纯平面先验 (Plane only)
             #     # ==========================================
             #     elif self.normal_mode == "plane":
-            #         # 假设 build_plane_normal_gt 返回世界坐标系的法线
-            #         gt_normal = build_plane_normal_gt(viewpoint,config=self.config)
-            #         # --- 新增：保存箭头图 ---
-            #         #quiver_save_dir = "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/quivers/"
-            #         #os.makedirs(quiver_save_dir, exist_ok=True)
-            #         _save_gt_normal(gt_normal, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid)
-            #         _save_gt_normal(rend_normal, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid,"rend")
-            #         # 保存 GT 的箭头图
-            #         #save_normal_as_quiver(gt_normal, os.path.join(quiver_save_dir, f"gt_{viewpoint.uid}.png"))
-            #         # 保存渲染结果的箭头图
-            #         #save_normal_as_quiver(rend_normal, os.path.join(quiver_save_dir, f"rend_{viewpoint.uid}.png"))
-            #         # -----------------------
-            #         #check_normal_dir(rend_normal, gt_normal)
-            #         normal_mask = gt_normal > 0
-            #         normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask*normal_mask).sum(dim=0))[None].mean()
-            #         loss_mapping += (self.config["opt_params"]["lambda_normal"] * normal_error)
+            #         # 1. 获取世界坐标系下的 GT 法线和平面 Mask
+            #         gt_normal_world, plane_mask = build_plane_normal_gt(viewpoint,config=self.config)
+            #
+            #         # 2. 组合 Mask（假设 depth_pixel_mask 也是 [1, H, W] 的 bool/float 张量）
+            #         # 仅在同时具有深度 valid 且属于平面的像素上计算 loss
+            #         valid_mask = plane_mask & (depth_pixel_mask.bool())
+            #         _save_gt_normal(gt_normal_world, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/", viewpoint.uid)
+            #         _save_gt_normal(rend_normal,"/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid, "rend")
+            #         if valid_mask.sum() > 0:
+            #             # 3. 计算余弦相似度 (渲染法线与GT法线点乘)
+            #             # rend_normal: [3, H, W], gt_normal_world: [3, H, W]
+            #             # cosine_sim shape: [1, H, W]
+            #             cosine_sim = (rend_normal * gt_normal_world).sum(dim=0, keepdim=True)
+            #
+            #             # 4. 仅在 valid_mask 区域内计算 normal_error = 1 - cos(theta)
+            #             # 只取有效区域进行 mean，防止背景的大量 0 拉低了 loss 从而产生错误梯度
+            #             # 只要法线平行（共线），不管是同向还是反向，Loss 都会接近 0
+            #             normal_error = (1.0 - cosine_sim.abs())[valid_mask].mean()
+            #
+            #             # 5. 累加 Loss
+            #             loss_mapping += (self.config["opt_params"]["lambda_normal"] * normal_error)
             #     # ==========================================
             #     # 模式 3: 混合监督 (Mixed)
             #     # ==========================================
