@@ -112,7 +112,7 @@ class BackEnd(mp.Process):
         for mapping_iteration in range(self.init_itr_num):
             self.iteration_count += 1
             render_pkg = render(
-                viewpoint, self.gaussians, self.pipeline_params, self.background, surf=False
+                viewpoint, self.gaussians, self.pipeline_params, self.background, surf=True
             )
             (
                 image,
@@ -145,6 +145,10 @@ class BackEnd(mp.Process):
                 # 权重通常设为 1000 到 3000，具体取决于场景尺度
                 lambda_dist = self.config.get("opt_params", {}).get("lambda_dist", 1000.0)
                 loss_init += lambda_dist * distortion_loss
+            if "surf_normal" in render_pkg:
+                normal_consistency_loss = get_normal_consistency_loss(render_pkg)
+                lambda_normal = self.config.get("opt_params", {}).get("lambda_normal", 0.1)
+                loss_init += lambda_normal * normal_consistency_loss
 
             loss_init.backward() #计算对gs模型参数的梯度（此阶段不更新相机位姿）
 
@@ -218,7 +222,7 @@ class BackEnd(mp.Process):
                 keyframes_opt.append(viewpoint)
 
                 render_pkg = render(
-                    viewpoint, self.gaussians, self.pipeline_params, self.background,surf=False
+                    viewpoint, self.gaussians, self.pipeline_params, self.background,surf=True
                 )
                 # 解包数据 (注意：如果 surf=False，rend_normal/dist 会是 None 或无效值)
                 (
@@ -253,6 +257,11 @@ class BackEnd(mp.Process):
                     # 权重通常设为 1000 到 3000，具体取决于场景尺度
                     lambda_dist = self.config.get("opt_params", {}).get("lambda_dist", 1000.0)
                     loss_mapping += lambda_dist * distortion_loss
+
+                if "surf_normal" in render_pkg:
+                    normal_consistency_loss = get_normal_consistency_loss(render_pkg)
+                    lambda_normal = self.config.get("opt_params", {}).get("lambda_normal", 0.1)
+                    loss_mapping += lambda_normal * normal_consistency_loss
 
                 viewspace_point_tensor_acm.append(viewspace_point_tensor)
                 visibility_filter_acm.append(visibility_filter)
