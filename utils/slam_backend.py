@@ -42,14 +42,16 @@ class BackEnd(mp.Process):
         self.initialized = not self.monocular
         self.keyframe_optimizers = None
 
-        self.use_normal = config["Training"]["sagsslam"]["use_normal"]
+        self.use_external_normal = config["Training"]["sagsslam"]["use_external_normal"]
+        self.use_surf_normal = config["Training"]["sagsslam"]["use_surf_normal"]
+        self.use_distortion_loss = config["Training"]["sagsslam"]["use_distortion_loss"]
         self.use_plane_constraint = config["Training"]["sagsslam"]["use_plane_constraint"]
         # 读取模式字符串
         self.normal_mode = config["Training"]["sagsslam"]["normal_mode"]
 
         # 可选：简单的参数校验，防止写错
         valid_modes = ["sensor", "plane", "mixed"]
-        if self.use_normal and self.normal_mode not in valid_modes:
+        if self.use_external_normal and self.normal_mode not in valid_modes:
             raise ValueError(f"Invalid normal_mode: {self.normal_mode}. Must be one of {valid_modes}")
 
     def set_hyperparams(self):
@@ -140,16 +142,19 @@ class BackEnd(mp.Process):
             # =========================================================
             # 你的 diff-surfel-rasterization 渲染器在 surf=False/True 时，
             # 通常会返回渲染过程中的 distortion 值。
-            if "rend_dist" in render_pkg:
+
+            if self.use_distortion_loss and "rend_dist" in render_pkg:
                 distortion_loss = render_pkg["rend_dist"].mean()
                 # 权重通常设为 1000 到 3000，具体取决于场景尺度
-                lambda_dist = self.config.get("opt_params", {}).get("lambda_dist", 1000.0)
+                lambda_dist = self.config.get("opt_params", {}).get("lambda_dist", 10.0)
                 loss_init += lambda_dist * distortion_loss
-            if "surf_normal" in render_pkg:
+
+            if self.use_surf_normal and "surf_normal" in render_pkg:
                 normal_consistency_loss = get_normal_consistency_loss(render_pkg)
-                lambda_normal = self.config.get("opt_params", {}).get("lambda_normal", 0.1)
-                loss_init += lambda_normal * normal_consistency_loss
-            if self.use_normal and viewpoint.normal is not None:
+                lambda_surf_normal = self.config.get("opt_params", {}).get("lambda_surf_normal", 0.001)
+                loss_init += lambda_surf_normal * normal_consistency_loss
+
+            if self.use_external_normal and viewpoint.normal is not None:
                 rend_normal = render_pkg["rend_normal"]
                 # rend_normal = F.normalize(rend_normal, p=2, dim=0)
                 depth_pixel_mask = (viewpoint.gt_depth > 0.01).view(*depth.shape)
@@ -174,7 +179,8 @@ class BackEnd(mp.Process):
                     # normal_mask = gt_normal > 0
                     # normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask * normal_mask).sum(dim=0))[None].mean() #0.9128
                     normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()
-                    loss_init += (self.config["opt_params"]["lambda_normal"] * normal_error)
+                    loss_init += (self.config["opt_params"]["lambda_sensor_normal"] * normal_error)
+
             loss_init.backward() #计算对gs模型参数的梯度（此阶段不更新相机位姿）
 
             with torch.no_grad(): #更新统计量
@@ -233,7 +239,9 @@ class BackEnd(mp.Process):
         for itr in range(iters):
             self.iteration_count += 1
             self.last_sent += 1
-
+            # 【新增】：计算衰减因子，从 1.0 线性衰减到 0.1
+            progress = itr / float(iters)
+            decay_factor = 1.0 - 0.9 * progress
             loss_mapping = 0
             viewspace_point_tensor_acm = []
             visibility_filter_acm = []
@@ -277,18 +285,20 @@ class BackEnd(mp.Process):
                 # =========================================================
                 # 你的 diff-surfel-rasterization 渲染器在 surf=False/True 时，
                 # 通常会返回渲染过程中的 distortion 值。
-                if "rend_dist" in render_pkg:
+                if self.use_distortion_loss and "rend_dist" in render_pkg:
                     distortion_loss = render_pkg["rend_dist"].mean() #3.9473e-06
                     # 权重通常设为 1000 到 3000，具体取决于场景尺度
-                    lambda_dist = self.config.get("opt_params", {}).get("lambda_dist", 1000.0)
-                    loss_mapping += lambda_dist * distortion_loss
+                    lambda_dist = self.config.get("opt_params", {}).get("lambda_dist", 10.0)
+                    #loss_mapping += lambda_dist * distortion_loss
+                    loss_mapping += (lambda_dist * decay_factor) * distortion_loss
 
-                if "surf_normal" in render_pkg:
+                if self.use_surf_normal and "surf_normal" in render_pkg:
                     normal_consistency_loss = get_normal_consistency_loss(render_pkg)
-                    lambda_normal = self.config.get("opt_params", {}).get("lambda_normal", 0.1)
-                    loss_mapping += lambda_normal * normal_consistency_loss
+                    lambda_surf_normal = self.config.get("opt_params", {}).get("lambda_surf_normal", 0.001)
+                    #loss_mapping += lambda_normal * normal_consistency_loss
+                    loss_mapping += lambda_surf_normal * normal_consistency_loss
 
-                if self.use_normal and viewpoint.normal is not None:
+                if self.use_external_normal and viewpoint.normal is not None:
                     rend_normal = render_pkg["rend_normal"]
                     #rend_normal = F.normalize(rend_normal, p=2, dim=0)
                     depth_pixel_mask = (viewpoint.gt_depth > 0.01).view(*depth.shape)
@@ -313,7 +323,7 @@ class BackEnd(mp.Process):
                         #normal_mask = gt_normal > 0
                         #normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask * normal_mask).sum(dim=0))[None].mean() #0.9128
                         normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()
-                        loss_mapping += (self.config["opt_params"]["lambda_normal"] * normal_error)
+                        loss_mapping += (self.config["opt_params"]["lambda_sensor_normal"]*decay_factor  * normal_error)
 
                 viewspace_point_tensor_acm.append(viewspace_point_tensor)
                 visibility_filter_acm.append(visibility_filter)

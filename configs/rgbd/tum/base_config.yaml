@@ -50,7 +50,9 @@ Training:
     cam_rot_delta: 0.003
     cam_trans_delta: 0.001
   sagsslam:
-    use_normal: True
+    use_external_normal: True
+    use_surf_normal: True
+    use_distortion_loss: True
     # 互斥选择: "sensor", "plane", "mixed"
     #sensor_depthnomal_supervision、plane_normal_supervision、mixed_normal_supervision
     normal_mode: "plane"
@@ -71,7 +73,8 @@ opt_params:
   scaling_lr: 0.001
   rotation_lr: 0.001
   percent_dense: 0.01
-  lambda_normal: 0.001 #0.006normal consistency loss weight 0.0001->0.05
+  lambda_surf_normal: 0.001 #0.006normal consistency loss weight 0.0001->0.05
+  lambda_sensor_normal: 0.01 #
   lambda_plane: 1.0 #plane constraint loss weight
   lambda_dssim: 0.2
   lambda_dist: 10.0
