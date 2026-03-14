@@ -149,7 +149,32 @@ class BackEnd(mp.Process):
                 normal_consistency_loss = get_normal_consistency_loss(render_pkg)
                 lambda_normal = self.config.get("opt_params", {}).get("lambda_normal", 0.1)
                 loss_init += lambda_normal * normal_consistency_loss
-
+            if self.use_normal and viewpoint.normal is not None:
+                rend_normal = render_pkg["rend_normal"]
+                # rend_normal = F.normalize(rend_normal, p=2, dim=0)
+                depth_pixel_mask = (viewpoint.gt_depth > 0.01).view(*depth.shape)
+                # ==========================================
+                # 模式 1: 纯传感器法线 (Sensor only)
+                # ==========================================
+                if self.normal_mode == "sensor":
+                    # 获取传感器法线并转到世界坐标系
+                    sensor_normal = viewpoint.normal
+                    # 注意：这里假设 viewpoint.T 是 World2Cam，具体转换需根据你的坐标系定义确认
+                    gt_normal = (viewpoint.T[0:3, 0:3].T @ sensor_normal.view(3, -1)).view(
+                        image.shape[0], image.shape[1], image.shape[2]
+                    )
+                    # _save_gt_normal(gt_normal, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/", viewpoint.uid)
+                    # _save_gt_normal(rend_normal,"/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid, "rend")
+                    # --- 新增：保存箭头图 ---
+                    # quiver_save_dir = "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/quivers/"
+                    # os.makedirs(quiver_save_dir, exist_ok=True)
+                    # save_normal_as_quiver(gt_normal, os.path.join(quiver_save_dir, f"gt_{viewpoint.uid}.png"))
+                    # 保存渲染结果的箭头图
+                    # save_normal_as_quiver(rend_normal, os.path.join(quiver_save_dir, f"rend_{viewpoint.uid}.png"))
+                    # normal_mask = gt_normal > 0
+                    # normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask * normal_mask).sum(dim=0))[None].mean() #0.9128
+                    normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()
+                    loss_init += (self.config["opt_params"]["lambda_normal"] * normal_error)
             loss_init.backward() #计算对gs模型参数的梯度（此阶段不更新相机位姿）
 
             with torch.no_grad(): #更新统计量
@@ -262,6 +287,33 @@ class BackEnd(mp.Process):
                     normal_consistency_loss = get_normal_consistency_loss(render_pkg)
                     lambda_normal = self.config.get("opt_params", {}).get("lambda_normal", 0.1)
                     loss_mapping += lambda_normal * normal_consistency_loss
+
+                if self.use_normal and viewpoint.normal is not None:
+                    rend_normal = render_pkg["rend_normal"]
+                    #rend_normal = F.normalize(rend_normal, p=2, dim=0)
+                    depth_pixel_mask = (viewpoint.gt_depth > 0.01).view(*depth.shape)
+                    # ==========================================
+                    # 模式 1: 纯传感器法线 (Sensor only)
+                    # ==========================================
+                    if self.normal_mode == "sensor":
+                        # 获取传感器法线并转到世界坐标系
+                        sensor_normal = viewpoint.normal
+                        # 注意：这里假设 viewpoint.T 是 World2Cam，具体转换需根据你的坐标系定义确认
+                        gt_normal = (viewpoint.T[0:3, 0:3].T @ sensor_normal.view(3, -1)).view(
+                            image.shape[0], image.shape[1], image.shape[2]
+                        )
+                        #_save_gt_normal(gt_normal, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/", viewpoint.uid)
+                        #_save_gt_normal(rend_normal,"/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid, "rend")
+                        # --- 新增：保存箭头图 ---
+                        #quiver_save_dir = "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/quivers/"
+                        #os.makedirs(quiver_save_dir, exist_ok=True)
+                        #save_normal_as_quiver(gt_normal, os.path.join(quiver_save_dir, f"gt_{viewpoint.uid}.png"))
+                        # 保存渲染结果的箭头图
+                        #save_normal_as_quiver(rend_normal, os.path.join(quiver_save_dir, f"rend_{viewpoint.uid}.png"))
+                        #normal_mask = gt_normal > 0
+                        #normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask * normal_mask).sum(dim=0))[None].mean() #0.9128
+                        normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()
+                        loss_mapping += (self.config["opt_params"]["lambda_normal"] * normal_error)
 
                 viewspace_point_tensor_acm.append(viewspace_point_tensor)
                 visibility_filter_acm.append(visibility_filter)
