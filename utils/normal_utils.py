@@ -90,13 +90,14 @@ def normal_to_rgb(normal, normal_mask=None):
 
 
 def d2n_tblr(
-    points: torch.Tensor, k: int = 3, d_min: float = 1e-3, d_max: float = 10.0
+    points: torch.Tensor, k: int = 3, d_min: float = 1e-3, d_max: float = 10.0, depth_edge_th: float = 0.05
 ) -> torch.Tensor:
     """points:     3D points in camera coordinates, shape: (B, 3, H, W)
     k:          neighborhood size
         e.g.)   If k=3, 3x3 neighborhood is used. Two vectors are defined by doing (top-bottom) and (left-right)
                 Then the normals are computed via cross-product
     d_min/max:  Range of valid depth values
+    depth_edge_th: 深度跳变阈值(米)。相邻像素深度差超过此值认为是物体边缘，不计算法线。
     """
     k = (k - 1) // 2
 
@@ -118,6 +119,14 @@ def d2n_tblr(
     vec_hori = (
         points_pad[:, :, k : k + H, :W] - points_pad[:, :, k : k + H, 2 * k : 2 * k + W]
     )  # (B, 3, H, W)
+    # ==========================================
+    # 【新增】计算边缘掩码 Edge Mask
+    # vec_vert 和 vec_hori 的第 2 个通道 (index 2) 就是深度的差值
+    # ==========================================
+    depth_jump_vert = torch.abs(vec_vert[:, 2, :, :])
+    depth_jump_hori = torch.abs(vec_hori[:, 2, :, :])
+    # 只有当垂直和水平的深度差都小于阈值（例如 5 厘米）时，才认为是在同一连续表面上
+    edge_mask = (depth_jump_vert < depth_edge_th) & (depth_jump_hori < depth_edge_th)
 
     # valid_mask (all five depth values - center/top/bottom/left/right should be valid)
     valid_mask = (
@@ -127,7 +136,9 @@ def d2n_tblr(
         * valid_pad[:, :, k : k + H, :W]
         * valid_pad[:, :, k : k + H, 2 * k : 2 * k + W]
     )
-    valid_mask = valid_mask > 0.5
+    #valid_mask = valid_mask > 0.5
+    # 将原有的 valid_mask 与 新增的 edge_mask 结合
+    valid_mask = (valid_mask > 0.5) & edge_mask.unsqueeze(1)
 
     # get cross product (B, 3, H, W)
     cross_product = -torch.linalg.cross(vec_vert, vec_hori, dim=1)
