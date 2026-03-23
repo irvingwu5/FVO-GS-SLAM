@@ -263,65 +263,275 @@ def world2camera(viewpoint, points_world):
     return points_final, u_valid, v_valid, valid_z_mask, valid_pixel_mask
 
 
-def get_loss_mapping_plane_constraint(gaussians, viewpoint, loss_type=None):
+# def get_loss_mapping_plane_constraint(gaussians, viewpoint, loss_type=None):
+#     """
+#     更加鲁棒的平面约束 Loss 计算，避免越界索引导致的 CUDA device-side assert。
+#     """
+#     # 1. Check & Prepare Data: plane_equations: [N, 4], label_map: [H, W], num_planes: int
+#     plane_equations, label_map, num_planes = prepare_plane_data(viewpoint)
+#
+#     # 验证 prepare_plane_data 返回值
+#     if not (isinstance(plane_equations, torch.Tensor) and isinstance(label_map, torch.Tensor)):
+#         return torch.tensor(0.0, device="cuda")
+#
+#     # 确保 plane_equations 是二维且至少有一行
+#     if plane_equations.ndim != 2 or plane_equations.shape[1] < 4 or plane_equations.shape[0] == 0:
+#         return torch.tensor(0.0, device="cuda")
+#
+#     # 同步 num_planes 与实际 plane_equations 大小，避免 mismatch
+#     num_planes_actual = int(plane_equations.shape[0])
+#     try:
+#         num_planes = int(num_planes)
+#     except Exception:
+#         num_planes = num_planes_actual
+#     num_planes = min(num_planes, num_planes_actual)
+#
+#     # 2. Opacity filtering
+#     opacity = gaussians.get_opacity
+#     valid_opacity_mask = (opacity > 0.5).squeeze()
+#     if valid_opacity_mask.sum() == 0:
+#         return torch.tensor(0.0, device="cuda")
+#
+#     points_world = gaussians.get_xyz[valid_opacity_mask]  # [M, 3]
+#     total_points = points_world.shape[0]
+#     SAMPLE_SIZE = 100000
+#     if total_points > SAMPLE_SIZE:
+#         indices = torch.randint(0, total_points, (SAMPLE_SIZE,), device=points_world.device)
+#         points_world = points_world[indices]
+#
+#     # 3. world2camera 可能返回标量表示失败，先判断
+#     w2c_out = world2camera(viewpoint, points_world)
+#     if isinstance(w2c_out, torch.Tensor) and w2c_out.dim() == 0:
+#         return torch.tensor(0.0, device="cuda")
+#
+#     try:
+#         points_cam, u, v, valid_z_mask, valid_pixel_mask = w2c_out
+#     except Exception:
+#         return torch.tensor(0.0, device="cuda")
+#
+#     # 再次检查投影结果有效性
+#     if not (isinstance(points_cam, torch.Tensor) and isinstance(u, torch.Tensor) and isinstance(v, torch.Tensor)):
+#         return torch.tensor(0.0, device="cuda")
+#
+#     H, W = viewpoint.image_height, viewpoint.image_width
+#     # 确保 u,v 在 [0,W-1]/[0,H-1] 范围内，否则过滤
+#     # u,v 可能已经是 long，但强制转 long
+#     u = u.long()
+#     v = v.long()
+#     within_x = (u >= 0) & (u < W)
+#     within_y = (v >= 0) & (v < H)
+#     within_both = within_x & within_y
+#
+#     if within_both.sum() == 0:
+#         return torch.tensor(0.0, device="cuda")
+#
+#     u_valid = u[within_both]
+#     v_valid = v[within_both]
+#     points_cam_valid = points_cam[within_both]
+#
+#     # 4. Sample plane ids safely
+#     # label_map 应该为 long 在 GPU 上
+#     if label_map.device != u_valid.device:
+#         label_map = label_map.to(device=u_valid.device)
+#     sampled_plane_ids = label_map[v_valid, u_valid]
+#
+#     # 强制为 long，防止类型问题
+#     sampled_plane_ids = sampled_plane_ids.long()
+#
+#     # 过滤有效 plane id：非负并且小于实际 plane 数量
+#     is_plane_mask = (sampled_plane_ids >= 0) & (sampled_plane_ids < num_planes)
+#     if is_plane_mask.sum() == 0:
+#         return torch.tensor(0.0, device=plane_equations.device)
+#
+#     final_plane_ids = sampled_plane_ids[is_plane_mask]
+#     final_points = points_cam_valid[is_plane_mask]
+#
+#     # 再次确保 final_plane_ids 全为合法的索引范围（防御式编程）
+#     # clamp 为最后保险措施（但应尽量发现数据来源错误）
+#     final_plane_ids_clamped = torch.clamp(final_plane_ids, 0, plane_equations.shape[0] - 1).long()
+#
+#     # Gather plane parameters safely
+#     target_plane_params = plane_equations[final_plane_ids_clamped]
+#
+#     # 5. Compute Plane Constraint Loss (same as 原实现，但更稳健)
+#     n = target_plane_params[:, :3]
+#     d = target_plane_params[:, 3]
+#
+#     dot_prod = (final_points * n).sum(dim=1)
+#     dist = dot_prod + d
+#
+#     # Outlier rejection
+#     valid_dist_mask = torch.abs(dist) < 0.02
+#     if valid_dist_mask.sum() == 0:
+#         return torch.tensor(0.0, device=plane_equations.device)
+#
+#     dist_filtered = dist[valid_dist_mask]
+#
+#     if loss_type == "l1":
+#         loss = torch.abs(dist_filtered).mean()
+#     elif loss_type == "l2":
+#         loss = (dist_filtered ** 2).mean()
+#     else:
+#         # Huber (delta=0.01)
+#         loss = torch.nn.functional.huber_loss(dist_filtered, torch.zeros_like(dist_filtered), delta=0.01)
+#
+#     return loss
+# def get_loss_mapping_plane_constraint(gaussians, viewpoint, loss_type='huber'):
+#     """
+#     更加鲁棒的平面约束 Loss 计算（去除了多余的坐标系翻转，直接使用原生 OpenCV 坐标）
+#     """
+#     # 1. Check & Prepare Data
+#     plane_equations, label_map, num_planes = prepare_plane_data(viewpoint)
+#
+#     if not (isinstance(plane_equations, torch.Tensor) and isinstance(label_map, torch.Tensor)):
+#         return torch.tensor(0.0, device="cuda")
+#
+#     if plane_equations.ndim != 2 or plane_equations.shape[1] < 4 or plane_equations.shape[0] == 0:
+#         return torch.tensor(0.0, device="cuda")
+#
+#     num_planes_actual = int(plane_equations.shape[0])
+#     try:
+#         num_planes = int(num_planes)
+#     except Exception:
+#         num_planes = num_planes_actual
+#     num_planes = min(num_planes, num_planes_actual)
+#
+#     # 2. Opacity filtering (放宽到 0.1，让更多初期点受约束)
+#     opacity = gaussians.get_opacity.squeeze(-1)
+#     valid_opacity_mask = opacity > 0.1
+#     if valid_opacity_mask.sum() == 0:
+#         return torch.tensor(0.0, device="cuda")
+#
+#     points_world = gaussians.get_xyz[valid_opacity_mask]  # [M, 3]
+#     total_points = points_world.shape[0]
+#     SAMPLE_SIZE = 100000
+#     if total_points > SAMPLE_SIZE:
+#         indices = torch.randint(0, total_points, (SAMPLE_SIZE,), device=points_world.device)
+#         points_world = points_world[indices]
+#
+#     # =========================================================
+#     # 3. 直接转换并投影 (当前 world_view_transform 已是 OpenCV 格式)
+#     # =========================================================
+#     w2c = viewpoint.world_view_transform.transpose(0, 1) # [4, 4]
+#     R = w2c[:3, :3]
+#     T = w2c[:3, 3]
+#
+#     # 计算相机坐标 (直接就是 OpenCV 坐标系: 右X, 下Y, 前Z)
+#     points_cam = points_world @ R.T + T
+#
+#     # 视锥截取 (Z > 0.05 表示在相机前方 5cm 以外)
+#     valid_z_mask = points_cam[:, 2] > 0.05
+#     if valid_z_mask.sum() == 0:
+#         return torch.tensor(0.0, device="cuda")
+#
+#     points_cam = points_cam[valid_z_mask]
+#
+#     # 投影获取像素坐标 (u, v)
+#     H, W = viewpoint.image_height, viewpoint.image_width
+#     fx = viewpoint.fx if hasattr(viewpoint, 'fx') else W / (2 * torch.tan(torch.tensor(viewpoint.FoVx) / 2))
+#     fy = viewpoint.fy if hasattr(viewpoint, 'fy') else H / (2 * torch.tan(torch.tensor(viewpoint.FoVy) / 2))
+#     cx = viewpoint.cx if hasattr(viewpoint, 'cx') else W / 2
+#     cy = viewpoint.cy if hasattr(viewpoint, 'cy') else H / 2
+#
+#     # 透视投影
+#     u = (points_cam[:, 0] / points_cam[:, 2] * fx + cx).long()
+#     v = (points_cam[:, 1] / points_cam[:, 2] * fy + cy).long()
+#
+#     # 屏幕内掩码
+#     within_both = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+#     if within_both.sum() == 0:
+#         return torch.tensor(0.0, device="cuda")
+#
+#     u_valid = u[within_both]
+#     v_valid = v[within_both]
+#     points_cam_valid = points_cam[within_both]
+#
+#     # 4. Sample plane ids safely
+#     if label_map.device != u_valid.device:
+#         label_map = label_map.to(device=u_valid.device)
+#     sampled_plane_ids = label_map[v_valid, u_valid].long()
+#
+#     is_plane_mask = (sampled_plane_ids >= 0) & (sampled_plane_ids < num_planes)
+#     if is_plane_mask.sum() == 0:
+#         return torch.tensor(0.0, device="cuda")
+#
+#     final_plane_ids = sampled_plane_ids[is_plane_mask]
+#     final_points = points_cam_valid[is_plane_mask]
+#
+#     final_plane_ids_clamped = torch.clamp(final_plane_ids, 0, plane_equations.shape[0] - 1)
+#     target_plane_params = plane_equations[final_plane_ids_clamped]
+#
+#     # 5. Compute Plane Constraint Loss
+#     n = target_plane_params[:, :3]
+#     d = target_plane_params[:, 3]
+#
+#     # 直接点乘计算距离 (此时 final_points 和 n 都在正确的空间下)
+#     dot_prod = (final_points * n).sum(dim=1)
+#     dist = dot_prod + d
+#
+#     # 外点剔除放宽至 5cm (0.05米)
+#     valid_dist_mask = torch.abs(dist) < 0.05
+#     if valid_dist_mask.sum() == 0:
+#         return torch.tensor(0.0, device="cuda")
+#
+#     dist_filtered = dist[valid_dist_mask]
+#
+#     if loss_type == "l1":
+#         loss = torch.abs(dist_filtered).mean()
+#     elif loss_type == "l2":
+#         loss = (dist_filtered ** 2).mean()
+#     else:
+#         loss = torch.nn.functional.huber_loss(dist_filtered, torch.zeros_like(dist_filtered), delta=0.01)
+#
+#     return loss
+def get_loss_mapping_plane_constraint(gaussians, viewpoint, loss_type='huber'):
     """
-    更加鲁棒的平面约束 Loss 计算，避免越界索引导致的 CUDA device-side assert。
+    更加鲁棒的平面约束 Loss 计算（加入深度遮挡剔除，防止背景点被误拉扯）
     """
-    # 1. Check & Prepare Data: plane_equations: [N, 4], label_map: [H, W], num_planes: int
     plane_equations, label_map, num_planes = prepare_plane_data(viewpoint)
 
-    # 验证 prepare_plane_data 返回值
     if not (isinstance(plane_equations, torch.Tensor) and isinstance(label_map, torch.Tensor)):
         return torch.tensor(0.0, device="cuda")
-
-    # 确保 plane_equations 是二维且至少有一行
     if plane_equations.ndim != 2 or plane_equations.shape[1] < 4 or plane_equations.shape[0] == 0:
         return torch.tensor(0.0, device="cuda")
 
-    # 同步 num_planes 与实际 plane_equations 大小，避免 mismatch
     num_planes_actual = int(plane_equations.shape[0])
-    try:
-        num_planes = int(num_planes)
-    except Exception:
-        num_planes = num_planes_actual
-    num_planes = min(num_planes, num_planes_actual)
+    num_planes = min(int(num_planes) if isinstance(num_planes, (int, float, str)) else num_planes_actual,
+                     num_planes_actual)
 
-    # 2. Opacity filtering
-    opacity = gaussians.get_opacity
-    valid_opacity_mask = (opacity > 0.5).squeeze()
+    opacity = gaussians.get_opacity.squeeze(-1)
+    valid_opacity_mask = opacity > 0.1
     if valid_opacity_mask.sum() == 0:
         return torch.tensor(0.0, device="cuda")
 
-    points_world = gaussians.get_xyz[valid_opacity_mask]  # [M, 3]
+    points_world = gaussians.get_xyz[valid_opacity_mask]
     total_points = points_world.shape[0]
     SAMPLE_SIZE = 100000
     if total_points > SAMPLE_SIZE:
         indices = torch.randint(0, total_points, (SAMPLE_SIZE,), device=points_world.device)
         points_world = points_world[indices]
 
-    # 3. world2camera 可能返回标量表示失败，先判断
-    w2c_out = world2camera(viewpoint, points_world)
-    if isinstance(w2c_out, torch.Tensor) and w2c_out.dim() == 0:
-        return torch.tensor(0.0, device="cuda")
+    w2c = viewpoint.world_view_transform.transpose(0, 1)
+    R = w2c[:3, :3]
+    T = w2c[:3, 3]
 
-    try:
-        points_cam, u, v, valid_z_mask, valid_pixel_mask = w2c_out
-    except Exception:
-        return torch.tensor(0.0, device="cuda")
+    points_cam = points_world @ R.T + T
 
-    # 再次检查投影结果有效性
-    if not (isinstance(points_cam, torch.Tensor) and isinstance(u, torch.Tensor) and isinstance(v, torch.Tensor)):
+    valid_z_mask = points_cam[:, 2] > 0.05
+    if valid_z_mask.sum() == 0:
         return torch.tensor(0.0, device="cuda")
+    points_cam = points_cam[valid_z_mask]
 
     H, W = viewpoint.image_height, viewpoint.image_width
-    # 确保 u,v 在 [0,W-1]/[0,H-1] 范围内，否则过滤
-    # u,v 可能已经是 long，但强制转 long
-    u = u.long()
-    v = v.long()
-    within_x = (u >= 0) & (u < W)
-    within_y = (v >= 0) & (v < H)
-    within_both = within_x & within_y
+    fx = viewpoint.fx if hasattr(viewpoint, 'fx') else W / (2 * torch.tan(torch.tensor(viewpoint.FoVx) / 2))
+    fy = viewpoint.fy if hasattr(viewpoint, 'fy') else H / (2 * torch.tan(torch.tensor(viewpoint.FoVy) / 2))
+    cx = viewpoint.cx if hasattr(viewpoint, 'cx') else W / 2
+    cy = viewpoint.cy if hasattr(viewpoint, 'cy') else H / 2
 
+    u = (points_cam[:, 0] / points_cam[:, 2] * fx + cx).long()
+    v = (points_cam[:, 1] / points_cam[:, 2] * fy + cy).long()
+
+    within_both = (u >= 0) & (u < W) & (v >= 0) & (v < H)
     if within_both.sum() == 0:
         return torch.tensor(0.0, device="cuda")
 
@@ -329,41 +539,52 @@ def get_loss_mapping_plane_constraint(gaussians, viewpoint, loss_type=None):
     v_valid = v[within_both]
     points_cam_valid = points_cam[within_both]
 
-    # 4. Sample plane ids safely
-    # label_map 应该为 long 在 GPU 上
+    # =========================================================
+    # 【核心修正】：深度遮挡剔除 (Visibility Culling)
+    # 防止背景的高斯点投影后，受到前景平面的错误约束！
+    # =========================================================
+    if hasattr(viewpoint, 'gt_depth') and viewpoint.gt_depth is not None:
+        gt_depth_map = viewpoint.gt_depth.squeeze()  # [H, W]
+        if gt_depth_map.device != u_valid.device:
+            gt_depth_map = gt_depth_map.to(u_valid.device)
+
+        # 获取投影像素处的真实深度
+        gt_d = gt_depth_map[v_valid, u_valid]
+
+        # 只保留“未被遮挡”的点：Z轴坐标与真实深度相差不超过 10cm (0.1m)
+        visible_mask = (gt_d > 0.01) & (torch.abs(points_cam_valid[:, 2] - gt_d) < 0.1)
+
+        u_valid = u_valid[visible_mask]
+        v_valid = v_valid[visible_mask]
+        points_cam_valid = points_cam_valid[visible_mask]
+
+        if points_cam_valid.shape[0] == 0:
+            return torch.tensor(0.0, device="cuda")
+    # =========================================================
+
     if label_map.device != u_valid.device:
         label_map = label_map.to(device=u_valid.device)
-    sampled_plane_ids = label_map[v_valid, u_valid]
+    sampled_plane_ids = label_map[v_valid, u_valid].long()
 
-    # 强制为 long，防止类型问题
-    sampled_plane_ids = sampled_plane_ids.long()
-
-    # 过滤有效 plane id：非负并且小于实际 plane 数量
     is_plane_mask = (sampled_plane_ids >= 0) & (sampled_plane_ids < num_planes)
     if is_plane_mask.sum() == 0:
-        return torch.tensor(0.0, device=plane_equations.device)
+        return torch.tensor(0.0, device="cuda")
 
     final_plane_ids = sampled_plane_ids[is_plane_mask]
     final_points = points_cam_valid[is_plane_mask]
 
-    # 再次确保 final_plane_ids 全为合法的索引范围（防御式编程）
-    # clamp 为最后保险措施（但应尽量发现数据来源错误）
-    final_plane_ids_clamped = torch.clamp(final_plane_ids, 0, plane_equations.shape[0] - 1).long()
-
-    # Gather plane parameters safely
+    final_plane_ids_clamped = torch.clamp(final_plane_ids, 0, plane_equations.shape[0] - 1)
     target_plane_params = plane_equations[final_plane_ids_clamped]
 
-    # 5. Compute Plane Constraint Loss (same as 原实现，但更稳健)
     n = target_plane_params[:, :3]
     d = target_plane_params[:, 3]
 
     dot_prod = (final_points * n).sum(dim=1)
     dist = dot_prod + d
 
-    # Outlier rejection
-    valid_dist_mask = torch.abs(dist) < 0.02
+    valid_dist_mask = torch.abs(dist) < 0.05
     if valid_dist_mask.sum() == 0:
-        return torch.tensor(0.0, device=plane_equations.device)
+        return torch.tensor(0.0, device="cuda")
 
     dist_filtered = dist[valid_dist_mask]
 
@@ -372,12 +593,290 @@ def get_loss_mapping_plane_constraint(gaussians, viewpoint, loss_type=None):
     elif loss_type == "l2":
         loss = (dist_filtered ** 2).mean()
     else:
-        # Huber (delta=0.01)
         loss = torch.nn.functional.huber_loss(dist_filtered, torch.zeros_like(dist_filtered), delta=0.01)
 
     return loss
 
-
+# def get_loss_mapping_plane_constraint(gaussians, viewpoint, loss_type='huber'):
+#     """
+#     终极版平面约束 Loss：
+#     1. 包含深度遮挡剔除 (Visibility Culling)
+#     2. 包含类别均衡采样 (Class-balanced Sampling)，解决大墙壁吞噬小桌面的问题
+#     """
+#     plane_equations, label_map, num_planes = prepare_plane_data(viewpoint)
+#
+#     # 1. 基础数据校验
+#     if not (isinstance(plane_equations, torch.Tensor) and isinstance(label_map, torch.Tensor)):
+#         return torch.tensor(0.0, device="cuda")
+#     if plane_equations.ndim != 2 or plane_equations.shape[1] < 4 or plane_equations.shape[0] == 0:
+#         return torch.tensor(0.0, device="cuda")
+#
+#     num_planes_actual = int(plane_equations.shape[0])
+#     num_planes = min(int(num_planes) if isinstance(num_planes, (int, float, str)) else num_planes_actual,
+#                      num_planes_actual)
+#
+#     # 2. 基础透明度过滤 (去掉原有的粗暴全局10w采样)
+#     opacity = gaussians.get_opacity.squeeze(-1)
+#     valid_opacity_mask = opacity > 0.1
+#     if valid_opacity_mask.sum() == 0:
+#         return torch.tensor(0.0, device="cuda")
+#
+#     points_world = gaussians.get_xyz[valid_opacity_mask]
+#
+#     # 3. 坐标系转换 (直接使用 OpenCV 格式投影)
+#     w2c = viewpoint.world_view_transform.transpose(0, 1)
+#     R = w2c[:3, :3]
+#     T = w2c[:3, 3]
+#
+#     points_cam = points_world @ R.T + T
+#
+#     # 视锥截取 (Z > 0.05)
+#     valid_z_mask = points_cam[:, 2] > 0.05
+#     if valid_z_mask.sum() == 0:
+#         return torch.tensor(0.0, device="cuda")
+#     points_cam = points_cam[valid_z_mask]
+#
+#     # 4. 透视投影获取像素坐标
+#     H, W = viewpoint.image_height, viewpoint.image_width
+#     fx = viewpoint.fx if hasattr(viewpoint, 'fx') else W / (2 * torch.tan(torch.tensor(viewpoint.FoVx) / 2))
+#     fy = viewpoint.fy if hasattr(viewpoint, 'fy') else H / (2 * torch.tan(torch.tensor(viewpoint.FoVy) / 2))
+#     cx = viewpoint.cx if hasattr(viewpoint, 'cx') else W / 2
+#     cy = viewpoint.cy if hasattr(viewpoint, 'cy') else H / 2
+#
+#     u = (points_cam[:, 0] / points_cam[:, 2] * fx + cx).long()
+#     v = (points_cam[:, 1] / points_cam[:, 2] * fy + cy).long()
+#
+#     within_both = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+#     if within_both.sum() == 0:
+#         return torch.tensor(0.0, device="cuda")
+#
+#     u_valid = u[within_both]
+#     v_valid = v[within_both]
+#     points_cam_valid = points_cam[within_both]
+#
+#     # =========================================================
+#     # 5.【第一道防线】：深度遮挡剔除 (Visibility Culling)
+#     # =========================================================
+#     if hasattr(viewpoint, 'gt_depth') and viewpoint.gt_depth is not None:
+#         gt_depth_map = viewpoint.gt_depth.squeeze()
+#         if gt_depth_map.device != u_valid.device:
+#             gt_depth_map = gt_depth_map.to(u_valid.device)
+#
+#         gt_d = gt_depth_map[v_valid, u_valid]
+#         visible_mask = (gt_d > 0.01) & (torch.abs(points_cam_valid[:, 2] - gt_d) < 0.1)
+#
+#         u_valid = u_valid[visible_mask]
+#         v_valid = v_valid[visible_mask]
+#         points_cam_valid = points_cam_valid[visible_mask]
+#
+#         if points_cam_valid.shape[0] == 0:
+#             return torch.tensor(0.0, device="cuda")
+#
+#     # 6. 获取每个有效点对应的平面 ID
+#     if label_map.device != u_valid.device:
+#         label_map = label_map.to(device=u_valid.device)
+#     sampled_plane_ids = label_map[v_valid, u_valid].long()
+#
+#     is_plane_mask = (sampled_plane_ids >= 0) & (sampled_plane_ids < num_planes)
+#     if is_plane_mask.sum() == 0:
+#         return torch.tensor(0.0, device="cuda")
+#
+#     final_plane_ids = sampled_plane_ids[is_plane_mask]
+#     final_points = points_cam_valid[is_plane_mask]
+#
+#     # =========================================================
+#     # 7. 【核心修正】：类别均衡采样 (Class-balanced Sampling)
+#     # 确保每个检测到的平面，最多只提供 N 个点参与 Loss 计算
+#     # =========================================================
+#     MAX_POINTS_PER_PLANE = 5000  # 每个平面最多采样的点数（可根据显存微调，5000非常均衡）
+#
+#     unique_plane_ids = torch.unique(final_plane_ids)
+#     balanced_indices = []
+#
+#     # 遍历当前画面中存在的所有有效平面 ID
+#     for p_id in unique_plane_ids:
+#         # 找出属于当前平面的所有点的索引
+#         p_indices = torch.nonzero(final_plane_ids == p_id, as_tuple=True)[0]
+#
+#         # 如果该平面的点数超过了上限，则进行随机降采样
+#         if p_indices.shape[0] > MAX_POINTS_PER_PLANE:
+#             perm = torch.randperm(p_indices.shape[0], device=p_indices.device)[:MAX_POINTS_PER_PLANE]
+#             p_indices = p_indices[perm]
+#
+#         balanced_indices.append(p_indices)
+#
+#     # 拼接所有均衡后的索引
+#     if len(balanced_indices) > 0:
+#         balanced_indices = torch.cat(balanced_indices)
+#         final_plane_ids = final_plane_ids[balanced_indices]
+#         final_points = final_points[balanced_indices]
+#     else:
+#         return torch.tensor(0.0, device="cuda")
+#     # =========================================================
+#
+#     # 8. 提取平面参数并计算距离
+#     final_plane_ids_clamped = torch.clamp(final_plane_ids, 0, plane_equations.shape[0] - 1)
+#     target_plane_params = plane_equations[final_plane_ids_clamped]
+#
+#     n = target_plane_params[:, :3]
+#     d = target_plane_params[:, 3]
+#
+#     dot_prod = (final_points * n).sum(dim=1)
+#     dist = dot_prod + d
+#
+#     # 9. 外点剔除 (距离 > 5cm 的点不参与优化，防止错误拉扯)
+#     valid_dist_mask = torch.abs(dist) < 0.05
+#     if valid_dist_mask.sum() == 0:
+#         return torch.tensor(0.0, device="cuda")
+#
+#     dist_filtered = dist[valid_dist_mask]
+#
+#     # 10. 计算最终 Loss
+#     if loss_type == "l1":
+#         loss = torch.abs(dist_filtered).mean()
+#     elif loss_type == "l2":
+#         loss = (dist_filtered ** 2).mean()
+#     else:
+#         loss = torch.nn.functional.huber_loss(dist_filtered, torch.zeros_like(dist_filtered), delta=0.01)
+#
+#     return loss
+# import torch
+# import torch.nn.functional as F
+#
+#
+# def get_loss_mapping_plane_constraint(gaussians, viewpoint, loss_type='huber'):
+#     """
+#     回归本源的平面约束 Loss：
+#     保留了深度遮挡剔除（防背景误拉），保留了 2D 网格均匀降采样（提速），
+#     去除了有害的类别均衡，让大墙壁自然主导 Tracking！
+#     """
+#     plane_equations, label_map, num_planes = prepare_plane_data(viewpoint)
+#
+#     if not (isinstance(plane_equations, torch.Tensor) and isinstance(label_map, torch.Tensor)):
+#         return torch.tensor(0.0, device="cuda")
+#     if plane_equations.ndim != 2 or plane_equations.shape[1] < 4 or plane_equations.shape[0] == 0:
+#         return torch.tensor(0.0, device="cuda")
+#
+#     num_planes_actual = int(plane_equations.shape[0])
+#     num_planes = min(int(num_planes) if isinstance(num_planes, (int, float, str)) else num_planes_actual,
+#                      num_planes_actual)
+#
+#     opacity = gaussians.get_opacity.squeeze(-1)
+#     valid_opacity_mask = opacity > 0.1
+#     if valid_opacity_mask.sum() == 0:
+#         return torch.tensor(0.0, device="cuda")
+#
+#     points_world = gaussians.get_xyz[valid_opacity_mask]
+#
+#     # 直接使用确定的 OpenCV 坐标系转换
+#     w2c = viewpoint.world_view_transform.transpose(0, 1)
+#     R = w2c[:3, :3]
+#     T = w2c[:3, 3]
+#     points_cam = points_world @ R.T + T
+#
+#     valid_z_mask = points_cam[:, 2] > 0.05
+#     if valid_z_mask.sum() == 0:
+#         return torch.tensor(0.0, device="cuda")
+#     points_cam = points_cam[valid_z_mask]
+#
+#     H, W = viewpoint.image_height, viewpoint.image_width
+#     fx = viewpoint.fx if hasattr(viewpoint, 'fx') else W / (2 * torch.tan(torch.tensor(viewpoint.FoVx) / 2))
+#     fy = viewpoint.fy if hasattr(viewpoint, 'fy') else H / (2 * torch.tan(torch.tensor(viewpoint.FoVy) / 2))
+#     cx = viewpoint.cx if hasattr(viewpoint, 'cx') else W / 2
+#     cy = viewpoint.cy if hasattr(viewpoint, 'cy') else H / 2
+#
+#     u = (points_cam[:, 0] / points_cam[:, 2] * fx + cx).long()
+#     v = (points_cam[:, 1] / points_cam[:, 2] * fy + cy).long()
+#
+#     within_both = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+#     if within_both.sum() == 0:
+#         return torch.tensor(0.0, device="cuda")
+#
+#     u_valid = u[within_both]
+#     v_valid = v[within_both]
+#     points_cam_valid = points_cam[within_both]
+#
+#     # =========================================================
+#     # 【保留防线 1】：深度遮挡剔除 (Visibility Culling)
+#     # =========================================================
+#     if hasattr(viewpoint, 'gt_depth') and viewpoint.gt_depth is not None:
+#         gt_depth_map = viewpoint.gt_depth.squeeze()
+#         if gt_depth_map.device != u_valid.device:
+#             gt_depth_map = gt_depth_map.to(u_valid.device)
+#
+#         gt_d = gt_depth_map[v_valid, u_valid]
+#         visible_mask = (gt_d > 0.01) & (torch.abs(points_cam_valid[:, 2] - gt_d) < 0.1)
+#
+#         u_valid = u_valid[visible_mask]
+#         v_valid = v_valid[visible_mask]
+#         points_cam_valid = points_cam_valid[visible_mask]
+#
+#         if points_cam_valid.shape[0] == 0:
+#             return torch.tensor(0.0, device="cuda")
+#
+#     # =========================================================
+#     # 【保留防线 2】：2D 网格均匀降采样 (提速，防局部扎堆)
+#     # =========================================================
+#     grid_size = 8
+#     grid_idx = (v_valid // grid_size) * (W // grid_size) + (u_valid // grid_size)
+#
+#     perm = torch.randperm(u_valid.size(0), device=u_valid.device)
+#     u_valid_shuffled = u_valid[perm]
+#     v_valid_shuffled = v_valid[perm]
+#     grid_idx_shuffled = grid_idx[perm]
+#     points_cam_valid_shuffled = points_cam_valid[perm]
+#
+#     sorted_grid, sorted_idx = torch.sort(grid_idx_shuffled)
+#     is_first = torch.ones_like(sorted_grid, dtype=torch.bool)
+#     is_first[1:] = sorted_grid[1:] != sorted_grid[:-1]
+#     unique_indices = sorted_idx[is_first]
+#
+#     u_valid = u_valid_shuffled[unique_indices]
+#     v_valid = v_valid_shuffled[unique_indices]
+#     points_cam_valid = points_cam_valid_shuffled[unique_indices]
+#
+#     if points_cam_valid.shape[0] == 0:
+#         return torch.tensor(0.0, device="cuda")
+#
+#     # =========================================================
+#     # 获取平面参数并计算 Loss (去除强行干预权重的逻辑)
+#     # =========================================================
+#     if label_map.device != u_valid.device:
+#         label_map = label_map.to(device=u_valid.device)
+#     sampled_plane_ids = label_map[v_valid, u_valid].long()
+#
+#     is_plane_mask = (sampled_plane_ids >= 0) & (sampled_plane_ids < num_planes)
+#     if is_plane_mask.sum() == 0:
+#         return torch.tensor(0.0, device="cuda")
+#
+#     final_plane_ids = sampled_plane_ids[is_plane_mask]
+#     final_points = points_cam_valid[is_plane_mask]
+#
+#     final_plane_ids_clamped = torch.clamp(final_plane_ids, 0, plane_equations.shape[0] - 1)
+#     target_plane_params = plane_equations[final_plane_ids_clamped]
+#
+#     n = target_plane_params[:, :3]
+#     d = target_plane_params[:, 3]
+#
+#     dot_prod = (final_points * n).sum(dim=1)
+#     dist = dot_prod + d
+#
+#     # 距离容忍度设为 5cm，超出则视为杂物（如桌子上的鼠标），不强行压平
+#     valid_dist_mask = torch.abs(dist) < 0.05
+#     if valid_dist_mask.sum() == 0:
+#         return torch.tensor(0.0, device="cuda")
+#
+#     dist_filtered = dist[valid_dist_mask]
+#
+#     if loss_type == "l1":
+#         loss = torch.abs(dist_filtered).mean()
+#     elif loss_type == "l2":
+#         loss = (dist_filtered ** 2).mean()
+#     else:
+#         loss = torch.nn.functional.huber_loss(dist_filtered, torch.zeros_like(dist_filtered), delta=0.01)
+#
+#     return loss
+#
 def build_plane_normal_gt(viewpoint, config=None):
     """
     根据 Plane Data 和 Label 构建当前帧的世界坐标系 GT 法线图和掩码

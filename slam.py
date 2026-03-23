@@ -229,7 +229,7 @@ if __name__ == "__main__":
 
     config = load_config(args.config)
     save_dir = None
-    # 如果命令行参数中包含 --eval，则进入评估模式
+    # 如果命令行参数中包含--eval，则进入评估模式
     if args.eval:
         Log("Running SA-GS-SLAM in Evaluation Mode")
         Log("Following config will be overriden")

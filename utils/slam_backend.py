@@ -114,7 +114,7 @@ class BackEnd(mp.Process):
         for mapping_iteration in range(self.init_itr_num):
             self.iteration_count += 1
             render_pkg = render(
-                viewpoint, self.gaussians, self.pipeline_params, self.background, surf=True
+                viewpoint, self.gaussians, self.pipeline_params, self.background, surf=False
             )
             (
                 image,
@@ -180,6 +180,9 @@ class BackEnd(mp.Process):
                     # normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask * normal_mask).sum(dim=0))[None].mean() #0.9128
                     normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()
                     loss_init += (self.config["opt_params"]["lambda_sensor_normal"] * normal_error)
+            # if self.use_plane_constraint:
+            #     proj_loss = get_loss_mapping_plane_constraint(self.gaussians, viewpoint, 'huber')  # 9.5036e-05、
+            #     loss_init += self.config["opt_params"]["lambda_plane"] * proj_loss
 
             loss_init.backward() #计算对gs模型参数的梯度（此阶段不更新相机位姿）
 
@@ -255,7 +258,7 @@ class BackEnd(mp.Process):
                 keyframes_opt.append(viewpoint)
 
                 render_pkg = render(
-                    viewpoint, self.gaussians, self.pipeline_params, self.background,surf=True
+                    viewpoint, self.gaussians, self.pipeline_params, self.background,surf=False
                 )
                 # 解包数据 (注意：如果 surf=False，rend_normal/dist 会是 None 或无效值)
                 (
@@ -286,16 +289,15 @@ class BackEnd(mp.Process):
                 # 你的 diff-surfel-rasterization 渲染器在 surf=False/True 时，
                 # 通常会返回渲染过程中的 distortion 值。
                 if self.use_distortion_loss and "rend_dist" in render_pkg:
-                    distortion_loss = render_pkg["rend_dist"].mean() #3.9473e-06
+                    distortion_loss = render_pkg["rend_dist"].mean() #1.0811e-05、6.0331e-06
                     # 权重通常设为 1000 到 3000，具体取决于场景尺度
                     lambda_dist = self.config.get("opt_params", {}).get("lambda_dist", 10.0)
                     #loss_mapping += lambda_dist * distortion_loss
                     loss_mapping += (lambda_dist * decay_factor) * distortion_loss
 
                 if self.use_surf_normal and "surf_normal" in render_pkg:
-                    normal_consistency_loss = get_normal_consistency_loss(render_pkg)
+                    normal_consistency_loss = get_normal_consistency_loss(render_pkg) #0.7075
                     lambda_surf_normal = self.config.get("opt_params", {}).get("lambda_surf_normal", 0.001)
-                    #loss_mapping += lambda_normal * normal_consistency_loss
                     loss_mapping += lambda_surf_normal * normal_consistency_loss
 
                 if self.use_external_normal and viewpoint.normal is not None:
@@ -322,8 +324,11 @@ class BackEnd(mp.Process):
                         #save_normal_as_quiver(rend_normal, os.path.join(quiver_save_dir, f"rend_{viewpoint.uid}.png"))
                         #normal_mask = gt_normal > 0
                         #normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask * normal_mask).sum(dim=0))[None].mean() #0.9128
-                        normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()
+                        normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean() #0.6932
                         loss_mapping += (self.config["opt_params"]["lambda_sensor_normal"]*decay_factor  * normal_error)
+                if self.use_plane_constraint:
+                    proj_loss = get_loss_mapping_plane_constraint(self.gaussians, viewpoint, 'huber')  #0.0001、9.5036e-05、
+                    loss_mapping += self.config["opt_params"]["lambda_plane"]*decay_factor * proj_loss
 
                 viewspace_point_tensor_acm.append(viewspace_point_tensor)
                 visibility_filter_acm.append(visibility_filter)
@@ -434,7 +439,7 @@ class BackEnd(mp.Process):
             #         normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()  # 0.6849
             #         loss_mapping += (self.config["opt_params"]["lambda_normal"] * normal_error)
             #
-            # if self.use_plane_constraint and itr == 0:
+            # if self.use_plane_constraint:
             #     proj_loss = get_loss_mapping_plane_constraint(self.gaussians, viewpoint,'huber') #5.3299e-05
             #     loss_mapping += self.config["opt_params"]["lambda_plane"] * proj_loss
 
@@ -545,6 +550,7 @@ class BackEnd(mp.Process):
                 random.randint(0, len(viewpoint_idx_stack) - 1)
             )
             viewpoint_cam = self.viewpoints[viewpoint_cam_idx]
+
             render_pkg = render(
                 viewpoint_cam, self.gaussians, self.pipeline_params, self.background, surf=False
             )
@@ -560,38 +566,7 @@ class BackEnd(mp.Process):
 
             gt_image = viewpoint_cam.original_image.cuda()
             Ll1 = l1_loss(image, gt_image)
-            #------------------------
-            # gt_depth = viewpoint_cam.gt_depth
-            # gt_depth_mask = gt_depth > 0.0
-            # Ll1_depth = l1_loss(depth * gt_depth_mask, gt_depth * gt_depth_mask)
-            # #------------------------
-            # scaling = self.gaussians.get_scaling
-            # isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1)).mean()
-            #------------------------
-            loss = (1.0 - self.opt_params.lambda_dssim) * (
-                Ll1
-            ) + self.opt_params.lambda_dssim * (1.0 - ssim(image, gt_image))
-            # loss = (1.0 - self.opt_params.lambda_dssim) * Ll1 + self.opt_params.lambda_dssim * (
-            #             1.0 - ssim(image, gt_image)) + 0.1 * isotropic_loss.mean() + 0.01 * Ll1_depth
-            #loss = Ll1 + 0.1 * isotropic_loss.mean() + 0.01 * Ll1_depth
-            # 2. 权重退火（关键优化：后期减弱几何约束以冲刺 PSNR）
-            # 初始权重设为 0.1，后期线性减小
-            # lambda_dist = 0.1 if iteration < 15000 else 0.1 * (1 - (iteration - 15000) / 11000)
-            # lambda_iso = 0.1 if iteration < 15000 else 0.1 * (1 - (iteration - 15000) / 11000)
-            #
-            # loss = Ll1 + lambda_iso * isotropic_loss + 0.01 * Ll1_depth
-            #------------------------
-            # if self.use_normal:
-            #     rend_normal = render_pkg["rend_normal"]
-            #     surf_normal = render_pkg["surf_normal"]
-            #     normal_error =(1 - (rend_normal * (-surf_normal)).sum(dim=0))[None]
-            #     normal_loss = 0.005 * normal_error.mean()
-            #     # 加入 Distortion Loss
-            #     dist_loss = get_depth_dist_loss(render_pkg)
-            #
-            #     loss += normal_loss + lambda_dist * dist_loss
-
-            #------------------------
+            loss = (1.0 - self.opt_params.lambda_dssim) * Ll1 + self.opt_params.lambda_dssim * (1.0 - ssim(image, gt_image))
             loss.backward()
             with torch.no_grad():
                 self.gaussians.max_radii2D[visibility_filter] = torch.max(
