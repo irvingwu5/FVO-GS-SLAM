@@ -128,10 +128,14 @@ class LoopClosureProcess(mp.Process):
 
             transformation = icp_result.transformation
 
-            # 计算信息矩阵，用于衡量这条闭环边在图优化中的可靠程度 (权重)
-            information = o3d.pipelines.registration.get_information_matrix_from_point_clouds(
-                source_pcd, target_pcd, max_correspondence_distance, transformation
-            )
+            # # 计算信息矩阵，用于衡量这条闭环边在图优化中的可靠程度 (权重)
+            # information = o3d.pipelines.registration.get_information_matrix_from_point_clouds(
+            #     source_pcd, target_pcd, max_correspondence_distance, transformation
+            # )
+            # 【核心修复 1】：废弃 Open3D 动辄几十万的暴力量化矩阵！
+            # 强制将 ICP 回环边的信息矩阵（权重）设定为一个极小的软约束。
+            # 让它只负责拉回全局累积的低频漂移，而不破坏局部高频轨迹的精确度。
+            information = np.identity(6) * 0.1
 
             Log(f"[ICP] 子图 {source_id}->{target_id} 匹配成功! Fitness: {icp_result.fitness:.3f}, RMSE: {icp_result.inlier_rmse:.4f}")
             return transformation, information, True
@@ -158,7 +162,7 @@ class LoopClosureProcess(mp.Process):
             trans = np.identity(4)
             # 【核心修复 1】：将极其刚硬的里程计权重(10.0)调低到(0.5)。
             # 这样位姿图才能变得“柔软”，允许 ICP 算出的回环误差将漂移的轨迹真正拉回正轨！
-            info = np.identity(6) * 0.5
+            info = np.identity(6) * 1000.0
             pose_graph.edges.append(
                 o3d.pipelines.registration.PoseGraphEdge(
                     source_id, target_id, trans, info, uncertain=False
