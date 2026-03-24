@@ -56,7 +56,7 @@ class LoopClosureProcess(mp.Process):
         self.min_interval = self.config.get("LoopClosure", {}).get("min_interval", 3)
         self.voxel_size = self.config.get("LoopClosure", {}).get("voxel_size", 0.05)
         # 判定为有效闭环的 ICP Fitness 阈值 (重叠度下限)
-        self.icp_fitness_threshold = 0.35
+        self.icp_fitness_threshold = 0.25
 
     def extract_pcd_from_2dgs_ckpt(self, ckpt_path):
         """

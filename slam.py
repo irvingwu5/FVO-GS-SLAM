@@ -29,7 +29,7 @@ from gaussian_splatting.gaussian_renderer import render
 from gaussian_splatting.utils.loss_utils import l1_loss, ssim
 # 引入刚体变换引擎
 from utils.loop_closure import rigid_transform_2dgs
-
+from utils.pose_utils import update_pose
 class SLAM:
     def __init__(self, config, save_dir=None):
         start = torch.cuda.Event(enable_timing=True) #创建了两个事件（Event）对象，主要用于GPU上的时间测量
@@ -456,8 +456,12 @@ class SLAM:
                 rendering_result_before["mean_lpips"],
                 ATE, FPS,
             )
-            # 4.2 真正对全局地图执行 Global Bundle Adjustment (仅缝合高斯几何，冻结相机)
-            Log("==> 开始全局大地图几何缝合与色彩精修... <==")
+            # 4.2 真正对全局地图执行 Global Bundle Adjustment (画质精修 + 几何缝合 + 位姿微调)
+            Log("==> 开始全局大地图联合优化 (Global BA & Color Refinement)... <==")
+            import random
+            from tqdm import tqdm
+            from gaussian_splatting.gaussian_renderer import render
+            from gaussian_splatting.utils.loss_utils import l1_loss, ssim
 
             camera_list = list(self.frontend.cameras.values())
             valid_cameras = []
@@ -482,20 +486,48 @@ class SLAM:
                 self.gaussians.n_obs = torch.zeros((total_points,), device="cuda", dtype=torch.int32)
 
                 # =========================================================================
-                # 【核心修复 3】：让高斯点云自由流动，但绝对冻结相机！
-                # 前端的相机轨迹已经很准了，让 2DGS 在光度误差的驱使下，自己去贴合正确的相机射线，
-                # 这样拼接处的重影就会完美重合。
-                # =========================================================================
+                # 1. 允许几何自我缝合
                 self.gaussians._xyz.requires_grad = True
                 self.gaussians._scaling.requires_grad = True
                 self.gaussians._rotation.requires_grad = True
                 if hasattr(self.gaussians, '_normal'):
                     self.gaussians._normal.requires_grad = True
 
-                # 降低几何学习率，防止剧烈形变
                 for param_group in self.gaussians.optimizer.param_groups:
                     if param_group["name"] in ["xyz", "rotation", "scaling", "normal"]:
                         param_group["lr"] = param_group["lr"] * 0.2
+
+                # =========================================================================
+                # 2. 【核心大招】：全局相机微调优化器 (Global Camera Optimizer)
+                # =========================================================================
+                opt_params_cams = []
+                for cam in valid_cameras:
+                    # 【核心修复】：动态重建被清理的参数张量
+                    if getattr(cam, 'cam_rot_delta', None) is None:
+                        cam.cam_rot_delta = torch.nn.Parameter(
+                            torch.zeros(3, requires_grad=True, device="cuda"))
+                    if getattr(cam, 'cam_trans_delta', None) is None:
+                        cam.cam_trans_delta = torch.nn.Parameter(
+                            torch.zeros(3, requires_grad=True, device="cuda"))
+                    if getattr(cam, 'exposure_a', None) is None:
+                        cam.exposure_a = torch.nn.Parameter(
+                            torch.tensor([0.0], requires_grad=True, device="cuda"))
+                    if getattr(cam, 'exposure_b', None) is None:
+                        cam.exposure_b = torch.nn.Parameter(
+                            torch.tensor([0.0], requires_grad=True, device="cuda"))
+
+                    opt_params_cams.append({"params": [cam.cam_rot_delta],
+                                            "lr": self.config["Training"]["lr"]["cam_rot_delta"] * 0.2,
+                                            "name": f"rot_{cam.uid}"})
+                    opt_params_cams.append({"params": [cam.cam_trans_delta],
+                                            "lr": self.config["Training"]["lr"]["cam_trans_delta"] * 0.2,
+                                            "name": f"trans_{cam.uid}"})
+                    opt_params_cams.append({"params": [cam.exposure_a], "lr": 0.01, "name": f"exp_a_{cam.uid}"})
+                    opt_params_cams.append({"params": [cam.exposure_b], "lr": 0.01, "name": f"exp_b_{cam.uid}"})
+
+                # 将优化器挂载
+                global_cam_optimizer = torch.optim.Adam(opt_params_cams)
+                # =========================================================================
 
                 iteration_total = 26000
                 for iteration in tqdm(range(1, iteration_total + 1)):
@@ -519,19 +551,30 @@ class SLAM:
                         self.gaussians.max_radii2D[visibility_filter] = torch.max(
                             self.gaussians.max_radii2D[visibility_filter], radii[visibility_filter]
                         )
+                        # 更新高斯
                         self.gaussians.optimizer.step()
                         self.gaussians.optimizer.zero_grad(set_to_none=True)
-
-                        # 重新打开学习率衰减，让最后几千步收敛得更加锐利
                         self.gaussians.update_learning_rate(iteration)
 
-                Log("==> 全局大地图缝合精修完成！ <==")
+                        # 【核心】：更新并应用全局相机位姿微调！消除漂移和重影的最后一步！
+                        global_cam_optimizer.step()
+                        global_cam_optimizer.zero_grad(set_to_none=True)
+
+                        # 把 Delta 增量吃进基础位姿矩阵 cam.T 里
+                        update_pose(viewpoint_cam)
+                        # 【新增】：全局相机学习率指数衰减，保证后期不再震荡
+                        if iteration % 100 == 0:
+                            lr_factor = (0.01 ** (1.0 / (iteration_total / 100)))  # 衰减系数
+                            for param_group in global_cam_optimizer.param_groups:
+                                param_group['lr'] *= lr_factor
+                Log("==> 全局大地图联合优化缝合完成！ <==")
             else:
                 Log("[Warning] 没有找到有效的图像缓存，跳过全局画质精修。")
 
             # 4.3 评估精修后的超清大图 (After)
             Log("Evaluating FINAL ATE after Global Optimization...")
-            # 【重要】：重新评估 ATE，拿到最终真实精度
+
+            # 【重要修复】：精修动了相机，必须在精修后重新计算真实的 ATE！
             final_ATE = eval_ate(
                 self.frontend.cameras,
                 self.frontend.kf_indices,

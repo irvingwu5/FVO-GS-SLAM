@@ -60,12 +60,12 @@ Training:
     loss_type: "Huber"  # "l1" or "l2"
     warmup_iter: 2500
 Submap:
-  trans_thre: 3     # 平移切图阈值(米)
-  rot_thre: 90           # 旋转切图阈值(度)
+  trans_thre: 1.5     # 平移切图阈值(米)
+  rot_thre: 60           # 旋转切图阈值(度)
 LoopClosure:
   enable: True
   min_interval: 2        # 触发闭环的最小子图间隔
-  voxel_size: 0.01
+  voxel_size: 0.02
 
 ## 3DGS default parameters
 opt_params:
