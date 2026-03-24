@@ -60,7 +60,7 @@ Training:
     loss_type: "Huber"  # "l1" or "l2"
     warmup_iter: 2500
 Submap:
-  trans_thre: 0.5        # 平移切图阈值(米)
+  trans_thre: 2        # 平移切图阈值(米)
   rot_thre: 50           # 旋转切图阈值(度)
 LoopClosure:
   enable: True

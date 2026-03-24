@@ -500,7 +500,7 @@ class SLAM:
                 # 为了防止优化力度过大导致点云乱飞，我们将几何参数的学习率人为降低 (微调模式)
                 for param_group in self.gaussians.optimizer.param_groups:
                     if param_group["name"] in ["xyz", "rotation", "scaling", "normal"]:
-                        param_group["lr"] = param_group["lr"] * 0.1
+                        param_group["lr"] = param_group["lr"] * 0.3
 
                 iteration_total = 26000
                 for iteration in tqdm(range(1, iteration_total + 1)):

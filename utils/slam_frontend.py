@@ -464,18 +464,18 @@ class FrontEnd(mp.Process):
                     if self.save_results:
                         # 注意：此处的 ATE 评估我们会在 slam.py 中合并后再做，这里可以先注释掉或保留(评估未修正前)
                         # 这里原本的 eval_ate 和 save_gaussians 先保留，它会评估未修正前的最终状态
-                        eval_ate(
-                            self.cameras,
-                            self.kf_indices,
-                            self.save_dir,
-                            0,
-                            final=True,
-                            monocular=self.monocular,
-                        )
-                        save_gaussians(
-                            self.gaussians, self.save_dir, "final", final=True
-                        )
-                        # pass
+                        # eval_ate(
+                        #     self.cameras,
+                        #     self.kf_indices,
+                        #     self.save_dir,
+                        #     0,
+                        #     final=True,
+                        #     monocular=self.monocular,
+                        # )
+                        # save_gaussians(
+                        #     self.gaussians, self.save_dir, "final", final=True
+                        # )
+                        pass
                     break
                 # 当调用前端initialize函数时，会将 self.requested_init 设为 True，并向后端发送初始化请求。只有当后端完成初始化并通过队列发回 init 消息时（第 534-536 行），前端才会将此标志重置为 False
                 if self.requested_init:
@@ -514,58 +514,26 @@ class FrontEnd(mp.Process):
                 render_pkg = self.tracking(cur_frame_idx, viewpoint)
 
                 # ========== 新增：子图“切图”监控逻辑 ==========
-                # 提取当前帧的 Camera to World (C2W) 矩阵
                 current_c2w = torch.linalg.inv(viewpoint.T)
 
-                # 初始化 Anchor（如果是第一帧或刚重置后）
                 if self.submap_anchor_pose is None:
                     self.submap_anchor_pose = current_c2w.clone()
 
-                # 检查是否超出阈值
                 if self.exceeds_motion_thresholds(current_c2w, self.submap_anchor_pose):
                     Log(f"==> 启动新子图 (ID: {self.current_submap_id + 1}) <==")
 
-                    # 1. 发送切图信号给后端
+                    # 1. 仅发送切图信号给后端
                     self.backend_queue.put(["new_submap", self.current_submap_id])
 
-                    # ==============================================================================
-                    # 【核心修复区】：防止 CUDA IPC 显存句柄失效导致 FileNotFoundError
-                    # a. 强制清空前端队列中积压的历史消息（如前一个子图的 sync_backend）
-                    while not self.frontend_queue.empty():
-                        try:
-                            self.frontend_queue.get_nowait()
-                        except:
-                            pass
-
-                    # b. 释放前端对旧高斯模型的引用，防止底层显存被后端销毁后引起非法访问
-                    self.gaussians = None
-                    self.requested_keyframe = 0
-                    # ==============================================================================
-
-                    # 2. 更新前端状态
+                    # 2. 更新前端锚点，继续平滑 Tracking
                     self.current_submap_id += 1
                     self.submap_anchor_pose = current_c2w.clone()
 
-                    # 3. 清空前端维护的关键帧窗口和可见性状态，以便在新的子图重新开始
-                    self.current_window.clear()
-                    self.occ_aware_visibility.clear()
+                    # 【核心修复】：彻底删除坐标系强制转换！
+                    # 保持全局坐标系连续 Tracking，不清理 current_window，
+                    # 彻底消除轨迹指数级爆炸和失忆问题。
 
-                    # 4. 强制当前帧成为新子图的第一个关键帧
-                    self.current_window.append(cur_frame_idx)
-                    depth_map = self.add_new_keyframe(
-                        cur_frame_idx,
-                        depth=render_pkg["depth"],
-                        opacity=render_pkg["opacity"],
-                        init=True,  # 【修改】：设为 True 以获取高质量的初始深度图
-                    )
-
-                    # 5. 【核心修复】：必须使用 request_init 而非 request_keyframe。
-                    # 这会将 self.requested_init 设为 True，使前端挂起（sleep），
-                    # 强制等待后端执行 3000 次初始化迭代，并返回一个稳定的新子图地图。
-                    self.request_init(cur_frame_idx, viewpoint, depth_map)
-
-                    cur_frame_idx += 1
-                    continue  # 跳过常规的关键帧判断，直接进入 wait 循环
+                    continue  # 跳过本次 is_keyframe 判断，平滑进入下一帧
                 # ============================================
 
                 # 窗口维护作用: 维护一个固定大小的滑动窗口（current_window），用于限制优化规模

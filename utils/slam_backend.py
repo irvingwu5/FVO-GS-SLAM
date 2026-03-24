@@ -536,12 +536,35 @@ class BackEnd(mp.Process):
                 self.gaussians.update_learning_rate(self.iteration_count)
                 self.keyframe_optimizers.step()
                 self.keyframe_optimizers.zero_grad(set_to_none=True)
-                # Pose update 只更新位姿优化窗口内的相机位姿
-                for cam_idx in range(min(frames_to_optimize, len(current_window))): #min(3,2)[5,0]
-                    viewpoint = viewpoint_stack[cam_idx]
-                    if viewpoint.uid == 0: #世界坐标系/第一帧位姿固定不变
-                        continue
-                    update_pose(viewpoint)
+                # # Pose update 只更新位姿优化窗口内的相机位姿
+                # for cam_idx in range(min(frames_to_optimize, len(current_window))): #min(3,2)[5,0]
+                #     viewpoint = viewpoint_stack[cam_idx]
+                #     if viewpoint.uid == 0: #世界坐标系/第一帧位姿固定不变
+                #         continue
+                #     update_pose(viewpoint)
+                # --- 修改重点 ---
+                # 只有在优化器被初始化后才执行 step
+                if self.keyframe_optimizers is not None:
+                    self.gaussians.optimizer.step()
+                    self.gaussians.optimizer.zero_grad(set_to_none=True)
+                    self.gaussians.update_learning_rate(self.iteration_count)
+
+                    # 执行位姿和曝光优化
+                    self.keyframe_optimizers.step()
+                    self.keyframe_optimizers.zero_grad(set_to_none=True)
+
+                    # 更新相机位姿
+                    frames_to_optimize = self.config["Training"]["pose_window"]
+                    for cam_idx in range(min(frames_to_optimize, len(current_window))):
+                        viewpoint = viewpoint_stack[cam_idx]
+                        if viewpoint.uid == 0:
+                            continue
+                        update_pose(viewpoint)
+                else:
+                    # 如果没有位姿优化器（处于切图间隙），只更新高斯模型本身
+                    self.gaussians.optimizer.step()
+                    self.gaussians.optimizer.zero_grad(set_to_none=True)
+                    self.gaussians.update_learning_rate(self.iteration_count)
         return gaussian_split
     '''
     ------------------离线精修模块(Color Refinement)------------------
@@ -619,6 +642,15 @@ class BackEnd(mp.Process):
                     continue
 
                 if self.single_thread:
+                    time.sleep(0.01)
+                    continue
+                # 如果没有位姿优化器，说明正处于两个子图的交接点，且尚未收到新子图的第一个关键帧
+                # 此时跳过 map，避免在 None 对象上纠结
+                if self.keyframe_optimizers is None:
+                    time.sleep(0.01)
+                    continue
+
+                if self.pause or len(self.current_window) == 0:
                     time.sleep(0.01)
                     continue
                 self.map(self.current_window) #执行建图 (map): 对当前窗口进行优化。
@@ -744,57 +776,72 @@ class BackEnd(mp.Process):
                     # 做可选的修剪（移除低观测数的高斯点）
                     self.map(self.current_window, prune=True)
                     self.push_to_frontend("keyframe")
+
                 # =========== 新增：子图冻结与重生逻辑 ===========
                 elif data[0] == "new_submap":
                     completed_submap_id = data[1]
-                    self.current_submap_id = completed_submap_id + 1  # <--- 新增这行，记录最新ID
+                    self.current_submap_id = completed_submap_id + 1
                     Log(f"==> Backend received new_submap signal. Freezing submap {completed_submap_id}...")
 
-                    # 1. 保存当前子图 (冻结)
                     save_dir = self.config["Results"]["save_dir"]
                     submaps_dir = os.path.join(save_dir, "submaps")
                     os.makedirs(submaps_dir, exist_ok=True)
 
-                    # 抓取当前高斯模型的所有张量参数
                     gaussian_params = self.gaussians.capture_dict()
-                    # 提取该子图包含的所有关键帧 ID
                     submap_keyframes = sorted(list(self.viewpoints.keys()))
-
                     ckpt_data = {
                         "gaussian_params": gaussian_params,
                         "submap_keyframes": submap_keyframes
                     }
                     ckpt_path = os.path.join(submaps_dir, f"{completed_submap_id:06d}.ckpt")
                     torch.save(ckpt_data, ckpt_path)
-                    Log(f"Submap {completed_submap_id} saved to {ckpt_path}")
-                    # ========= 新增：触发独立进程的 PGO 优化 =========
+
                     if hasattr(self, 'loop_queue') and self.loop_queue is not None:
                         self.loop_queue.put(["submap_saved", completed_submap_id, ckpt_path])
-                    # ===================================================
-                    # 2. 浴火重生：清空显存和状态
-                    self.gaussians.reset()
 
-                    # 【极度关键】：重新初始化高斯模型的 Adam 优化器。
-                    # 否则下一个关键帧执行 extend_from_pcd_seq 时会因找不到优化器而报错
-                    self.gaussians.training_setup(self.opt_params)
+                    # =================================================================
+                    # 【核心修复】：软重置 (Soft Reset)
+                    # 配合前端的连续全局坐标系，后端只剔除不在当前滑动窗口内的老旧高斯点。
+                    # 保留重叠区，实现物理上的无缝衔接。
+                    # =================================================================
+                    retained_kfs = self.current_window
+                    if len(retained_kfs) > 0:
+                        # 获取 unique_kfIDs 所在的设备（通常在 CPU 上以节省显存）
+                        target_device = self.gaussians.unique_kfIDs.device
 
-                    # 清空后端维护的局部窗口和可视性掩码
-                    self.viewpoints.clear()
-                    self.current_window.clear()
-                    self.occ_aware_visibility.clear()
+                        # 在 CPU 上创建遮罩并进行逻辑运算，避免设备冲突报错
+                        old_mask = torch.ones(self.gaussians.get_xyz.shape[0], dtype=torch.bool, device=target_device)
+                        for kf_id in retained_kfs:
+                            kf_id_tensor = torch.tensor(kf_id, device=target_device,
+                                                        dtype=self.gaussians.unique_kfIDs.dtype)
+                            old_mask = old_mask & (self.gaussians.unique_kfIDs != kf_id_tensor)
 
-                    # 清空相机位姿的优化器
+                        # 剔除老点（加 .cuda() 送回 GPU 执行）
+                        self.gaussians.prune_points(old_mask.cuda())
+
+                        self.gaussians.training_setup(self.opt_params)
+
+                        # 清理老旧 viewpoints，只保留窗口内的重叠区相机
+                        retained_viewpoints = {kf: self.viewpoints[kf] for kf in retained_kfs}
+                        self.viewpoints.clear()
+                        self.viewpoints.update(retained_viewpoints)
+                    else:
+                        # 兜底逻辑
+                        self.gaussians.reset()
+                        self.gaussians.training_setup(self.opt_params)
+                        self.viewpoints.clear()
+                        self.current_window.clear()
+                        self.occ_aware_visibility.clear()
+                    # =================================================================
+
                     if self.keyframe_optimizers is not None:
                         self.keyframe_optimizers.zero_grad(set_to_none=True)
                         del self.keyframe_optimizers
                         self.keyframe_optimizers = None
 
                     self.iteration_count = 0
-
-                    # 强制清空碎片显存
                     torch.cuda.empty_cache()
                     Log(f"==> Submap {completed_submap_id} frozen and VRAM cleared. Ready for next submap. <==")
-            # ===============================================
                 else:
                     raise Exception("Unprocessed data", data)
         while not self.backend_queue.empty():
