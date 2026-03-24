@@ -90,18 +90,19 @@ class GaussianPacket:
         self.has_gaussians = False
         if gaussians is not None:
             self.has_gaussians = True
-            self.get_xyz = gaussians.get_xyz.detach().clone()
+            # 【极度关键】：必须加上 .cpu()，彻底切断与后端 CUDA 显存的 IPC 绑定，防止闪退！
+            self.get_xyz = gaussians.get_xyz.detach().cpu().clone()
             self.active_sh_degree = gaussians.active_sh_degree
-            self.get_opacity = gaussians.get_opacity.detach().clone()
-            self.get_scaling = gaussians.get_scaling.detach().clone()
-            self.get_rotation = gaussians.get_rotation.detach().clone()
+            self.get_opacity = gaussians.get_opacity.detach().cpu().clone()
+            self.get_scaling = gaussians.get_scaling.detach().cpu().clone()
+            self.get_rotation = gaussians.get_rotation.detach().cpu().clone()
             self.max_sh_degree = gaussians.max_sh_degree
-            self.get_features = gaussians.get_features.detach().clone()
+            self.get_features = gaussians.get_features.detach().cpu().clone()
 
-            self._rotation = gaussians._rotation.detach().clone()
+            self._rotation = gaussians._rotation.detach().cpu().clone()
             self.rotation_activation = torch.nn.functional.normalize
-            self.unique_kfIDs = gaussians.unique_kfIDs.clone()
-            self.n_obs = gaussians.n_obs.clone()
+            self.unique_kfIDs = gaussians.unique_kfIDs.detach().cpu().clone()
+            self.n_obs = gaussians.n_obs.detach().cpu().clone()
 
         self.keyframe = keyframe
         self.current_frame = current_frame
@@ -115,34 +116,22 @@ class GaussianPacket:
     def resize_img(self, img, width):
         if img is None:
             return None
-
-        # check if img is numpy
         if isinstance(img, np.ndarray):
             height = int(width * img.shape[0] / img.shape[1])
             return cv2.resize(img, (width, height))
         height = int(width * img.shape[1] / img.shape[2])
-        # img is 3xHxW
-        img = torch.nn.functional.interpolate(
-            img.unsqueeze(0), size=(height, width), mode="bilinear", align_corners=False
+        # 如果 img 在 GPU 上，必须转到 CPU
+        img_cpu = img.cpu() if img.is_cuda else img
+        img_resized = torch.nn.functional.interpolate(
+            img_cpu.unsqueeze(0), size=(height, width), mode="bilinear", align_corners=False
         )
-        return img.squeeze(0)
+        return img_resized.squeeze(0)
 
     def get_covariance(self, scaling_modifier=1):
         return self.build_covariance_from_scaling_rotation(
             self.get_scaling, scaling_modifier, self._rotation
         )
 
-    # def build_covariance_from_scaling_rotation(  # 缩放矩阵,用于调整缩放矩阵的大小,四元数
-    #         self, center, scaling, scaling_modifier, rotation
-    # ):
-    #     RS = build_scaling_rotation(torch.cat([scaling * scaling_modifier, torch.ones_like(scaling)], dim=-1),
-    #                                 rotation,
-    #                                 ).permute(0, 2, 1)  # S,q->R，L=RS，scaling_modifier用于调整缩放矩阵的大小
-    #     trans = torch.zeros((center.shape[0], 4, 4), dtype=torch.float, device="cuda")
-    #     trans[:, :3, :3] = RS
-    #     trans[:, 3, :3] = center
-    #     trans[:, 3, 3] = 1
-    #     return trans
     def build_covariance_from_scaling_rotation(
         self, scaling, scaling_modifier, rotation
     ):
@@ -170,7 +159,7 @@ class Packet_vis2main:
     flag_pause = None
 
 
-class ParamsGUI: # 定义了一个名为 ParamsGUI 的 Python 类，其主要作用是一个数据容器或配置对象，用于封装和传递 GUI（图形用户界面）所需的各种参数和共享对象。
+class ParamsGUI:
     def __init__(
         self,
         pipe=None,
@@ -178,9 +167,11 @@ class ParamsGUI: # 定义了一个名为 ParamsGUI 的 Python 类，其主要作
         gaussians=None,
         q_main2vis=None,
         q_vis2main=None,
+        save_dir=".", # <--- 新增
     ):
         self.pipe = pipe
         self.background = background
-        self.gaussians = gaussians #要在 GUI 中可视化的 3D 高斯数据
-        self.q_main2vis = q_main2vis #从前端（主进程/线程）发送消息到可视化 (GUI) 进程/线程。这通常用于传输更新的数据包
-        self.q_vis2main = q_vis2main #从可视化 (GUI) 进程/线程发送消息回主进程/线程（例如用户在 GUI 上的操作指令，如暂停、调整视角等）
+        self.gaussians = gaussians
+        self.q_main2vis = q_main2vis
+        self.q_vis2main = q_vis2main
+        self.save_dir = save_dir # <--- 记录保存路径以便读取所有子图

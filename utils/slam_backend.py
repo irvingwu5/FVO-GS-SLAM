@@ -5,6 +5,7 @@ import torch
 import torch.multiprocessing as mp
 from tqdm import tqdm
 import os
+import numpy as np
 from gaussian_splatting.gaussian_renderer import render
 from gaussian_splatting.utils.loss_utils import l1_loss, ssim
 from utils.logging_utils import Log
@@ -53,6 +54,8 @@ class BackEnd(mp.Process):
         self.use_plane_constraint = config["Training"]["sagsslam"]["use_plane_constraint"]
         # 读取模式字符串
         self.normal_mode = config["Training"]["sagsslam"]["normal_mode"]
+
+        self.current_submap_id = 0  # <--- 新增这行
 
         # 可选：简单的参数校验，防止写错
         valid_modes = ["sensor", "plane", "mixed"]
@@ -626,6 +629,25 @@ class BackEnd(mp.Process):
             else: #响应前端的指令，指令处理 (非空时)
                 data = self.backend_queue.get()
                 if data[0] == "stop": #终止循环，退出进程
+                    # ========== 新增：在进程退出前，强行保存最后一块子图 ==========
+                    save_dir = self.config["Results"]["save_dir"]
+                    submaps_dir = os.path.join(save_dir, "submaps")
+                    os.makedirs(submaps_dir, exist_ok=True)
+
+                    gaussian_params = self.gaussians.capture_dict()
+                    submap_keyframes = sorted(list(self.viewpoints.keys()))
+                    ckpt_data = {
+                        "gaussian_params": gaussian_params,
+                        "submap_keyframes": submap_keyframes,
+                        "correct_tsfm": np.eye(4)  # 默认单位阵，防PGO未触发
+                    }
+                    ckpt_path = os.path.join(submaps_dir, f"{self.current_submap_id:06d}.ckpt")
+                    torch.save(ckpt_data, ckpt_path)
+
+                    if hasattr(self, 'loop_queue') and self.loop_queue is not None:
+                        self.loop_queue.put(["submap_saved", self.current_submap_id, ckpt_path])
+                    Log(f"==> 终局保存：最后一块子图 {self.current_submap_id} 已存入硬盘。 <==")
+                    # ==============================================================
                     break
                 elif data[0] == "pause": #设置暂停状态标志
                     self.pause = True
@@ -725,6 +747,7 @@ class BackEnd(mp.Process):
                 # =========== 新增：子图冻结与重生逻辑 ===========
                 elif data[0] == "new_submap":
                     completed_submap_id = data[1]
+                    self.current_submap_id = completed_submap_id + 1  # <--- 新增这行，记录最新ID
                     Log(f"==> Backend received new_submap signal. Freezing submap {completed_submap_id}...")
 
                     # 1. 保存当前子图 (冻结)

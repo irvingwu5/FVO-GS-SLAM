@@ -9,10 +9,6 @@ from utils.logging_utils import Log
 
 
 def rigid_transform_2dgs(gaussian_params, tsfm_matrix):
-    """
-    针对 2DGS 的核心刚体变换引擎。
-    将 4x4 的修正矩阵应用到 2DGS 的中心点、法线和切平面旋转上。
-    """
     tsfm_matrix = torch.from_numpy(tsfm_matrix).float().cuda()
     R = tsfm_matrix[:3, :3]
     t = tsfm_matrix[:3, 3]
@@ -21,18 +17,25 @@ def rigid_transform_2dgs(gaussian_params, tsfm_matrix):
     xyz = gaussian_params['_xyz']
     gaussian_params['_xyz'] = (R @ xyz.T).T + t
 
-    # 2. 变换二维高斯的朝向
-    if '_normal' in gaussian_params:
-        normals = gaussian_params['_normal']
-        gaussian_params['_normal'] = (R @ normals.T).T
-
-    # 处理旋转四元数 (用于 2D 切平面的三维空间朝向)
+    # 2. 变换二维高斯的朝向 (严谨处理四元数顺序)
     if '_rotation' in gaussian_params:
         rotation_q = gaussian_params['_rotation']
-        cur_rot_mat = roma.unitquat_to_rotmat(rotation_q)
-        # 旋转叠加：新旋转矩阵 = 刚体旋转矩阵 @ 原旋转矩阵
+
+        # 【核心修复】：3DGS 的四元数是 (w, x, y, z)，而 roma 需要 (x, y, z, w)
+        # 将第 0 位 (w) 移到最后
+        rotation_q_roma = rotation_q[:, [1, 2, 3, 0]]
+
+        cur_rot_mat = roma.unitquat_to_rotmat(rotation_q_roma)
         new_rot_mat = R.unsqueeze(0) @ cur_rot_mat
-        gaussian_params['_rotation'] = roma.rotmat_to_unitquat(new_rot_mat).squeeze()
+        new_rotation_q_roma = roma.rotmat_to_unitquat(new_rot_mat).squeeze()
+
+        # 计算完后再转换回 3DGS 的 (w, x, y, z) 格式
+        # 将最后一位 (w) 移回最前面
+        new_rotation_q = new_rotation_q_roma[:, [3, 0, 1, 2]]
+        gaussian_params['_rotation'] = new_rotation_q
+
+        if '_normal' in gaussian_params:
+            gaussian_params['_normal'] = new_rot_mat[:, :, 2]
 
     return gaussian_params
 
@@ -152,9 +155,10 @@ class LoopClosureProcess(mp.Process):
             source_id = i
             target_id = i - 1
             # 相邻子图在保存时已经处于同一世界坐标系下，理论相对变换为单位阵
-            # 若要更严谨，应当记录前端传入的 Anchor Pose 并在此计算相对变换
             trans = np.identity(4)
-            info = np.identity(6) * 10.0  # 里程计边权重较高
+            # 【核心修复 1】：将极其刚硬的里程计权重(10.0)调低到(0.5)。
+            # 这样位姿图才能变得“柔软”，允许 ICP 算出的回环误差将漂移的轨迹真正拉回正轨！
+            info = np.identity(6) * 0.5
             pose_graph.edges.append(
                 o3d.pipelines.registration.PoseGraphEdge(
                     source_id, target_id, trans, info, uncertain=False
@@ -202,6 +206,10 @@ class LoopClosureProcess(mp.Process):
         return correction_list
 
     def apply_correction_to_submaps(self, correction_list):
+        """
+        仅仅将优化后的位姿修正矩阵记录到硬盘上的 .ckpt 文件中。
+        真正的坐标变换放到 slam.py 合并大图时实时应用。杜绝递归旋转！
+        """
         for correction in correction_list:
             submap_id = correction['submap_id']
             correct_tsfm = correction['correct_tsfm']
@@ -213,11 +221,12 @@ class LoopClosureProcess(mp.Process):
             if not ckpt_path or not os.path.exists(ckpt_path):
                 continue
 
-            Log(f"正在对子图 {submap_id} 进行 2DGS 刚体拉扯校正...")
-            submap_ckpt = torch.load(ckpt_path, map_location="cuda")
+            Log(f"记录子图 {submap_id} 的 PGO 修正矩阵...")
+            submap_ckpt = torch.load(ckpt_path, map_location="cpu")
 
-            updated_params = rigid_transform_2dgs(submap_ckpt["gaussian_params"], correct_tsfm)
-            submap_ckpt["gaussian_params"] = updated_params
+            # 【绝对关键】：千万不要再调用 rigid_transform_2dgs 去改 gaussian_params 了！
+            # 仅仅记录 PGO 计算出的全局修正矩阵
+            submap_ckpt["correct_tsfm"] = correct_tsfm
 
             torch.save(submap_ckpt, ckpt_path)
 

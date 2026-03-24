@@ -3,7 +3,7 @@ import time
 import numpy as np
 import torch
 import torch.multiprocessing as mp
-
+import os
 from gaussian_splatting.gaussian_renderer import render
 from gaussian_splatting.utils.graphics_utils import getProjectionMatrix2, getWorld2View2
 from gui import gui_utils
@@ -48,6 +48,7 @@ class FrontEnd(mp.Process):
         self.submap_anchor_pose = None  # 记录当前子图第一帧的位姿 (World to Camera)
         self.submap_trans_thre = self.config.get("Submap", {}).get("trans_thre", 0.5)  # 默认 0.5 米
         self.submap_rot_thre = self.config.get("Submap", {}).get("rot_thre", 50.0)  # 默认 50 度
+        self.frame_to_submap = {}  # <--- 新增这行：记录每帧属于哪个子图
         # ============================================
 
     def set_hyperparams(self):
@@ -457,7 +458,12 @@ class FrontEnd(mp.Process):
             if self.frontend_queue.empty(): # 前端队列为空（第一次执行为空），执行前端 SLAM 主循环的核心逻辑
                 tic.record()
                 if cur_frame_idx >= len(self.dataset): #所有帧处理完毕，保存结果并退出循环
+                    # ========== 新增：退出前将从属关系存入硬盘 ==========
+                    torch.save(self.frame_to_submap, os.path.join(self.save_dir, "frame_to_submap.pt"))
+                    # ====================================================
                     if self.save_results:
+                        # 注意：此处的 ATE 评估我们会在 slam.py 中合并后再做，这里可以先注释掉或保留(评估未修正前)
+                        # 这里原本的 eval_ate 和 save_gaussians 先保留，它会评估未修正前的最终状态
                         eval_ate(
                             self.cameras,
                             self.kf_indices,
@@ -469,6 +475,7 @@ class FrontEnd(mp.Process):
                         save_gaussians(
                             self.gaussians, self.save_dir, "final", final=True
                         )
+                        # pass
                     break
                 # 当调用前端initialize函数时，会将 self.requested_init 设为 True，并向后端发送初始化请求。只有当后端完成初始化并通过队列发回 init 消息时（第 534-536 行），前端才会将此标志重置为 False
                 if self.requested_init:
@@ -489,6 +496,9 @@ class FrontEnd(mp.Process):
                 viewpoint.compute_grad_mask(self.config) # 计算rgb l1损失时使用的梯度掩码,提取图像中纹理丰富或边缘明显的区域，忽略平坦区域，提高tracking计算的效率和稳定性
                 # 读取当前帧数据后，将其存储在前端属性 self.cameras 字典中，以便后续处理和访问
                 self.cameras[cur_frame_idx] = viewpoint #将当前正在处理的这一帧（由索引 cur_frame_idx 标识）的相机对象（viewpoint）保存到前端类的成员变量 self.cameras 字典中
+                # ========== 新增：记录当前帧属于哪个子图 ==========
+                self.frame_to_submap[cur_frame_idx] = self.current_submap_id
+                # ==================================================
                 # 系统初始化
                 if self.reset: #系统重置标志为 True，说明需要重新初始化 SLAM 系统
                     self.initialize(cur_frame_idx, viewpoint) #系统的冷启动，前端将第一帧关键帧信息发送给后端建立初始地图，重置标志为 False表明初始化已完成
