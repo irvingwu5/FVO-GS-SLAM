@@ -50,16 +50,22 @@ Training:
     cam_rot_delta: 0.003
     cam_trans_delta: 0.001
   sagsslam:
-    use_external_normal: True
-    use_surf_normal: True
-    use_distortion_loss: True
+    use_external_normal: False
+    use_surf_normal: False
+    use_distortion_loss: False
     # 互斥选择: "sensor", "plane", "mixed"
     #sensor_depthnomal_supervision、plane_normal_supervision、mixed_normal_supervision
     normal_mode: "sensor"
-    use_plane_constraint: True
+    use_plane_constraint: False
     loss_type: "Huber"  # "l1" or "l2"
     warmup_iter: 2500
-
+Submap:
+  trans_thre: 0.5        # 平移切图阈值(米)
+  rot_thre: 50           # 旋转切图阈值(度)
+LoopClosure:
+  enable: True
+  min_interval: 3        # 触发闭环的最小子图间隔
+  voxel_size: 0.05
 
 ## 3DGS default parameters
 opt_params:

@@ -20,7 +20,9 @@ from utils.logging_utils import Log
 from utils.multiprocessing_utils import FakeQueue
 from utils.slam_backend import BackEnd
 from utils.slam_frontend import FrontEnd
-
+# ========= 新增：导入新建的 Loop Closure 进程类 =========
+from utils.loop_closure import LoopClosureProcess
+# ========================================================
 
 class SLAM:
     def __init__(self, config, save_dir=None):
@@ -74,9 +76,14 @@ class SLAM:
         # 创建前端和后端进程之间的队列
         frontend_queue = mp.Queue() #后端传给前端的数据队列
         backend_queue = mp.Queue() #前端传给后端的数据队列
+
         # FakeQueue 是一个“假的”队列，它存在的目的是为了让程序在关闭 GUI 模式下，依然能够流畅运行原本为 GUI 通信设计的代码逻辑，而不会因为没有真实的队列对象而崩溃。
         q_main2vis = mp.Queue() if self.use_gui else FakeQueue() #主进程（frontend）传给可视化进程的数据队列
         q_vis2main = mp.Queue() if self.use_gui else FakeQueue() #可视化进程传给主进程（frontend）的数据队列
+
+        # ========= 新增：为 Loop Closure 创建专属通信队列 =========
+        loop_queue = mp.Queue()
+        # ==========================================================
         # 重新赋值保存目录和单目模式
         self.config["Results"]["save_dir"] = save_dir
         self.config["Training"]["monocular"] = self.monocular
@@ -102,6 +109,11 @@ class SLAM:
         self.backend.backend_queue = backend_queue #前端传给后端的数据队列
         self.backend.live_mode = self.live_mode # 实时模式标志
         self.backend.set_hyperparams() # 设置后端的超参数
+
+        # ========= 新增：将 loop_queue 挂载给后端 =========
+        self.backend.loop_queue = loop_queue
+        # ====================================================
+
         # 给GUI的参数赋值
         self.params_gui = gui_utils.ParamsGUI(
             pipe=self.pipeline_params,
@@ -112,6 +124,12 @@ class SLAM:
         )
         # 仅仅是创建了一个进程对象，并将 self.backend.run 注册为该进程启动时要运行的目标函数，不会执行 run 方法
         backend_process = mp.Process(target=self.backend.run)
+
+        # ========= 新增：实例化并启动 Loop Closure 后台进程 =========
+        self.loop_closure_process = LoopClosureProcess(self.config, loop_queue)
+        self.loop_closure_process.start()
+        # ============================================================
+
         if self.use_gui:
             # 创建一个 GUI 进程，目标函数为 slam_gui.run，传递参数 self.params_gui
             gui_process = mp.Process(target=slam_gui.run, args=(self.params_gui,))
@@ -205,6 +223,13 @@ class SLAM:
         backend_queue.put(["stop"])
         backend_process.join()
         Log("Backend stopped and joined the main thread")
+
+        # ========= 新增：优雅关闭 Loop Closure 进程 =========
+        loop_queue.put(["stop"])
+        self.loop_closure_process.join()
+        Log("Loop Closure stopped and joined the main thread")
+        # ====================================================
+
         if self.use_gui:
             q_main2vis.put(gui_utils.GaussianPacket(finish=True))
             gui_process.join()

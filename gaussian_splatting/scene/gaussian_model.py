@@ -365,6 +365,119 @@ class GaussianModel:
             l.append("rot_{}".format(i))
         return l
 
+    def capture_dict(self):
+        """
+        将当前高斯子图的所有参数及优化器状态打包为字典，转移至 CPU。
+        用于前端触发切图时，将子图状态保存至硬盘 (.ckpt)。
+        """
+        params_dict = {
+            "active_sh_degree": self.active_sh_degree,
+            "spatial_lr_scale": getattr(self, "spatial_lr_scale", 1.0),
+            # 断开计算图并转移到 CPU，防止硬盘持久化时仍占用显存
+            "_xyz": self._xyz.detach().cpu(),
+            "_features_dc": self._features_dc.detach().cpu(),
+            "_features_rest": self._features_rest.detach().cpu(),
+            "_scaling": self._scaling.detach().cpu(),
+            "_rotation": self._rotation.detach().cpu(),
+            "_opacity": self._opacity.detach().cpu(),
+            "max_radii2D": self.max_radii2D.detach().cpu(),
+            "xyz_gradient_accum": self.xyz_gradient_accum.detach().cpu(),
+            "denom": self.denom.detach().cpu(),
+            "unique_kfIDs": self.unique_kfIDs.detach().cpu(),
+            "n_obs": self.n_obs.detach().cpu(),
+        }
+
+        # 提取 Adam 优化器的当前动量状态（如果需要热启动）
+        if self.optimizer is not None:
+            opt_state = self.optimizer.state_dict()
+            opt_state_cpu = {"state": {}, "param_groups": opt_state["param_groups"]}
+            for param_id, state in opt_state["state"].items():
+                opt_state_cpu["state"][param_id] = {}
+                for k, v in state.items():
+                    # 必须确保所有的动量矩阵 (exp_avg, exp_avg_sq) 都移到 CPU
+                    if torch.is_tensor(v):
+                        opt_state_cpu["state"][param_id][k] = v.detach().cpu()
+                    else:
+                        opt_state_cpu["state"][param_id][k] = v
+            params_dict["optimizer_state"] = opt_state_cpu
+
+        return params_dict
+
+    def restore_from_params(self, params_dict, training_args=None):
+        """
+        从字典中恢复高斯子图的所有参数。
+        用于后端位姿图优化（PGO）时重新加载历史子图。
+        """
+        self.active_sh_degree = params_dict.get("active_sh_degree", 0)
+        if "spatial_lr_scale" in params_dict:
+            self.spatial_lr_scale = params_dict["spatial_lr_scale"]
+
+        # 重新包装为 nn.Parameter 并挂载回 GPU，启用梯度计算
+        self._xyz = nn.Parameter(params_dict["_xyz"].cuda().requires_grad_(True))
+        self._features_dc = nn.Parameter(params_dict["_features_dc"].cuda().requires_grad_(True))
+        self._features_rest = nn.Parameter(params_dict["_features_rest"].cuda().requires_grad_(True))
+        self._scaling = nn.Parameter(params_dict["_scaling"].cuda().requires_grad_(True))
+        self._rotation = nn.Parameter(params_dict["_rotation"].cuda().requires_grad_(True))
+        self._opacity = nn.Parameter(params_dict["_opacity"].cuda().requires_grad_(True))
+
+        self.max_radii2D = params_dict["max_radii2D"].cuda()
+        self.xyz_gradient_accum = params_dict["xyz_gradient_accum"].cuda()
+        self.denom = params_dict["denom"].cuda()
+
+        self.unique_kfIDs = params_dict["unique_kfIDs"].int()
+        self.n_obs = params_dict["n_obs"].int()
+
+        # 如果提供了训练参数，则重新构建优化器
+        if training_args is not None:
+            self.training_setup(training_args)
+
+            # 尝试恢复优化器的动量状态
+            if "optimizer_state" in params_dict and self.optimizer is not None:
+                opt_state_gpu = {"state": {}, "param_groups": params_dict["optimizer_state"]["param_groups"]}
+                for param_id, state in params_dict["optimizer_state"]["state"].items():
+                    opt_state_gpu["state"][param_id] = {}
+                    for k, v in state.items():
+                        if torch.is_tensor(v):
+                            opt_state_gpu["state"][param_id][k] = v.cuda()
+                        else:
+                            opt_state_gpu["state"][param_id][k] = v
+                try:
+                    self.optimizer.load_state_dict(opt_state_gpu)
+                except Exception as e:
+                    print(f"[Warning] 优化器状态映射失败，将使用全新的优化器状态继续。原因: {e}")
+
+    def reset(self):
+        """
+        清空当前模型的所有参数与优化器状态，彻底释放显存。
+        极其关键：这是 LoopSplat 在切换新子图时防止显存爆炸的核心动作。
+        """
+        # 1. 斩断优化器的梯度累积，释放动量矩阵
+        if self.optimizer is not None:
+            self.optimizer.zero_grad(set_to_none=True)
+            del self.optimizer
+            self.optimizer = None
+
+        # 2. 将所有属性重置为空张量 (0个高斯点)
+        self._xyz = torch.empty(0, device="cuda")
+        self._features_dc = torch.empty(0, device="cuda")
+        self._features_rest = torch.empty(0, device="cuda")
+        self._scaling = torch.empty(0, device="cuda")
+        self._rotation = torch.empty(0, device="cuda")
+        self._opacity = torch.empty(0, device="cuda")
+
+        self.max_radii2D = torch.empty(0, device="cuda")
+        self.xyz_gradient_accum = torch.empty(0, device="cuda")
+        self.denom = torch.empty(0, device="cuda")
+
+        self.unique_kfIDs = torch.empty(0).int()
+        self.n_obs = torch.empty(0).int()
+
+        self.active_sh_degree = 0
+
+        # 3. 强制清空 CUDA 缓存，收回所有被解绑张量占用的碎片显存
+        torch.cuda.empty_cache()
+
+
     def save_ply(self, path):
         mkdir_p(os.path.dirname(path))
 

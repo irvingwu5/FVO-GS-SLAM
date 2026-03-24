@@ -43,6 +43,13 @@ class FrontEnd(mp.Process):
         self.device = "cuda:0"
         self.pause = False
 
+        # ========== 新增：子图策略状态变量 ==========
+        self.current_submap_id = 0
+        self.submap_anchor_pose = None  # 记录当前子图第一帧的位姿 (World to Camera)
+        self.submap_trans_thre = self.config.get("Submap", {}).get("trans_thre", 0.5)  # 默认 0.5 米
+        self.submap_rot_thre = self.config.get("Submap", {}).get("rot_thre", 50.0)  # 默认 50 度
+        # ============================================
+
     def set_hyperparams(self):
         self.save_dir = self.config["Results"]["save_dir"] # 结果保存路径
         self.save_results = self.config["Results"]["save_results"] # 是否保存结果
@@ -233,6 +240,17 @@ class FrontEnd(mp.Process):
 
         curr_frame = self.cameras[cur_frame_idx] # 当前帧对象
         last_kf = self.cameras[last_keyframe_idx] # 上一个关键帧对象
+
+        # ====================================================================
+        # 【新增防御性逻辑】：防止异步通信导致的状态覆写引发 KeyError
+        # 如果发现当前的基准关键帧丢失，说明前端刚刚受到了旧消息的干扰。
+        # 此时直接返回 True 强制生成一个新关键帧。这会迫使后端重新运行 map()，
+        # 并下发一份绝对正确、新鲜的 occ_aware_visibility 字典，实现系统“自愈”。
+        if last_keyframe_idx not in occ_aware_visibility:
+            Log(f"[Warning] Keyframe {last_keyframe_idx} lost in visibility dict! Forcing a new keyframe to heal state.")
+            return True
+        # ====================================================================
+
         #计算相对位移（几何距离判断）这部分计算当前帧相对于上一关键帧移动了多少距离
         # pose_CW = getWorld2View2(curr_frame.R, curr_frame.T) # 当前帧的世界到相机变换矩阵 (World to Camera)
         # last_kf_CW = getWorld2View2(last_kf.R, last_kf.T) # 上一关键帧的世界到相机变换矩阵
@@ -368,6 +386,38 @@ class FrontEnd(mp.Process):
         self.cameras[cur_frame_idx].clean()
         if cur_frame_idx % 5 == 0: #10->5
             torch.cuda.empty_cache()
+
+    def exceeds_motion_thresholds(self, current_c2w, anchor_c2w):
+        """
+        判断当前位姿与子图起始位姿之间的相对运动是否超过阈值。
+        注意：MonoGS 中 curr_frame.T 通常是 World to Camera (W2C) 变换。
+        我们需要将其转为 Camera to World (C2W) 以便计算物理平移。
+        """
+        if anchor_c2w is None:
+            return False
+
+        # 计算相对变换矩阵 delta_T = inv(Anchor) @ Current
+        # 这里的输入假设已经是 C2W 矩阵
+        delta_T = torch.linalg.inv(anchor_c2w) @ current_c2w
+
+        # 1. 计算平移距离
+        translation = torch.norm(delta_T[0:3, 3]).item()
+
+        # 2. 计算旋转角度 (基于旋转矩阵求迹)
+        # trace(R) = 1 + 2*cos(theta) -> theta = arccos((trace(R) - 1) / 2)
+        R = delta_T[0:3, 0:3]
+        trace = torch.trace(R)
+        # 限制在 [-1, 1] 防止数值误差导致 acos 报错
+        cos_theta = torch.clamp((trace - 1.0) / 2.0, -1.0, 1.0)
+        angle_rad = torch.acos(cos_theta).item()
+        angle_deg = angle_rad * 180.0 / np.pi
+
+        if translation > self.submap_trans_thre or angle_deg > self.submap_rot_thre:
+            Log(f"触发切图! 平移: {translation:.2f}m, 旋转: {angle_deg:.2f}°")
+            return True
+
+        return False
+
     '''
     -------------------前端 SLAM 主循环---------------------
     作用: 前端 SLAM 系统的主循环，负责处理数据流、执行跟踪和关键帧管理，并与后端进行通信。
@@ -452,6 +502,62 @@ class FrontEnd(mp.Process):
 
                 # ------------------Tracking跟踪：估计当前帧的相机位姿（位置和旋转）---------------------
                 render_pkg = self.tracking(cur_frame_idx, viewpoint)
+
+                # ========== 新增：子图“切图”监控逻辑 ==========
+                # 提取当前帧的 Camera to World (C2W) 矩阵
+                current_c2w = torch.linalg.inv(viewpoint.T)
+
+                # 初始化 Anchor（如果是第一帧或刚重置后）
+                if self.submap_anchor_pose is None:
+                    self.submap_anchor_pose = current_c2w.clone()
+
+                # 检查是否超出阈值
+                if self.exceeds_motion_thresholds(current_c2w, self.submap_anchor_pose):
+                    Log(f"==> 启动新子图 (ID: {self.current_submap_id + 1}) <==")
+
+                    # 1. 发送切图信号给后端
+                    self.backend_queue.put(["new_submap", self.current_submap_id])
+
+                    # ==============================================================================
+                    # 【核心修复区】：防止 CUDA IPC 显存句柄失效导致 FileNotFoundError
+                    # a. 强制清空前端队列中积压的历史消息（如前一个子图的 sync_backend）
+                    while not self.frontend_queue.empty():
+                        try:
+                            self.frontend_queue.get_nowait()
+                        except:
+                            pass
+
+                    # b. 释放前端对旧高斯模型的引用，防止底层显存被后端销毁后引起非法访问
+                    self.gaussians = None
+                    self.requested_keyframe = 0
+                    # ==============================================================================
+
+                    # 2. 更新前端状态
+                    self.current_submap_id += 1
+                    self.submap_anchor_pose = current_c2w.clone()
+
+                    # 3. 清空前端维护的关键帧窗口和可见性状态，以便在新的子图重新开始
+                    self.current_window.clear()
+                    self.occ_aware_visibility.clear()
+
+                    # 4. 强制当前帧成为新子图的第一个关键帧
+                    self.current_window.append(cur_frame_idx)
+                    depth_map = self.add_new_keyframe(
+                        cur_frame_idx,
+                        depth=render_pkg["depth"],
+                        opacity=render_pkg["opacity"],
+                        init=True,  # 【修改】：设为 True 以获取高质量的初始深度图
+                    )
+
+                    # 5. 【核心修复】：必须使用 request_init 而非 request_keyframe。
+                    # 这会将 self.requested_init 设为 True，使前端挂起（sleep），
+                    # 强制等待后端执行 3000 次初始化迭代，并返回一个稳定的新子图地图。
+                    self.request_init(cur_frame_idx, viewpoint, depth_map)
+
+                    cur_frame_idx += 1
+                    continue  # 跳过常规的关键帧判断，直接进入 wait 循环
+                # ============================================
+
                 # 窗口维护作用: 维护一个固定大小的滑动窗口（current_window），用于限制优化规模
                 current_window_dict = {}
                 current_window_dict[self.current_window[0]] = self.current_window[1:]
@@ -564,11 +670,18 @@ class FrontEnd(mp.Process):
             else: # 前端队列不为空，处理来自后端的同步数据，第二次及以后执行前端队列不为空
                 data = self.frontend_queue.get() # 获取后端发来的第一帧以及后续帧的数据 data list(str:'init', GaussiansModel:, dict:, list:)
                 if data[0] == "sync_backend":
-                    self.sync_backend(data) #前端同步来自后端的最新高斯模型、可见性信息、关键帧最新位姿
+                    # 如果系统刚刚请求了新子图初始化，还未完成时，忽略普通的同步信息
+                    if not self.requested_init:
+                        self.sync_backend(data) #前端同步来自后端的最新高斯模型、可见性信息、关键帧最新位姿
 
                 elif data[0] == "keyframe":
-                    self.sync_backend(data)
-                    self.requested_keyframe -= 1
+                    # 只有当我们确实在等待 keyframe 返回时才处理它，
+                    # 否则这就是一条来自旧子图的“幽灵消息”，直接丢弃。
+                    if self.requested_keyframe > 0:
+                        self.sync_backend(data)
+                        self.requested_keyframe -= 1
+                    else:
+                        Log("[Frontend] 拦截到旧子图的幽灵 keyframe 消息，已安全丢弃。")
 
                 elif data[0] == "init": #前端给后端第一个关键帧信息，后端初始化完成回传数据
                     self.sync_backend(data)

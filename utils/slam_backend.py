@@ -28,6 +28,11 @@ class BackEnd(mp.Process):
         self.cameras_extent = None
         self.frontend_queue = None #后端到前端的通信队列
         self.backend_queue = None #前端到后端的通信队列
+
+        # ========= 新增：预留 Loop Closure 队列的属性 =========
+        self.loop_queue = None
+        # ======================================================
+
         self.live_mode = False
 
         self.pause = False
@@ -717,6 +722,56 @@ class BackEnd(mp.Process):
                     # 做可选的修剪（移除低观测数的高斯点）
                     self.map(self.current_window, prune=True)
                     self.push_to_frontend("keyframe")
+                # =========== 新增：子图冻结与重生逻辑 ===========
+                elif data[0] == "new_submap":
+                    completed_submap_id = data[1]
+                    Log(f"==> Backend received new_submap signal. Freezing submap {completed_submap_id}...")
+
+                    # 1. 保存当前子图 (冻结)
+                    save_dir = self.config["Results"]["save_dir"]
+                    submaps_dir = os.path.join(save_dir, "submaps")
+                    os.makedirs(submaps_dir, exist_ok=True)
+
+                    # 抓取当前高斯模型的所有张量参数
+                    gaussian_params = self.gaussians.capture_dict()
+                    # 提取该子图包含的所有关键帧 ID
+                    submap_keyframes = sorted(list(self.viewpoints.keys()))
+
+                    ckpt_data = {
+                        "gaussian_params": gaussian_params,
+                        "submap_keyframes": submap_keyframes
+                    }
+                    ckpt_path = os.path.join(submaps_dir, f"{completed_submap_id:06d}.ckpt")
+                    torch.save(ckpt_data, ckpt_path)
+                    Log(f"Submap {completed_submap_id} saved to {ckpt_path}")
+                    # ========= 新增：触发独立进程的 PGO 优化 =========
+                    if hasattr(self, 'loop_queue') and self.loop_queue is not None:
+                        self.loop_queue.put(["submap_saved", completed_submap_id, ckpt_path])
+                    # ===================================================
+                    # 2. 浴火重生：清空显存和状态
+                    self.gaussians.reset()
+
+                    # 【极度关键】：重新初始化高斯模型的 Adam 优化器。
+                    # 否则下一个关键帧执行 extend_from_pcd_seq 时会因找不到优化器而报错
+                    self.gaussians.training_setup(self.opt_params)
+
+                    # 清空后端维护的局部窗口和可视性掩码
+                    self.viewpoints.clear()
+                    self.current_window.clear()
+                    self.occ_aware_visibility.clear()
+
+                    # 清空相机位姿的优化器
+                    if self.keyframe_optimizers is not None:
+                        self.keyframe_optimizers.zero_grad(set_to_none=True)
+                        del self.keyframe_optimizers
+                        self.keyframe_optimizers = None
+
+                    self.iteration_count = 0
+
+                    # 强制清空碎片显存
+                    torch.cuda.empty_cache()
+                    Log(f"==> Submap {completed_submap_id} frozen and VRAM cleared. Ready for next submap. <==")
+            # ===============================================
                 else:
                     raise Exception("Unprocessed data", data)
         while not self.backend_queue.empty():
