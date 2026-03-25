@@ -567,6 +567,15 @@ class SLAM:
                             lr_factor = (0.01 ** (1.0 / (iteration_total / 100)))  # 衰减系数
                             for param_group in global_cam_optimizer.param_groups:
                                 param_group['lr'] *= lr_factor
+                        # =======================================================
+                        # 【核心修复 2】：指数学习率衰减，让点云和相机在最后阶段完美锁定！
+                        # =======================================================
+                        # decay_rate = 0.01 ** (1.0 / iteration_total)  # 计算单步衰减率
+                        # for param_group in self.gaussians.optimizer.param_groups:
+                        #     param_group["lr"] *= decay_rate
+                        # for param_group in global_cam_optimizer.param_groups:
+                        #     param_group["lr"] *= decay_rate
+                        # =======================================================
                 Log("==> 全局大地图联合优化缝合完成！ <==")
             else:
                 Log("[Warning] 没有找到有效的图像缓存，跳过全局画质精修。")

@@ -50,7 +50,7 @@ Training:
     cam_rot_delta: 0.003
     cam_trans_delta: 0.001
   sagsslam:
-    use_external_normal: False
+    use_external_normal: True
     use_surf_normal: False
     use_distortion_loss: False
     # 互斥选择: "sensor", "plane", "mixed"

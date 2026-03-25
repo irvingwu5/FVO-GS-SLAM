@@ -46,8 +46,10 @@ class FrontEnd(mp.Process):
         # ========== 新增：子图策略状态变量 ==========
         self.current_submap_id = 0
         self.submap_anchor_pose = None  # 记录当前子图第一帧的位姿 (World to Camera)
-        self.submap_trans_thre = self.config.get("Submap", {}).get("trans_thre", 0.5)  # 默认 0.5 米
-        self.submap_rot_thre = self.config.get("Submap", {}).get("rot_thre", 50.0)  # 默认 50 度
+        #self.submap_trans_thre = self.config.get("Submap", {}).get("trans_thre", 0.5)  # 默认 0.5 米
+        #self.submap_rot_thre = self.config.get("Submap", {}).get("rot_thre", 50.0)  # 默认 50 度
+        self.submap_trans_thre = self.config["Submap"]["trans_thre"]
+        self.submap_rot_thre = self.config["Submap"]["rot_thre"]
         self.frame_to_submap = {}  # <--- 新增这行：记录每帧属于哪个子图
         # ============================================
 
