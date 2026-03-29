@@ -800,31 +800,43 @@ class BackEnd(mp.Process):
                         self.loop_queue.put(["submap_saved", completed_submap_id, ckpt_path])
 
                     # =================================================================
-                    # 【核心修复】：软重置 (Soft Reset)
-                    # 配合前端的连续全局坐标系，后端只剔除不在当前滑动窗口内的老旧高斯点。
-                    # 保留重叠区，实现物理上的无缝衔接。
+                    # 【终极核心修复】：时空双重缓冲 (无痛版，彻底消灭 KeyError)
+                    # 完全信任前端的 window_size，不再在后端强行做 [:6] 切片导致状态错位！
                     # =================================================================
-                    retained_kfs = self.current_window
+                    retained_kfs = self.current_window  # 直接沿用当前窗口，不要切片！
+
                     if len(retained_kfs) > 0:
-                        # 获取 unique_kfIDs 所在的设备（通常在 CPU 上以节省显存）
                         target_device = self.gaussians.unique_kfIDs.device
+                        latest_kf = max(retained_kfs)
 
-                        # 在 CPU 上创建遮罩并进行逻辑运算，避免设备冲突报错
-                        old_mask = torch.ones(self.gaussians.get_xyz.shape[0], dtype=torch.bool, device=target_device)
+                        # 1. 【时间宽容】：保留最近 15 帧内生成的所有高斯点
+                        keep_mask = self.gaussians.unique_kfIDs > (latest_kf - 15)
+                        keep_mask = keep_mask.to(target_device)
+
+                        # 2. 【空间宽容】：保留窗口内所有帧能看到的点
                         for kf_id in retained_kfs:
-                            kf_id_tensor = torch.tensor(kf_id, device=target_device,
-                                                        dtype=self.gaussians.unique_kfIDs.dtype)
-                            old_mask = old_mask & (self.gaussians.unique_kfIDs != kf_id_tensor)
+                            if kf_id in self.occ_aware_visibility:
+                                visible_mask = self.occ_aware_visibility[kf_id].to(target_device).bool()
 
-                        # 剔除老点（加 .cuda() 送回 GPU 执行）
+                                if visible_mask.shape[0] == keep_mask.shape[0]:
+                                    keep_mask = keep_mask | visible_mask
+                                else:
+                                    kf_id_tensor = torch.tensor(kf_id, device=target_device,
+                                                                dtype=self.gaussians.unique_kfIDs.dtype)
+                                    keep_mask = keep_mask | (self.gaussians.unique_kfIDs == kf_id_tensor)
+
+                        old_mask = ~keep_mask
                         self.gaussians.prune_points(old_mask.cuda())
-
                         self.gaussians.training_setup(self.opt_params)
 
-                        # 清理老旧 viewpoints，只保留窗口内的重叠区相机
+                        # 清理 viewpoints 字典，只保留 retained_kfs 里面的帧
                         retained_viewpoints = {kf: self.viewpoints[kf] for kf in retained_kfs}
                         self.viewpoints.clear()
                         self.viewpoints.update(retained_viewpoints)
+
+                        # 同步当前窗口
+                        self.current_window = list(retained_kfs)
+
                     else:
                         # 兜底逻辑
                         self.gaussians.reset()
