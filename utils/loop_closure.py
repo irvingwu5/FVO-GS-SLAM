@@ -6,6 +6,12 @@ import open3d as o3d
 import torch.multiprocessing as mp
 import roma  # 用于四元数和旋转矩阵的转换
 from utils.logging_utils import Log
+# 【新增】：从你刚刚放进去的 netvlad.py 中导入模型
+from utils.netvlad import NetVLAD, EmbedNet
+import torchvision.transforms as T
+import torchvision.models as models
+import torch.nn as nn
+import torch.nn.functional as F
 
 
 def rigid_transform_2dgs(gaussian_params, tsfm_matrix):
@@ -52,11 +58,57 @@ class LoopClosureProcess(mp.Process):
         # 记录已保存子图的路径和其空间几何中心，用于启发式闭环检测
         self.submap_records = {}
         self.submap_centroids = {}
-
+        # 视觉特征字典与相似度阈值
+        self.submap_features = {}
+        # 【重要】：NetVLAD 的向量非常紧凑，建议初始阈值设为 0.85 或 0.88
+        self.sim_threshold = 0.85
         self.min_interval = self.config.get("LoopClosure", {}).get("min_interval", 3)
         self.voxel_size = self.config.get("LoopClosure", {}).get("voxel_size", 0.05)
         # 判定为有效闭环的 ICP Fitness 阈值 (重叠度下限)
         self.icp_fitness_threshold = 0.25
+
+    def init_feature_extractor(self):
+        """
+        利用你上传的 netvlad.py 官方写法初始化网络
+        """
+        Log("[LoopClosure] 初始化高级视觉检索网络 (ResNet18 + NetVLAD)...")
+
+        # 1. 加载预训练的 ResNet18 作为特征提取骨干
+        encoder = models.resnet18(pretrained=True)
+
+        # 2. 丢弃最后的 Average Pooling 和 Linear 分类层
+        base_model = nn.Sequential(
+            encoder.conv1, encoder.bn1, encoder.relu, encoder.maxpool,
+            encoder.layer1, encoder.layer2, encoder.layer3, encoder.layer4
+        )
+
+        # 获取基础网络输出的通道数 (ResNet18 是 512)
+        dim = list(base_model.parameters())[-1].shape[0]
+
+        # 3. 实例化 NetVLAD 层 (聚类中心设为 16 或 32，减小显存占用)
+        net_vlad = NetVLAD(num_clusters=16, dim=dim, alpha=1.0)
+
+        # 4. 使用 EmbedNet 将它们无缝组装
+        self.feature_extractor = EmbedNet(base_model, net_vlad).eval().to(self.device)
+
+        # 图像预处理流水线
+        self.img_transform = T.Compose([
+            T.Resize((224, 224)),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+
+
+    def extract_image_feature(self, img_path):
+        """提取图像的 NetVLAD 全局描述子"""
+        img_tensor = torch.load(img_path).to(self.device)  # [3, H, W]
+        img_tensor = self.img_transform(img_tensor).unsqueeze(0)
+
+        with torch.no_grad():
+            # net_vlad.py 里的实现已经自带了 L2 归一化
+            feat = self.feature_extractor(img_tensor).squeeze()
+
+        return feat.cpu().numpy()
+
 
     def extract_pcd_from_2dgs_ckpt(self, ckpt_path):
         """
@@ -83,24 +135,30 @@ class LoopClosureProcess(mp.Process):
 
     def detect_closure(self, query_id):
         """
-        基于空间距离启发式的闭环检测 (可平滑替换为 DBoW3 / NetVLAD)。
-        此处返回潜在的闭环候选 ID。
+        【全新升级】：NetVLAD 视觉特征匹配 + 空间距离双重校验
         """
         matched_ids = []
-        if query_id not in self.submap_centroids:
+        if query_id not in self.submap_features:
             return matched_ids
 
+        query_feat = self.submap_features[query_id]
         query_centroid = self.submap_centroids[query_id]
 
-        for db_id, db_centroid in self.submap_centroids.items():
+        for db_id, db_feat in self.submap_features.items():
             if abs(query_id - db_id) > self.min_interval:
-                # 启发式距离检测：如果两个子图的几何中心距离小于 2.0 米，则认为有空间重叠的可能
-                dist = np.linalg.norm(query_centroid - db_centroid)
-                if dist < 2.0:
-                    matched_ids.append(db_id)
 
-        # TODO: 若后续接入 NetVLAD，只需将上述空间距离判断替换为:
-        # cosine_similarity(query_desc, db_desc) > similarity_threshold
+                # 1. 核心：计算 NetVLAD 特征的余弦相似度 (由于已归一化，点乘即余弦)
+                sim = np.dot(query_feat, db_feat)
+
+                # 如果视觉相似度超过阈值
+                if sim > self.sim_threshold:
+                    # 2. 辅助校验：松弛几何距离，放宽到 4 米
+                    db_centroid = self.submap_centroids[db_id]
+                    dist = np.linalg.norm(query_centroid - db_centroid)
+
+                    if dist < 4.0:
+                        Log(f"[*] 🚀 NetVLAD 视觉回环触发! 子图 {query_id} -> {db_id} (相似度: {sim:.3f}, 距离: {dist:.2f}m)")
+                        matched_ids.append(db_id)
 
         return matched_ids
 
@@ -247,6 +305,8 @@ class LoopClosureProcess(mp.Process):
 
     def run(self):
         Log("Loop Closure 进程已启动，后台静默监听中...")
+        # 启动即初始化基于 NetVLAD 的检索网络
+        self.init_feature_extractor()
         while True:
             if not self.loop_queue.empty():
                 data = self.loop_queue.get()
@@ -256,8 +316,13 @@ class LoopClosureProcess(mp.Process):
                 elif data[0] == "submap_saved":
                     submap_id = data[1]
                     ckpt_path = data[2]
+                    img_path = data[3]
+
                     self.submap_records[submap_id] = ckpt_path
                     self._cache_submap_centroid(submap_id, ckpt_path)
+                    # 提取图像特征
+                    self.submap_features[submap_id] = self.extract_image_feature(img_path)
+
                     Log(f"[LoopClosure] 接收并处理新子图: ID {submap_id}")
 
                     # 尝试构建位姿图并优化

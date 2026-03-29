@@ -660,8 +660,7 @@ class BackEnd(mp.Process):
                     self.push_to_frontend()
             else: #响应前端的指令，指令处理 (非空时)
                 data = self.backend_queue.get()
-                if data[0] == "stop": #终止循环，退出进程
-                    # ========== 新增：在进程退出前，强行保存最后一块子图 ==========
+                if data[0] == "stop":  # 终止循环，退出进程
                     save_dir = self.config["Results"]["save_dir"]
                     submaps_dir = os.path.join(save_dir, "submaps")
                     os.makedirs(submaps_dir, exist_ok=True)
@@ -671,15 +670,27 @@ class BackEnd(mp.Process):
                     ckpt_data = {
                         "gaussian_params": gaussian_params,
                         "submap_keyframes": submap_keyframes,
-                        "correct_tsfm": np.eye(4)  # 默认单位阵，防PGO未触发
+                        "correct_tsfm": np.eye(4)
                     }
                     ckpt_path = os.path.join(submaps_dir, f"{self.current_submap_id:06d}.ckpt")
                     torch.save(ckpt_data, ckpt_path)
 
-                    if hasattr(self, 'loop_queue') and self.loop_queue is not None:
-                        self.loop_queue.put(["submap_saved", self.current_submap_id, ckpt_path])
+                    # =========================================================
+                    # 【新增】：提取终局子图的代表性图像 (取中间关键帧)
+                    # =========================================================
+                    if len(submap_keyframes) > 0:
+                        rep_kf_idx = submap_keyframes[len(submap_keyframes) // 2]
+                        rep_image = self.viewpoints[rep_kf_idx].original_image.cpu()
+                        img_path = os.path.join(submaps_dir, f"{self.current_submap_id:06d}_img.pt")
+                        torch.save(rep_image, img_path)
+                    else:
+                        img_path = None
+
+                    # 【修改】：传入 4 个参数 (带上 img_path)
+                    if hasattr(self, 'loop_queue') and self.loop_queue is not None and img_path is not None:
+                        self.loop_queue.put(["submap_saved", self.current_submap_id, ckpt_path, img_path])
+
                     Log(f"==> 终局保存：最后一块子图 {self.current_submap_id} 已存入硬盘。 <==")
-                    # ==============================================================
                     break
                 elif data[0] == "pause": #设置暂停状态标志
                     self.pause = True
@@ -796,8 +807,20 @@ class BackEnd(mp.Process):
                     ckpt_path = os.path.join(submaps_dir, f"{completed_submap_id:06d}.ckpt")
                     torch.save(ckpt_data, ckpt_path)
 
-                    if hasattr(self, 'loop_queue') and self.loop_queue is not None:
-                        self.loop_queue.put(["submap_saved", completed_submap_id, ckpt_path])
+                    # =========================================================
+                    # 【新增】：提取该子图的代表性图像 (取中间关键帧)
+                    # =========================================================
+                    if len(submap_keyframes) > 0:
+                        rep_kf_idx = submap_keyframes[len(submap_keyframes) // 2]
+                        rep_image = self.viewpoints[rep_kf_idx].original_image.cpu()
+                        img_path = os.path.join(submaps_dir, f"{completed_submap_id:06d}_img.pt")
+                        torch.save(rep_image, img_path)
+                    else:
+                        img_path = None
+
+                    # 【修改】：传入 4 个参数 (带上 img_path)
+                    if hasattr(self, 'loop_queue') and self.loop_queue is not None and img_path is not None:
+                        self.loop_queue.put(["submap_saved", completed_submap_id, ckpt_path, img_path])
 
                     # =================================================================
                     # 【终极核心修复】：时空双重缓冲 (无痛版，彻底消灭 KeyError)
