@@ -126,8 +126,7 @@ class SLAM:
             background=self.background,
             gaussians=self.gaussians,
             q_main2vis=q_main2vis,
-            q_vis2main=q_vis2main,
-            save_dir=self.save_dir,  # <==== 加上这一行！！！
+            q_vis2main=q_vis2main
         )
         # 仅仅是创建了一个进程对象，并将 self.backend.run 注册为该进程启动时要运行的目标函数，不会执行 run 方法
         backend_process = mp.Process(target=self.backend.run)
@@ -735,8 +734,8 @@ if __name__ == "__main__":
         Log("Following config will be overriden")
         Log("\tsave_results=True")
         config["Results"]["save_results"] = True
-        Log("\tuse_gui=False")
-        config["Results"]["use_gui"] = False
+        Log("\tuse_gui=True")
+        config["Results"]["use_gui"] = True
         Log("\teval_rendering=True")
         config["Results"]["eval_rendering"] = True
         Log("\tuse_wandb=False")

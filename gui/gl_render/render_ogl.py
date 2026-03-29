@@ -94,15 +94,19 @@ class OpenGLRenderer(GaussianRenderBase):
         # load gaussian geometry
         gaussian_data = gaus.flat()
         self.gau_bufferid = util.set_storage_buffer_data(
-            self.program, "gaussian_data", gaussian_data, bind_idx=0,
-            buffer_id=self.gau_bufferid
+            self.program,
+            "gaussian_data",
+            gaussian_data,
+            bind_idx=0,
+            buffer_id=self.gau_bufferid,
         )
         util.set_uniform_1int(self.program, gaus.sh_dim, "sh_dim")
 
     def sort_and_update(self, camera: util.Camera):
         index = _sort_gaussian(self.gaussians, camera.get_view_matrix())
-        self.index_bufferid = util.set_storage_buffer_data(self.program, "gi", index, bind_idx=1,
-                                                           buffer_id=self.index_bufferid)
+        self.index_bufferid = util.set_storage_buffer_data(
+            self.program, "gi", index, bind_idx=1, buffer_id=self.index_bufferid
+        )
         return
 
     def set_scale_modifier(self, modifier):

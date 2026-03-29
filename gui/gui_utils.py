@@ -4,7 +4,8 @@ import cv2
 import numpy as np
 import open3d as o3d
 import torch
-
+import copy
+import torch.nn.functional as F
 from gaussian_splatting.utils.general_utils import (
     build_scaling_rotation,
     strip_symmetric,
@@ -48,7 +49,7 @@ class Frustum:
         self.up = up
 
 
-def create_frustum(pose, frusutum_color=[0, 1, 0], size=0.02):
+def create_frustum(pose, frusutum_color=[0, 1, 0], size=0.005):
     points = (
         np.array(
             [
@@ -74,6 +75,45 @@ def create_frustum(pose, frusutum_color=[0, 1, 0], size=0.02):
     return frustum
 
 
+def depth_to_normal(points, k=3, d_min=1e-3, d_max=10.0):
+    k = (k - 1) // 2
+    b, _, h, w = points.size()
+    points_pad = F.pad(points, (k, k, k, k), mode="constant", value=0)
+    if d_max is not None:
+        valid_pad = (points_pad[:, 2:, :, :] > d_min) & (
+            points_pad[:, 2:, :, :] < d_max
+        )
+    else:
+        valid_pad = points_pad[:, 2:, :, :] > d_min
+    valid_pad = valid_pad.float()
+
+    vec_vert = (
+        points_pad[:, :, :h, k : w + k]
+        - points_pad[:, :, 2 * k : h + (2 * k), k : w + k]
+    )
+
+    vec_hori = (
+        points_pad[:, :, k : h + k, :w]
+        - points_pad[:, :, k : h + k, 2 * k : w + (2 * k)]
+    )
+
+    valid_mask = (
+        valid_pad[:, :, k : h + k, k : w + k]
+        * valid_pad[:, :, :h, k : w + k]
+        * valid_pad[:, :, 2 * k : h + (2 * k), k : w + k]
+        * valid_pad[:, :, k : h + k, :w]
+        * valid_pad[:, :, k : h + k, 2 * k : w + (2 * k)]
+    )
+    valid_mask = valid_mask > 0.5
+    cross_product = -torch.linalg.cross(vec_vert, vec_hori, dim=1)
+    normal = F.normalize(cross_product, p=2.0, dim=1, eps=1e-12)
+    return normal, valid_mask
+
+
+def vfov_to_hfov(vfov_deg, height, width):
+    return np.rad2deg(2 * np.arctan(width * np.tan(np.deg2rad(vfov_deg) / 2) / height))
+
+
 class GaussianPacket:
     def __init__(
         self,
@@ -86,46 +126,48 @@ class GaussianPacket:
         keyframes=None,
         finish=False,
         kf_window=None,
+        warpfield=None,
     ):
         self.has_gaussians = False
         if gaussians is not None:
             self.has_gaussians = True
-            # 【极度关键】：必须加上 .cpu()，彻底切断与后端 CUDA 显存的 IPC 绑定，防止闪退！
-            self.get_xyz = gaussians.get_xyz.detach().cpu().clone()
+            self.get_xyz = gaussians.get_xyz.detach().clone()
             self.active_sh_degree = gaussians.active_sh_degree
-            self.get_opacity = gaussians.get_opacity.detach().cpu().clone()
-            self.get_scaling = gaussians.get_scaling.detach().cpu().clone()
-            self.get_rotation = gaussians.get_rotation.detach().cpu().clone()
+            self.get_opacity = gaussians.get_opacity.detach().clone()
+            self.get_scaling = gaussians.get_scaling.detach().clone()
+            self.get_rotation = gaussians.get_rotation.detach().clone()
             self.max_sh_degree = gaussians.max_sh_degree
-            self.get_features = gaussians.get_features.detach().cpu().clone()
+            self.get_features = gaussians.get_features.detach().clone()
 
-            self._rotation = gaussians._rotation.detach().cpu().clone()
+            self._rotation = gaussians._rotation.detach().clone()
             self.rotation_activation = torch.nn.functional.normalize
-            self.unique_kfIDs = gaussians.unique_kfIDs.detach().cpu().clone()
-            self.n_obs = gaussians.n_obs.detach().cpu().clone()
+            self.unique_kfIDs = gaussians.unique_kfIDs.clone()
+            self.n_obs = gaussians.n_obs.clone()
 
         self.keyframe = keyframe
         self.current_frame = current_frame
         self.gtcolor = self.resize_img(gtcolor, 320)
         self.gtdepth = self.resize_img(gtdepth, 320)
         self.gtnormal = self.resize_img(gtnormal, 320)
-        self.keyframes = keyframes
+        self.keyframes = copy.deepcopy(keyframes)
         self.finish = finish
         self.kf_window = kf_window
+        self.warpfield = warpfield
 
     def resize_img(self, img, width):
         if img is None:
             return None
+
+        # check if img is numpy
         if isinstance(img, np.ndarray):
             height = int(width * img.shape[0] / img.shape[1])
             return cv2.resize(img, (width, height))
         height = int(width * img.shape[1] / img.shape[2])
-        # 如果 img 在 GPU 上，必须转到 CPU
-        img_cpu = img.cpu() if img.is_cuda else img
-        img_resized = torch.nn.functional.interpolate(
-            img_cpu.unsqueeze(0), size=(height, width), mode="bilinear", align_corners=False
+        # img is 3xHxW
+        img = torch.nn.functional.interpolate(
+            img.unsqueeze(0), size=(height, width), mode="bilinear", align_corners=False
         )
-        return img_resized.squeeze(0)
+        return img.squeeze(0)
 
     def get_covariance(self, scaling_modifier=1):
         return self.build_covariance_from_scaling_rotation(
@@ -167,11 +209,13 @@ class ParamsGUI:
         gaussians=None,
         q_main2vis=None,
         q_vis2main=None,
-        save_dir=".", # <--- 新增
+        is_2dgs=False,
+        seq_name="",
     ):
         self.pipe = pipe
         self.background = background
         self.gaussians = gaussians
         self.q_main2vis = q_main2vis
         self.q_vis2main = q_vis2main
-        self.save_dir = save_dir # <--- 记录保存路径以便读取所有子图
+        self.is_2dgs = is_2dgs
+        self.seq_name = seq_name
