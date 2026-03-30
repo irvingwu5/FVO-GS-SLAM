@@ -12,7 +12,11 @@ import torchvision.transforms as T
 import torchvision.models as models
 import torch.nn as nn
 import torch.nn.functional as F
-
+from scipy.spatial.transform import Rotation
+from graphslam.graph import Graph
+from graphslam.vertex import Vertex
+from graphslam.edge.edge_odometry import EdgeOdometry
+from graphslam.pose.se3 import PoseSE3
 
 def rigid_transform_2dgs(gaussian_params, tsfm_matrix):
     tsfm_matrix = torch.from_numpy(tsfm_matrix).float().cuda()
@@ -61,11 +65,20 @@ class LoopClosureProcess(mp.Process):
         # 视觉特征字典与相似度阈值
         self.submap_features = {}
         # 【重要】：NetVLAD 的向量非常紧凑，建议初始阈值设为 0.85 或 0.88
-        self.sim_threshold = 0.85
+        # ==============================================================
+        # 【精英法则 1】：提高视觉门槛！
+        # 办公室里相似的东西太多，把 NetVLAD 的门槛从 0.85 提高到 0.92
+        # ==============================================================
+        self.sim_threshold = 0.92
         self.min_interval = self.config.get("LoopClosure", {}).get("min_interval", 3)
         self.voxel_size = self.config.get("LoopClosure", {}).get("voxel_size", 0.05)
         # 判定为有效闭环的 ICP Fitness 阈值 (重叠度下限)
-        self.icp_fitness_threshold = 0.25
+        # ==============================================================
+        # 【精英法则 2】：斩杀虚假 ICP！
+        # 必须有至少 50% 的 3D 点云严丝合缝地贴在一起，才承认是回环！
+        # 把之前的 0.25 改成 0.50，直接干掉那群 0.26 的“老鼠屎”！
+        # ==============================================================
+        self.icp_fitness_threshold = 0.50
 
     def init_feature_extractor(self):
         """
@@ -156,46 +169,55 @@ class LoopClosureProcess(mp.Process):
                     db_centroid = self.submap_centroids[db_id]
                     dist = np.linalg.norm(query_centroid - db_centroid)
 
-                    if dist < 4.0:
+                    # =========================================================
+                    # 【核心修复 2】：恢复理智的空间距离校验！
+                    # 在室内场景，前端漂移不可能超过 2 米。
+                    # 如果距离超过 2 米，就算长得一模一样，也肯定是“另一把椅子”！
+                    # =========================================================
+                    if dist < 2.0:
                         Log(f"[*] 🚀 NetVLAD 视觉回环触发! 子图 {query_id} -> {db_id} (相似度: {sim:.3f}, 距离: {dist:.2f}m)")
                         matched_ids.append(db_id)
+                    else:
+                        Log(f"[!] 拦截假回环: 子图 {query_id} -> {db_id} (视觉极度相似，但物理距离过远 {dist:.2f}m)")
 
         return matched_ids
 
     def compute_relative_transform(self, source_id, target_id):
         """
-        加载 2DGS 点云，执行 Point-to-Plane ICP。
-        返回 4x4 变换矩阵、信息矩阵以及配准是否成功的布尔值。
+        加载 2DGS 点云，执行 ICP。
         """
         try:
             source_pcd = self.extract_pcd_from_2dgs_ckpt(self.submap_records[source_id])
             target_pcd = self.extract_pcd_from_2dgs_ckpt(self.submap_records[target_id])
 
-            max_correspondence_distance = self.voxel_size * 3.0
-
-            # 利用 2DGS 原生高精度法线执行 Point-to-Plane ICP
-            icp_result = o3d.pipelines.registration.registration_icp(
-                source_pcd, target_pcd, max_correspondence_distance,
-                np.identity(4),  # 初始猜测 (对于SLAM，闭环通常处于同一全局坐标系附近)
-                o3d.pipelines.registration.TransformationEstimationPointToPlane()
+            # ==============================================================
+            # 【核心修复 1】：Coarse-to-Fine 且必须使用 PointToPoint！
+            # 彻底杜绝平面滑动效应，只允许严丝合缝的几何镶嵌！
+            # ==============================================================
+            coarse_icp = o3d.pipelines.registration.registration_icp(
+                source_pcd, target_pcd, 1.5, np.identity(4),
+                o3d.pipelines.registration.TransformationEstimationPointToPoint() # <== 必须是 PointToPoint
             )
 
-            # 通过 Fitness (重叠度) 和 Inlier RMSE 拒绝错误的闭环匹配
+            fine_icp = o3d.pipelines.registration.registration_icp(
+                source_pcd, target_pcd, self.voxel_size * 2.0, coarse_icp.transformation,
+                o3d.pipelines.registration.TransformationEstimationPointToPoint() # <== 必须是 PointToPoint
+            )
+
+            icp_result = fine_icp
+
             if icp_result.fitness < self.icp_fitness_threshold:
                 return np.identity(4), np.identity(6), False
 
             transformation = icp_result.transformation
 
-            # # 计算信息矩阵，用于衡量这条闭环边在图优化中的可靠程度 (权重)
-            # information = o3d.pipelines.registration.get_information_matrix_from_point_clouds(
-            #     source_pcd, target_pcd, max_correspondence_distance, transformation
-            # )
-            # 【核心修复 1】：废弃 Open3D 动辄几十万的暴力量化矩阵！
-            # 强制将 ICP 回环边的信息矩阵（权重）设定为一个极小的软约束。
-            # 让它只负责拉回全局累积的低频漂移，而不破坏局部高频轨迹的精确度。
-            information = np.identity(6) * 0.1
+            # ==============================================================
+            # 【核心修复 2】：降低闭环拉力！(50.0 -> 10.0)
+            # ==============================================================
+            weight = icp_result.fitness * 10.0  # <== 改成了 10.0
+            information = np.identity(6) * weight
 
-            Log(f"[ICP] 子图 {source_id}->{target_id} 匹配成功! Fitness: {icp_result.fitness:.3f}, RMSE: {icp_result.inlier_rmse:.4f}")
+            Log(f"[ICP] 子图 {source_id}->{target_id} 匹配成功! Fitness: {icp_result.fitness:.3f}, 拉力权重: {weight:.1f}")
             return transformation, information, True
 
         except Exception as e:
@@ -204,66 +226,58 @@ class LoopClosureProcess(mp.Process):
 
     def construct_and_optimize_pose_graph(self):
         """
-        构建 Open3D 位姿图并执行 Levenberg-Marquardt 全局优化。
+        使用纯 Python 的 python-graphslam
         """
-        pose_graph = o3d.pipelines.registration.PoseGraph()
+        def mat2pose(mat):
+            pos = mat[:3, 3].copy()
+            rot_mat = mat[:3, :3].copy()
+            rot_quat = Rotation.from_matrix(rot_mat).as_quat()
+            return PoseSE3(pos, rot_quat)
+
+        vertices = []
+        edges = []
         n_submaps = max(self.submap_records.keys()) + 1
 
         for i in range(n_submaps):
-            pose_graph.nodes.append(o3d.pipelines.registration.PoseGraphNode(np.identity(4)))
+            vertices.append(Vertex(i, PoseSE3(np.zeros(3), [0., 0., 0., 1.])))
 
-        # 添加相邻里程计边
+        # ==============================================================
+        # 【核心修复 3】：为里程计注入钢铁之魂！(5.0 -> 500.0)
+        # 誓死捍卫前端 1.6cm 的极限精度，绝不向错误的闭环妥协！
+        # ==============================================================
+        info_odom = np.identity(6) * 500.0  # <== 改成了 500.0
         for i in range(1, n_submaps):
             source_id = i
             target_id = i - 1
-            # 相邻子图在保存时已经处于同一世界坐标系下，理论相对变换为单位阵
-            trans = np.identity(4)
-            # 【核心修复 1】：将极其刚硬的里程计权重(10.0)调低到(0.5)。
-            # 这样位姿图才能变得“柔软”，允许 ICP 算出的回环误差将漂移的轨迹真正拉回正轨！
-            info = np.identity(6) * 1000.0
-            pose_graph.edges.append(
-                o3d.pipelines.registration.PoseGraphEdge(
-                    source_id, target_id, trans, info, uncertain=False
-                )
-            )
+            edges.append(EdgeOdometry([target_id, source_id], info_odom, mat2pose(np.identity(4))))
 
-        # 添加跨度闭环边
         loop_found = False
         for source_id in range(1, n_submaps):
             matches = self.detect_closure(source_id)
             for target_id in matches:
-                trans, info, success = self.compute_relative_transform(source_id, target_id)
+                trans, info_loop, success = self.compute_relative_transform(source_id, target_id)
                 if success:
-                    pose_graph.edges.append(
-                        o3d.pipelines.registration.PoseGraphEdge(
-                            source_id, target_id, trans, info, uncertain=True
-                        )
-                    )
+                    edges.append(EdgeOdometry([target_id, source_id], info_loop, mat2pose(trans)))
                     loop_found = True
 
         if not loop_found:
             return []
 
-        Log("检测到有效闭环，正在执行全局位姿图优化 (PGO)...")
-        option = o3d.pipelines.registration.GlobalOptimizationOption(
-            max_correspondence_distance=self.voxel_size * 2.0,
-            edge_prune_threshold=0.25,
-            reference_node=0
-        )
-        o3d.pipelines.registration.global_optimization(
-            pose_graph,
-            o3d.pipelines.registration.GlobalOptimizationLevenbergMarquardt(),
-            o3d.pipelines.registration.GlobalOptimizationConvergenceCriteria(),
-            option
-        )
+        Log("检测到有效闭环，启动纯 Python-GraphSLAM 全局优化...")
+        graph = Graph(edges, vertices)
+
+        graph.optimize(tol=1e-4, max_iter=100)
 
         correction_list = []
-        for id in range(n_submaps):
-            submap_correction = {
-                'submap_id': id,
-                'correct_tsfm': pose_graph.nodes[id].pose
-            }
-            correction_list.append(submap_correction)
+        T_0_inv = np.linalg.inv(graph._vertices[0].pose.to_matrix())
+
+        for v in graph._vertices:
+            opt_trans = v.pose.to_matrix()
+            final_trans = T_0_inv @ opt_trans
+            correction_list.append({
+                'submap_id': v.id,
+                'correct_tsfm': final_trans
+            })
 
         return correction_list
 

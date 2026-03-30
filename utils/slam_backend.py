@@ -237,7 +237,6 @@ class BackEnd(mp.Process):
 
         viewpoint_stack = [self.viewpoints[kf_idx] for kf_idx in current_window]
         random_viewpoint_stack = []
-        frames_to_optimize = self.config["Training"]["pose_window"]
 
         current_window_set = set(current_window)
         for cam_idx, viewpoint in self.viewpoints.items(): #遍历窗口内所有关键帧
@@ -296,17 +295,17 @@ class BackEnd(mp.Process):
                 # =========================================================
                 # 你的 diff-surfel-rasterization 渲染器在 surf=False/True 时，
                 # 通常会返回渲染过程中的 distortion 值。
-                if self.use_distortion_loss and "rend_dist" in render_pkg:
-                    distortion_loss = render_pkg["rend_dist"].mean() #1.0811e-05、6.0331e-06
-                    # 权重通常设为 1000 到 3000，具体取决于场景尺度
-                    lambda_dist = self.config.get("opt_params", {}).get("lambda_dist", 10.0)
-                    #loss_mapping += lambda_dist * distortion_loss
-                    loss_mapping += (lambda_dist * decay_factor) * distortion_loss
-
-                if self.use_surf_normal and "surf_normal" in render_pkg:
-                    normal_consistency_loss = get_normal_consistency_loss(render_pkg) #0.7075
-                    lambda_surf_normal = self.config.get("opt_params", {}).get("lambda_surf_normal", 0.001)
-                    loss_mapping += lambda_surf_normal * normal_consistency_loss
+                # if self.use_distortion_loss and "rend_dist" in render_pkg:
+                #     distortion_loss = render_pkg["rend_dist"].mean() #1.0811e-05、6.0331e-06
+                #     # 权重通常设为 1000 到 3000，具体取决于场景尺度
+                #     lambda_dist = self.config.get("opt_params", {}).get("lambda_dist", 10.0)
+                #     #loss_mapping += lambda_dist * distortion_loss
+                #     loss_mapping += (lambda_dist * decay_factor) * distortion_loss
+                #
+                # if self.use_surf_normal and "surf_normal" in render_pkg:
+                #     normal_consistency_loss = get_normal_consistency_loss(render_pkg) #0.7075
+                #     lambda_surf_normal = self.config.get("opt_params", {}).get("lambda_surf_normal", 0.001)
+                #     loss_mapping += lambda_surf_normal * normal_consistency_loss
 
                 if self.use_external_normal and viewpoint.normal is not None:
                     rend_normal = render_pkg["rend_normal"]
@@ -334,9 +333,9 @@ class BackEnd(mp.Process):
                         #normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask * normal_mask).sum(dim=0))[None].mean() #0.9128
                         normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean() #0.6932
                         loss_mapping += (self.config["opt_params"]["lambda_sensor_normal"]  * normal_error)
-                if self.use_plane_constraint:
-                    proj_loss = get_loss_mapping_plane_constraint(self.gaussians, viewpoint, 'huber')  #0.0001、9.5036e-05、
-                    loss_mapping += self.config["opt_params"]["lambda_plane"]*decay_factor * proj_loss
+                # if self.use_plane_constraint:
+                #     proj_loss = get_loss_mapping_plane_constraint(self.gaussians, viewpoint, 'huber')  #0.0001、9.5036e-05、
+                #     loss_mapping += self.config["opt_params"]["lambda_plane"]*decay_factor * proj_loss
 
                 viewspace_point_tensor_acm.append(viewspace_point_tensor)
                 visibility_filter_acm.append(visibility_filter)

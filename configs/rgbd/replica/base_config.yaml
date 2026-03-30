@@ -71,6 +71,14 @@ Training:
     loss_type: "Huber"  # "l1" or "l2"
     warmup_iter: 2500
 
+Submap:
+  trans_thre: 1.5     # 平移切图阈值(米)
+  rot_thre: 60           # 旋转切图阈值(度)
+LoopClosure:
+  enable: True
+  min_interval: 2        # 触发闭环的最小子图间隔
+  voxel_size: 0.02
+
 opt_params:
   iterations: 30000
   position_lr_init: 0.00016
@@ -83,7 +91,7 @@ opt_params:
   rotation_lr: 0.001
   percent_dense: 0.01 #0.01->0.03
   lambda_surf_normal: 0.001 #0.006normal consistency loss weight 0.0001->0.05
-  lambda_sensor_normal: 0.02 #
+  lambda_sensor_normal: 0.001 #
   lambda_plane: 15.0 #plane constraint loss weight
   lambda_dssim: 0.2
   lambda_dist: 10.0 #10->100
