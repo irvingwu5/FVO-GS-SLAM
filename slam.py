@@ -23,13 +23,11 @@ from utils.slam_frontend import FrontEnd
 # ========= 新增：导入新建的 Loop Closure 进程类 =========
 from utils.loop_closure import LoopClosureProcess
 # ========================================================
-import random
-from tqdm import tqdm
-from gaussian_splatting.gaussian_renderer import render
-from gaussian_splatting.utils.loss_utils import l1_loss, ssim
 # 引入刚体变换引擎
 from utils.loop_closure import rigid_transform_2dgs
 from utils.pose_utils import update_pose
+import glob
+
 class SLAM:
     def __init__(self, config, save_dir=None):
         start = torch.cuda.Event(enable_timing=True) #创建了两个事件（Event）对象，主要用于GPU上的时间测量
@@ -145,175 +143,7 @@ class SLAM:
             time.sleep(5)
         # 启动 backend_process 进程
         backend_process.start() #它会请求操作系统启动一个新的进程，并在该进程中执行 self.backend.run 方法
-        # 主进程运行frontend
-        # self.frontend.run()
-        # # 前端运行结束了，利用队列传递信息，让后端暂停
-        # #backend_queue.put(["pause"])
-        #
-        # end.record()
-        # torch.cuda.synchronize()
-        # # empty the frontend queue
-        # N_frames = len(self.frontend.cameras)
-        # FPS = N_frames / (start.elapsed_time(end) * 0.001)
-        # Log("Total time", start.elapsed_time(end) * 0.001, tag="Eval")
-        # Log("Total FPS", N_frames / (start.elapsed_time(end) * 0.001), tag="Eval")
-        # # 1. 停止后端，促使其保存最后一块子图
-        # backend_queue.put(["stop"])
-        # # 等待后端完成最后一块子图的保存
-        # backend_process.join()
-        # Log("Backend stopped and saved final submap.")
-        #
-        # # 等待回环检测进程完成最后的 PGO
-        # loop_queue.put(["stop"])
-        # self.loop_closure_process.join()
-        # Log("Loop Closure stopped and PGO finalized.")
-        #
-        # # =========================================================================
-        # # 3. THE GRAND MERGE: 全局子图合并与相机轨迹校正
-        # # =========================================================================
-        # Log("==> 开始合并所有子图并校正全局相机轨迹... <==")
-        # import glob
-        # submaps_dir = os.path.join(self.save_dir, "submaps")
-        # ckpt_files = sorted(glob.glob(os.path.join(submaps_dir, "*.ckpt")))
-        #
-        # merged_params = {
-        #     "_xyz": [], "_features_dc": [], "_features_rest": [],
-        #     "_scaling": [], "_rotation": [], "_opacity": []
-        # }
-        # has_normal = False
-        # frame_to_submap = torch.load(os.path.join(self.save_dir, "frame_to_submap.pt"))
-        #
-        # submap_tsfms = {}
-        #
-        # # 遍历读取所有存入硬盘的子图
-        # for ckpt_path in ckpt_files:
-        #     ckpt = torch.load(ckpt_path, map_location="cuda")
-        #     gp = ckpt["gaussian_params"]
-        #
-        #     merged_params["_xyz"].append(gp["_xyz"])
-        #     merged_params["_features_dc"].append(gp["_features_dc"])
-        #     merged_params["_features_rest"].append(gp["_features_rest"])
-        #     merged_params["_scaling"].append(gp["_scaling"])
-        #     merged_params["_rotation"].append(gp["_rotation"])
-        #     merged_params["_opacity"].append(gp["_opacity"])
-        #     if "_normal" in gp:
-        #         has_normal = True
-        #         if "_normal" not in merged_params: merged_params["_normal"] = []
-        #         merged_params["_normal"].append(gp["_normal"])
-        #
-        #     # 提取 PGO 修正矩阵 (在 loop_closure 之前如果未加，这里回退为单位阵)
-        #     submap_id = int(os.path.basename(ckpt_path).split('.')[0])
-        #     correct_tsfm = ckpt.get("correct_tsfm", np.eye(4))
-        #     submap_tsfms[submap_id] = torch.from_numpy(correct_tsfm).float().cuda()
-        #
-        # if len(merged_params["_xyz"]) > 0:
-        #     import torch.nn as nn
-        #     # 拼接成一个超级全图并覆盖回 self.gaussians
-        #     self.gaussians._xyz = nn.Parameter(torch.cat(merged_params["_xyz"], dim=0))
-        #     self.gaussians._features_dc = nn.Parameter(torch.cat(merged_params["_features_dc"], dim=0))
-        #     self.gaussians._features_rest = nn.Parameter(torch.cat(merged_params["_features_rest"], dim=0))
-        #     self.gaussians._scaling = nn.Parameter(torch.cat(merged_params["_scaling"], dim=0))
-        #     self.gaussians._rotation = nn.Parameter(torch.cat(merged_params["_rotation"], dim=0))
-        #     self.gaussians._opacity = nn.Parameter(torch.cat(merged_params["_opacity"], dim=0))
-        #     if has_normal:
-        #         self.gaussians._normal = nn.Parameter(torch.cat(merged_params["_normal"], dim=0))
-        #
-        #     # 对前端的每一帧相机施加 PGO 逆向修正
-        #     # LoopSplat 算出的 correct_tsfm 作用于 C2W。而 MonoGS 内部相机矩阵是 W2C。
-        #     # W2C_new = W2C_old @ inv(correct_tsfm)
-        #     for frame_id, cam in self.frontend.cameras.items():
-        #         sid = frame_to_submap.get(frame_id, 0)
-        #         tsfm_tensor = submap_tsfms.get(sid, torch.eye(4).cuda())
-        #         inv_tsfm = torch.linalg.inv(tsfm_tensor)
-        #         cam.T = cam.T @ inv_tsfm
-        #
-        #     Log(f"==> 拼接完成！全局高斯点总数: {self.gaussians._xyz.shape[0]} <==")
-        #
-        # # =========================================================================
-        # # 4. 最终评估与保存 (使用修正后的全局地图和轨迹)
-        # # =========================================================================
-        # if self.eval_rendering:
-        #     self.gaussians = self.frontend.gaussians
-        #     kf_indices = self.frontend.kf_indices
-        #     ATE = eval_ate(
-        #         self.frontend.cameras,
-        #         self.frontend.kf_indices,
-        #         self.save_dir,
-        #         0,
-        #         final=True,
-        #         monocular=self.monocular,
-        #     )
-        #
-        #     rendering_result = eval_rendering(
-        #         self.frontend.cameras,
-        #         self.gaussians,
-        #         self.dataset,
-        #         self.save_dir,
-        #         self.pipeline_params,
-        #         self.background,
-        #         kf_indices=kf_indices,
-        #         iteration="before_opt",
-        #     )
-        #     columns = ["tag", "psnr", "ssim", "lpips", "RMSE ATE", "FPS"]
-        #     metrics_table = wandb.Table(columns=columns)
-        #     metrics_table.add_data(
-        #         "Before",
-        #         rendering_result["mean_psnr"],
-        #         rendering_result["mean_ssim"],
-        #         rendering_result["mean_lpips"],
-        #         ATE,
-        #         FPS,
-        #     )
-        #
-        #     # re-used the frontend queue to retrive the gaussians from the backend.
-        #     while not frontend_queue.empty():
-        #         frontend_queue.get()
-        #     backend_queue.put(["color_refinement"])
-        #     while True:
-        #         if frontend_queue.empty():
-        #             time.sleep(0.01)
-        #             continue
-        #         data = frontend_queue.get()
-        #         if data[0] == "sync_backend" and frontend_queue.empty():
-        #             gaussians = data[1]
-        #             self.gaussians = gaussians
-        #             break
-        #
-        #     rendering_result = eval_rendering(
-        #         self.frontend.cameras,
-        #         self.gaussians,
-        #         self.dataset,
-        #         self.save_dir,
-        #         self.pipeline_params,
-        #         self.background,
-        #         kf_indices=kf_indices,
-        #         iteration="after_opt",
-        #     )
-        #     metrics_table.add_data(
-        #         "After",
-        #         rendering_result["mean_psnr"],
-        #         rendering_result["mean_ssim"],
-        #         rendering_result["mean_lpips"],
-        #         ATE,
-        #         FPS,
-        #     )
-        #     wandb.log({"Metrics": metrics_table})
-        #     save_gaussians(self.gaussians, self.save_dir, "final_after_opt", final=True)
-        #
-        # backend_queue.put(["stop"])
-        # backend_process.join()
-        # Log("Backend stopped and joined the main thread")
-        #
-        # # ========= 新增：优雅关闭 Loop Closure 进程 =========
-        # loop_queue.put(["stop"])
-        # self.loop_closure_process.join()
-        # Log("Loop Closure stopped and joined the main thread")
-        # # ====================================================
-        #
-        # if self.use_gui:
-        #     q_main2vis.put(gui_utils.GaussianPacket(finish=True))
-        #     gui_process.join()
-        #     Log("GUI Stopped and joined the main thread")
+
         # 主进程运行frontend
         self.frontend.run()
         # 前端运行结束了，利用队列传递信息，让后端暂停
@@ -327,12 +157,29 @@ class SLAM:
         Log("Total time", start.elapsed_time(end) * 0.001, tag="Eval")
         Log("Total FPS", FPS, tag="Eval")
 
+        # =========================================================================
         # 1. 停止后端，促使其保存最后一块子图
+        # =========================================================================
         backend_queue.put(["stop"])
+
+        Log("等待后端清理显存并安全退出 (防死锁抽干机制启动)...")
+        # 【核心修复】：只要后端还活着，主进程就疯狂抽干 frontend_queue！
+        # 防止后端发送的遗留高斯地图塞爆底层 IPC 管道，导致互相死锁。
+        while backend_process.is_alive():
+            while not frontend_queue.empty():
+                try:
+                    # 拿出来直接丢弃，让 PyTorch 释放底层的共享内存
+                    _ = frontend_queue.get_nowait()
+                except:
+                    break
+            time.sleep(0.1)  # 稍微喘口气，避免吃满单核 CPU
+
         backend_process.join()
         Log("Backend stopped and saved final submap.")
 
+        # =========================================================================
         # 2. 停止回环检测进程，确保所有 PGO 写入硬盘完成
+        # =========================================================================
         loop_queue.put(["stop"])
         self.loop_closure_process.join()
         Log("Loop Closure stopped and PGO finalized.")
@@ -341,8 +188,7 @@ class SLAM:
         # 3. THE GRAND MERGE: 全局子图合并与相机轨迹深度校正
         # =========================================================================
         Log("==> 开始合并所有子图并校正全局相机轨迹... <==")
-        import glob
-        import copy
+
         submaps_dir = os.path.join(self.save_dir, "submaps")
         ckpt_files = sorted(glob.glob(os.path.join(submaps_dir, "*.ckpt")))
 
@@ -464,15 +310,14 @@ class SLAM:
 
             camera_list = list(self.frontend.cameras.values())
             valid_cameras = []
-            gt_image_cache = {}
 
+            # =========================================================
+            # 【核心修复 1】：废弃内存黑洞 gt_image_cache！
+            # 长序列下把 2000 张高清图塞进内存会导致系统被 Killed。
+            # 我们只保存相机对象，图片在后面的循环中现用现取。
+            # =========================================================
             for cam in camera_list:
-                try:
-                    gt_image, _, _, _, _ = self.dataset[cam.uid]
-                    gt_image_cache[cam.uid] = gt_image.cpu()
-                    valid_cameras.append(cam)
-                except Exception as e:
-                    pass
+                valid_cameras.append(cam)
 
             if len(valid_cameras) > 0:
                 self.gaussians.training_setup(self.opt_params)
@@ -484,7 +329,6 @@ class SLAM:
                 self.gaussians.unique_kfIDs = torch.zeros((total_points,), device="cuda", dtype=torch.int32)
                 self.gaussians.n_obs = torch.zeros((total_points,), device="cuda", dtype=torch.int32)
 
-                # =========================================================================
                 # 1. 允许几何自我缝合
                 self.gaussians._xyz.requires_grad = True
                 self.gaussians._scaling.requires_grad = True
@@ -496,37 +340,28 @@ class SLAM:
                     if param_group["name"] in ["xyz", "rotation", "scaling", "normal"]:
                         param_group["lr"] = param_group["lr"] * 0.2
 
-                # =========================================================================
-                # 2. 【核心大招】：全局相机微调优化器 (Global Camera Optimizer)
-                # =========================================================================
+                # 2. 全局相机微调优化器 (Global Camera Optimizer)
                 opt_params_cams = []
                 for cam in valid_cameras:
-                    # 【核心修复】：动态重建被清理的参数张量
                     if getattr(cam, 'cam_rot_delta', None) is None:
-                        cam.cam_rot_delta = torch.nn.Parameter(
-                            torch.zeros(3, requires_grad=True, device="cuda"))
+                        cam.cam_rot_delta = torch.nn.Parameter(torch.zeros(3, requires_grad=True, device="cuda"))
                     if getattr(cam, 'cam_trans_delta', None) is None:
-                        cam.cam_trans_delta = torch.nn.Parameter(
-                            torch.zeros(3, requires_grad=True, device="cuda"))
+                        cam.cam_trans_delta = torch.nn.Parameter(torch.zeros(3, requires_grad=True, device="cuda"))
                     if getattr(cam, 'exposure_a', None) is None:
-                        cam.exposure_a = torch.nn.Parameter(
-                            torch.tensor([0.0], requires_grad=True, device="cuda"))
+                        cam.exposure_a = torch.nn.Parameter(torch.tensor([0.0], requires_grad=True, device="cuda"))
                     if getattr(cam, 'exposure_b', None) is None:
-                        cam.exposure_b = torch.nn.Parameter(
-                            torch.tensor([0.0], requires_grad=True, device="cuda"))
+                        cam.exposure_b = torch.nn.Parameter(torch.tensor([0.0], requires_grad=True, device="cuda"))
 
-                    opt_params_cams.append({"params": [cam.cam_rot_delta],
-                                            "lr": self.config["Training"]["lr"]["cam_rot_delta"] * 0.2,
-                                            "name": f"rot_{cam.uid}"})
-                    opt_params_cams.append({"params": [cam.cam_trans_delta],
-                                            "lr": self.config["Training"]["lr"]["cam_trans_delta"] * 0.2,
-                                            "name": f"trans_{cam.uid}"})
+                    opt_params_cams.append(
+                        {"params": [cam.cam_rot_delta], "lr": self.config["Training"]["lr"]["cam_rot_delta"] * 0.2,
+                         "name": f"rot_{cam.uid}"})
+                    opt_params_cams.append(
+                        {"params": [cam.cam_trans_delta], "lr": self.config["Training"]["lr"]["cam_trans_delta"] * 0.2,
+                         "name": f"trans_{cam.uid}"})
                     opt_params_cams.append({"params": [cam.exposure_a], "lr": 0.01, "name": f"exp_a_{cam.uid}"})
                     opt_params_cams.append({"params": [cam.exposure_b], "lr": 0.01, "name": f"exp_b_{cam.uid}"})
 
-                # 将优化器挂载
                 global_cam_optimizer = torch.optim.Adam(opt_params_cams)
-                # =========================================================================
 
                 iteration_total = 20000
                 for iteration in tqdm(range(1, iteration_total + 1)):
@@ -539,7 +374,15 @@ class SLAM:
                     visibility_filter = render_pkg["visibility_filter"]
                     radii = render_pkg["radii"]
 
-                    gt_image = gt_image_cache[viewpoint_cam.uid].cuda()
+                    # =========================================================
+                    # 【核心修复 2】：流式读取 GT 图像
+                    # 现用现读，用完即焚。不仅彻底解决了内存溢出，对速度影响也微乎其微。
+                    # =========================================================
+                    try:
+                        gt_image_raw, _, _, _, _ = self.dataset[viewpoint_cam.uid]
+                        gt_image = gt_image_raw.cuda()
+                    except Exception as e:
+                        continue  # 如果读取失败，直接跳过本次迭代
 
                     Ll1 = l1_loss(image, gt_image)
                     loss = (1.0 - self.opt_params.lambda_dssim) * Ll1 + self.opt_params.lambda_dssim * (
@@ -550,31 +393,27 @@ class SLAM:
                         self.gaussians.max_radii2D[visibility_filter] = torch.max(
                             self.gaussians.max_radii2D[visibility_filter], radii[visibility_filter]
                         )
-                        # 更新高斯
                         self.gaussians.optimizer.step()
                         self.gaussians.optimizer.zero_grad(set_to_none=True)
                         self.gaussians.update_learning_rate(iteration)
 
-                        # 【核心】：更新并应用全局相机位姿微调！消除漂移和重影的最后一步！
                         global_cam_optimizer.step()
                         global_cam_optimizer.zero_grad(set_to_none=True)
 
-                        # 把 Delta 增量吃进基础位姿矩阵 cam.T 里
                         update_pose(viewpoint_cam)
-                        # 【新增】：全局相机学习率指数衰减，保证后期不再震荡
+
                         if iteration % 100 == 0:
-                            lr_factor = (0.01 ** (1.0 / (iteration_total / 100)))  # 衰减系数
+                            lr_factor = (0.01 ** (1.0 / (iteration_total / 100)))
                             for param_group in global_cam_optimizer.param_groups:
                                 param_group['lr'] *= lr_factor
-                        # =======================================================
-                        # 【核心修复 2】：指数学习率衰减，让点云和相机在最后阶段完美锁定！
-                        # =======================================================
-                        # decay_rate = 0.01 ** (1.0 / iteration_total)  # 计算单步衰减率
-                        # for param_group in self.gaussians.optimizer.param_groups:
-                        #     param_group["lr"] *= decay_rate
-                        # for param_group in global_cam_optimizer.param_groups:
-                        #     param_group["lr"] *= decay_rate
-                        # =======================================================
+
+                        if iteration == 3000:
+                            Log("==> 执行全局透明度重置，零代价清洗浮游点与重影... <==")
+                            self.gaussians.reset_opacity()
+
+                    # 用完即焚，确保每轮迭代显存安全
+                    del gt_image_raw, gt_image
+
                 Log("==> 全局大地图联合优化缝合完成！ <==")
             else:
                 Log("[Warning] 没有找到有效的图像缓存，跳过全局画质精修。")
@@ -605,100 +444,6 @@ class SLAM:
                 final_ATE, FPS,
             )
             wandb.log({"Metrics": metrics_table})
-            # # 4.2 真正对全局地图执行 Global Bundle Adjustment (画质精修 + 几何缝合)
-            # Log("==> 开始全局大地图联合优化 (Global BA & Color Refinement)... <==")
-            # import random
-            # from tqdm import tqdm
-            # from gaussian_splatting.gaussian_renderer import render
-            # from gaussian_splatting.utils.loss_utils import l1_loss, ssim
-            #
-            # camera_list = list(self.frontend.cameras.values())
-            # valid_cameras = []
-            # gt_image_cache = {}
-            #
-            # for cam in camera_list:
-            #     try:
-            #         gt_image, _, _, _, _ = self.dataset[cam.uid]
-            #         gt_image_cache[cam.uid] = gt_image.cpu()
-            #         valid_cameras.append(cam)
-            #     except Exception as e:
-            #         pass
-            #
-            # if len(valid_cameras) > 0:
-            #     # 初始化优化器
-            #     self.gaussians.training_setup(self.opt_params)
-            #
-            #     # 重新扩充辅助张量
-            #     total_points = self.gaussians._xyz.shape[0]
-            #     self.gaussians.max_radii2D = torch.zeros((total_points,), device="cuda")
-            #     self.gaussians.xyz_gradient_accum = torch.zeros((total_points, 1), device="cuda")
-            #     self.gaussians.denom = torch.zeros((total_points, 1), device="cuda")
-            #     self.gaussians.unique_kfIDs = torch.zeros((total_points,), device="cuda", dtype=torch.int32)
-            #     self.gaussians.n_obs = torch.zeros((total_points,), device="cuda", dtype=torch.int32)
-            #
-            #     # =========================================================================
-            #     # 【核心修复 2】：绝对不要冻结几何！(UNFREEZE)
-            #     # 允许 _xyz 和 _rotation 参与梯度下降。在 26000 次渲染迭代中，
-            #     # 图像的光度误差 (L1+SSIM) 会把 PGO 拼接处撕裂的“重影点”像磁铁一样紧紧吸附在一起，
-            #     # 从而实现极其平滑的无缝融合！
-            #     # =========================================================================
-            #     self.gaussians._xyz.requires_grad = True
-            #     self.gaussians._scaling.requires_grad = True
-            #     self.gaussians._rotation.requires_grad = True
-            #     if hasattr(self.gaussians, '_normal'):
-            #         self.gaussians._normal.requires_grad = True
-            #
-            #     # 为了防止优化力度过大导致点云乱飞，我们将几何参数的学习率人为降低 (微调模式)
-            #     for param_group in self.gaussians.optimizer.param_groups:
-            #         if param_group["name"] in ["xyz", "rotation", "scaling", "normal"]:
-            #             param_group["lr"] = param_group["lr"] * 0.3
-            #
-            #     iteration_total = 26000
-            #     for iteration in tqdm(range(1, iteration_total + 1)):
-            #         viewpoint_cam = random.choice(valid_cameras)
-            #
-            #         render_pkg = render(
-            #             viewpoint_cam, self.gaussians, self.pipeline_params, self.background, surf=False
-            #         )
-            #         image = render_pkg["render"]
-            #         visibility_filter = render_pkg["visibility_filter"]
-            #         radii = render_pkg["radii"]
-            #
-            #         gt_image = gt_image_cache[viewpoint_cam.uid].cuda()
-            #
-            #         Ll1 = l1_loss(image, gt_image)
-            #         loss = (1.0 - self.opt_params.lambda_dssim) * Ll1 + self.opt_params.lambda_dssim * (
-            #                 1.0 - ssim(image.unsqueeze(0), gt_image.unsqueeze(0)))
-            #
-            #         loss.backward()
-            #         with torch.no_grad():
-            #             self.gaussians.max_radii2D[visibility_filter] = torch.max(
-            #                 self.gaussians.max_radii2D[visibility_filter], radii[visibility_filter]
-            #             )
-            #             self.gaussians.optimizer.step()
-            #             self.gaussians.optimizer.zero_grad(set_to_none=True)
-            #
-            #             # 避免内部函数重置微调学习率，注销学习率更新
-            #             # self.gaussians.update_learning_rate(iteration)
-            #
-            #     Log("==> 全局大地图联合优化缝合完成！ <==")
-            # else:
-            #     Log("[Warning] 没有找到有效的图像缓存，跳过全局画质精修。")
-            #
-            # # 4.3 评估精修后的超清大图 (After)
-            # rendering_result_after = eval_rendering(
-            #     self.frontend.cameras, self.gaussians, self.dataset, self.save_dir,
-            #     self.pipeline_params, self.background, kf_indices=kf_indices,
-            #     iteration="global_merged_after_opt",
-            # )
-            # metrics_table.add_data(
-            #     "After",
-            #     rendering_result_after["mean_psnr"],
-            #     rendering_result_after["mean_ssim"],
-            #     rendering_result_after["mean_lpips"],
-            #     ATE, FPS,
-            # )
-            # wandb.log({"Metrics": metrics_table})
 
             # 保存巅峰之作
             save_gaussians(self.gaussians, self.save_dir, "final_merged_after_opt", final=True)

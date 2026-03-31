@@ -878,8 +878,20 @@ class BackEnd(mp.Process):
                     Log(f"==> Submap {completed_submap_id} frozen and VRAM cleared. Ready for next submap. <==")
                 else:
                     raise Exception("Unprocessed data", data)
+        # =======================================================
+        # 【核心修复】：使用 get_nowait 替代阻塞的 get()
+        # 防止在系统关闭的最后一刻，因为自己等自己而发生死锁
+        # =======================================================
         while not self.backend_queue.empty():
-            self.backend_queue.get()
+            try:
+                self.backend_queue.get_nowait()
+            except:
+                break
+
         while not self.frontend_queue.empty():
-            self.frontend_queue.get()
+            try:
+                self.frontend_queue.get_nowait()
+            except:
+                break
+
         return

@@ -5,10 +5,10 @@ import torch
 import torch.multiprocessing as mp
 import os
 from gaussian_splatting.gaussian_renderer import render
-from gaussian_splatting.utils.graphics_utils import getProjectionMatrix2, getWorld2View2
+from gaussian_splatting.utils.graphics_utils import getProjectionMatrix2
 from gui import gui_utils
 from utils.camera_utils import Camera
-from utils.eval_utils import eval_ate, save_gaussians
+from utils.eval_utils import eval_ate
 from utils.logging_utils import Log
 from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
@@ -154,7 +154,6 @@ class FrontEnd(mp.Process):
     '''
     def tracking(self, cur_frame_idx, viewpoint):
         prev = self.cameras[cur_frame_idx - self.use_every_n_frames] # 上一帧位姿
-        #viewpoint.update_RT(prev.R, prev.T) # 以上一帧位姿初始化当前帧位姿
         viewpoint.T = prev.T
         # 优化参数与优化器构建
         opt_params = []
