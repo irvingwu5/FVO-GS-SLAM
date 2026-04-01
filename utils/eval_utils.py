@@ -128,7 +128,7 @@ def eval_rendering(
     interval = 5
     img_pred, img_gt, saved_frame_idx = [], [], []
     end_idx = len(frames) - 1 if iteration == "final" or "before_opt" else iteration
-    psnr_array, ssim_array, lpips_array = [], [], []
+    psnr_array, ssim_array, lpips_array, depth_l1_array = [], [], [], []
     cal_lpips = LearnedPerceptualImagePatchSimilarity(
         net_type="alex", normalize=True
     ).to("cuda")
@@ -140,9 +140,12 @@ def eval_rendering(
             continue
         saved_frame_idx.append(idx)
         frame = frames[idx]
-        gt_image, _, _, _, _ = dataset[idx]
+        gt_image, gt_depth, _, _, _ = dataset[idx]
 
-        rendering = render(frame, gaussians, pipe, background)["render"]
+        render_pkg = render(frame, gaussians, pipe, background)
+        rendering = render_pkg["render"]
+        render_depth = render_pkg["depth"]
+
         image = torch.clamp(rendering, 0.0, 1.0)
 
         gt = (gt_image.cpu().numpy().transpose((1, 2, 0)) * 255).astype(np.uint8)
@@ -165,13 +168,35 @@ def eval_rendering(
         ssim_array.append(ssim_score.item())
         lpips_array.append(lpips_score.item())
 
+        # =========================================================
+        # 【新增计算】：Depth L1 (深度绝对误差)
+        # =========================================================
+        if gt_depth is not None:
+            # 【核心修复】：如果是 numpy 数组，先转 tensor，再推到 GPU 并 squeeze
+            if isinstance(gt_depth, np.ndarray):
+                gt_d = torch.from_numpy(gt_depth).float().cuda().squeeze()
+            else:
+                gt_d = gt_depth.float().cuda().squeeze()
+
+            rend_d = render_depth.squeeze()
+
+            # 只在有真实深度的有效像素（>0.01m）上计算误差
+            valid_depth_mask = gt_d > 0.01
+            if valid_depth_mask.sum() > 0:
+                # 计算 L1 误差 (单位: 米)
+                depth_l1 = torch.abs(rend_d[valid_depth_mask] - gt_d[valid_depth_mask]).mean().item()
+                depth_l1_array.append(depth_l1)
+
     output = dict()
     output["mean_psnr"] = float(np.mean(psnr_array))
     output["mean_ssim"] = float(np.mean(ssim_array))
     output["mean_lpips"] = float(np.mean(lpips_array))
+    # 【新增】：保存深度误差
+    output["mean_depth_l1"] = float(np.mean(depth_l1_array)) if len(depth_l1_array) > 0 else 0.0
 
+    # 【修改】：在终端打印日志时，附加上 Depth L1
     Log(
-        f'mean psnr: {output["mean_psnr"]}, ssim: {output["mean_ssim"]}, lpips: {output["mean_lpips"]}',
+        f'mean psnr: {output["mean_psnr"]:.4f}, ssim: {output["mean_ssim"]:.4f}, lpips: {output["mean_lpips"]:.4f}, depth_l1: {output["mean_depth_l1"]:.4f}m',
         tag="Eval",
     )
 

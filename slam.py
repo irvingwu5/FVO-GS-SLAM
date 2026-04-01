@@ -20,6 +20,10 @@ from utils.logging_utils import Log
 from utils.multiprocessing_utils import FakeQueue
 from utils.slam_backend import BackEnd
 from utils.slam_frontend import FrontEnd
+import random
+from tqdm import tqdm
+from gaussian_splatting.gaussian_renderer import render
+from gaussian_splatting.utils.loss_utils import l1_loss, ssim
 # ========= 新增：导入新建的 Loop Closure 进程类 =========
 from utils.loop_closure import LoopClosureProcess
 # ========================================================
@@ -291,22 +295,19 @@ class SLAM:
                 self.pipeline_params, self.background, kf_indices=kf_indices,
                 iteration="global_merged_before_opt",
             )
-
-            columns = ["tag", "psnr", "ssim", "lpips", "RMSE ATE", "FPS"]
+            # 【修改 1】：列名加上 Depth L1
+            columns = ["tag", "psnr", "ssim", "lpips", "Depth L1", "RMSE ATE", "FPS"]
             metrics_table = wandb.Table(columns=columns)
             metrics_table.add_data(
                 "Before",
                 rendering_result_before["mean_psnr"],
                 rendering_result_before["mean_ssim"],
                 rendering_result_before["mean_lpips"],
+                rendering_result_before.get("mean_depth_l1", 0.0),  # <== 新增
                 ATE, FPS,
             )
             # 4.2 真正对全局地图执行 Global Bundle Adjustment (画质精修 + 几何缝合 + 位姿微调)
             Log("==> 开始全局大地图联合优化 (Global BA & Color Refinement)... <==")
-            import random
-            from tqdm import tqdm
-            from gaussian_splatting.gaussian_renderer import render
-            from gaussian_splatting.utils.loss_utils import l1_loss, ssim
 
             camera_list = list(self.frontend.cameras.values())
             valid_cameras = []
@@ -436,11 +437,13 @@ class SLAM:
                 self.pipeline_params, self.background, kf_indices=kf_indices,
                 iteration="global_merged_after_opt",
             )
+            # 【修改 3】：塞入 After 阶段的数据
             metrics_table.add_data(
                 "After",
                 rendering_result_after["mean_psnr"],
                 rendering_result_after["mean_ssim"],
                 rendering_result_after["mean_lpips"],
+                rendering_result_after.get("mean_depth_l1", 0.0),  # <== 新增
                 final_ATE, FPS,
             )
             wandb.log({"Metrics": metrics_table})
