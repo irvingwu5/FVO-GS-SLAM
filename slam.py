@@ -309,16 +309,26 @@ class SLAM:
             # 4.2 真正对全局地图执行 Global Bundle Adjustment (画质精修 + 几何缝合 + 位姿微调)
             Log("==> 开始全局大地图联合优化 (Global BA & Color Refinement)... <==")
 
-            camera_list = list(self.frontend.cameras.values())
-            valid_cameras = []
+            # 【修复警告】：直接将所有前端相机列表赋值给 valid_cameras
+            valid_cameras = list(self.frontend.cameras.values())
 
-            # =========================================================
-            # 【核心修复 1】：废弃内存黑洞 gt_image_cache！
-            # 长序列下把 2000 张高清图塞进内存会导致系统被 Killed。
-            # 我们只保存相机对象，图片在后面的循环中现用现取。
-            # =========================================================
-            for cam in camera_list:
-                valid_cameras.append(cam)
+            if len(valid_cameras) > 0:
+                # =========================================================
+                # 【优化版：使用 CPU 锁页内存 (Pin Memory) 彻底消除 I/O 瓶颈】
+                # 将所有图像缓存在系统主存中，既不撑爆显存，又能实现极速读取
+                # =========================================================
+                Log("==> 预加载 GT 图像至 CPU 主存，加速训练流... <==")
+                cpu_image_cache = {}
+                for cam in tqdm(valid_cameras, desc="Caching to CPU RAM"):
+                    try:
+                        gt_image_raw, _, _, _, _ = self.dataset[cam.uid]
+                        # 存放在 CPU，并启用 pin_memory 极大加速 CPU -> GPU 的拷贝速度
+                        cpu_image_cache[cam.uid] = gt_image_raw.cpu().pin_memory()
+                    except Exception as e:
+                        pass
+
+                # 过滤掉因为某种原因读取失败的相机
+                valid_cameras = [cam for cam in valid_cameras if cam.uid in cpu_image_cache]
 
             if len(valid_cameras) > 0:
                 self.gaussians.training_setup(self.opt_params)
@@ -364,7 +374,8 @@ class SLAM:
 
                 global_cam_optimizer = torch.optim.Adam(opt_params_cams)
 
-                iteration_total = 26000
+                # 【核心加速点 1：将迭代次数降为 10000】
+                iteration_total = 20000
                 for iteration in tqdm(range(1, iteration_total + 1)):
                     viewpoint_cam = random.choice(valid_cameras)
 
@@ -376,14 +387,10 @@ class SLAM:
                     radii = render_pkg["radii"]
 
                     # =========================================================
-                    # 【核心修复 2】：流式读取 GT 图像
-                    # 现用现读，用完即焚。不仅彻底解决了内存溢出，对速度影响也微乎其微。
+                    # 【核心加速点 2：从系统主存异步提取数据至显存】
+                    # non_blocking=True 允许 CPU 向 GPU 发送数据的同时执行计算
                     # =========================================================
-                    try:
-                        gt_image_raw, _, _, _, _ = self.dataset[viewpoint_cam.uid]
-                        gt_image = gt_image_raw.cuda()
-                    except Exception as e:
-                        continue  # 如果读取失败，直接跳过本次迭代
+                    gt_image = cpu_image_cache[viewpoint_cam.uid].cuda(non_blocking=True)
 
                     Ll1 = l1_loss(image, gt_image)
                     loss = (1.0 - self.opt_params.lambda_dssim) * Ll1 + self.opt_params.lambda_dssim * (
@@ -408,12 +415,14 @@ class SLAM:
                             for param_group in global_cam_optimizer.param_groups:
                                 param_group['lr'] *= lr_factor
 
+                        # 【核心加速点 3：透明度重置提前到第 1500 步】
+                        #if iteration == 1500:
                         if iteration == 3000:
                             Log("==> 执行全局透明度重置，零代价清洗浮游点与重影... <==")
                             self.gaussians.reset_opacity()
 
-                    # 用完即焚，确保每轮迭代显存安全
-                    del gt_image_raw, gt_image
+                    # 释放显存引用，防止每一步累积
+                    del gt_image
 
                 Log("==> 全局大地图联合优化缝合完成！ <==")
             else:
@@ -482,8 +491,8 @@ if __name__ == "__main__":
         Log("Following config will be overriden")
         Log("\tsave_results=True")
         config["Results"]["save_results"] = True
-        Log("\tuse_gui=True")
-        config["Results"]["use_gui"] = True
+        Log("\tuse_gui=False")
+        config["Results"]["use_gui"] = False
         Log("\teval_rendering=True")
         config["Results"]["eval_rendering"] = True
         Log("\tuse_wandb=False")
