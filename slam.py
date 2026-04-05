@@ -524,6 +524,30 @@ if __name__ == "__main__":
     slam = SLAM(config, save_dir=save_dir)
 
     slam.run()
+    # =========================================================================
+    # 【新增】：学术级指标统计 (Peak GPU Memory & Map Size)
+    # =========================================================================
+    if save_dir is not None:
+        # 1. 统计峰值显存 (Peak GPU Memory)
+        # 获取自程序运行以来，由 PyTorch 分配的最大 GPU 显存 (单位: MB)
+        peak_memory_mb = torch.cuda.max_memory_allocated(device="cuda") / (1024 * 1024)
+        Log(f"Peak GPU Memory: {peak_memory_mb:.2f} MB", tag="Eval")
+
+        # 2. 统计地图大小 (Map Size)
+        # 寻找全局联合优化后保存的最终点云文件 (.ply)
+        # 显式使用 str(save_dir) 消除 IDE 类型检查警告
+        final_ply_path = os.path.join(
+            str(save_dir),
+            "point_cloud",
+            "final",
+            "point_cloud.ply"
+        )
+
+        if os.path.exists(final_ply_path):
+            map_size_mb = os.path.getsize(final_ply_path) / (1024 * 1024)
+            Log(f"Final Map Size: {map_size_mb:.2f} MB", tag="Eval")
+        else:
+            Log(f"[Warning] 找不到最终的 PLY 文件: {final_ply_path}，无法计算 Map Size。", tag="Eval")
     wandb.finish()
 
     # All done
