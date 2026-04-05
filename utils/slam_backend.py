@@ -383,32 +383,32 @@ class BackEnd(mp.Process):
             # isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
             # loss_mapping += 10 * isotropic_loss.mean() #0.1*0.0024=0.00024
             # -----------------------------------------------
-            if self.use_external_normal and viewpoint.normal is not None and itr == 0:
-                rend_normal = render_pkg["rend_normal"]
-                #rend_normal = F.normalize(rend_normal, p=2, dim=0)
-                depth_pixel_mask = (viewpoint.gt_depth > 0.01).view(*depth.shape)
-                # ==========================================
-                # 模式 1: 纯传感器法线 (Sensor only)
-                # ==========================================
-                if self.normal_mode == "sensor":
-                    # 获取传感器法线并转到世界坐标系
-                    sensor_normal = viewpoint.normal
-                    # 注意：这里假设 viewpoint.T 是 World2Cam，具体转换需根据你的坐标系定义确认
-                    gt_normal = (viewpoint.T[0:3, 0:3].T @ sensor_normal.view(3, -1)).view(
-                        image.shape[0], image.shape[1], image.shape[2]
-                    )
-                    #_save_gt_normal(gt_normal, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/", viewpoint.uid)
-                    #_save_gt_normal(rend_normal,"/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid, "rend")
-                    # --- 新增：保存箭头图 ---
-                    #quiver_save_dir = "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/quivers/"
-                    #os.makedirs(quiver_save_dir, exist_ok=True)
-                    #save_normal_as_quiver(gt_normal, os.path.join(quiver_save_dir, f"gt_{viewpoint.uid}.png"))
-                    # 保存渲染结果的箭头图
-                    #save_normal_as_quiver(rend_normal, os.path.join(quiver_save_dir, f"rend_{viewpoint.uid}.png"))
-                    #normal_mask = gt_normal > 0
-                    #normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask * normal_mask).sum(dim=0))[None].mean() #0.9128
-                    normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()
-                    loss_mapping += (self.config["opt_params"]["lambda_sensor_normal"] * normal_error)
+            # if self.use_external_normal and viewpoint.normal is not None and itr == 0:
+            #     rend_normal = render_pkg["rend_normal"]
+            #     #rend_normal = F.normalize(rend_normal, p=2, dim=0)
+            #     depth_pixel_mask = (viewpoint.gt_depth > 0.01).view(*depth.shape)
+            #     # ==========================================
+            #     # 模式 1: 纯传感器法线 (Sensor only)
+            #     # ==========================================
+            #     if self.normal_mode == "sensor":
+            #         # 获取传感器法线并转到世界坐标系
+            #         sensor_normal = viewpoint.normal
+            #         # 注意：这里假设 viewpoint.T 是 World2Cam，具体转换需根据你的坐标系定义确认
+            #         gt_normal = (viewpoint.T[0:3, 0:3].T @ sensor_normal.view(3, -1)).view(
+            #             image.shape[0], image.shape[1], image.shape[2]
+            #         )
+            #         #_save_gt_normal(gt_normal, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/", viewpoint.uid)
+            #         #_save_gt_normal(rend_normal,"/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid, "rend")
+            #         # --- 新增：保存箭头图 ---
+            #         #quiver_save_dir = "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/quivers/"
+            #         #os.makedirs(quiver_save_dir, exist_ok=True)
+            #         #save_normal_as_quiver(gt_normal, os.path.join(quiver_save_dir, f"gt_{viewpoint.uid}.png"))
+            #         # 保存渲染结果的箭头图
+            #         #save_normal_as_quiver(rend_normal, os.path.join(quiver_save_dir, f"rend_{viewpoint.uid}.png"))
+            #         #normal_mask = gt_normal > 0
+            #         #normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask * normal_mask).sum(dim=0))[None].mean() #0.9128
+            #         normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()
+            #         loss_mapping += (self.config["opt_params"]["lambda_sensor_normal"] * normal_error)
             #     # ==========================================
             #     # 模式 2: 纯平面先验 (Plane only)
             #     # ==========================================

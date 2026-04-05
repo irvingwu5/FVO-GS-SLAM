@@ -13,7 +13,8 @@ from utils.logging_utils import Log
 from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
 from utils.slam_utils import get_loss_tracking, get_median_depth
-
+import cv2
+from utils.fft_filter import FFTFrequencyFilter
 
 class FrontEnd(mp.Process):
     def __init__(self, config):
@@ -52,6 +53,7 @@ class FrontEnd(mp.Process):
         self.submap_rot_thre = self.config["Submap"]["rot_thre"]
         self.frame_to_submap = {}  # <--- 新增这行：记录每帧属于哪个子图
         # ============================================
+        self.fft_filter = None  # <--- 新增这行：频域滤波器实例
 
     def set_hyperparams(self):
         self.save_dir = self.config["Results"]["save_dir"] # 结果保存路径
@@ -64,6 +66,41 @@ class FrontEnd(mp.Process):
         self.window_size = self.config["Training"]["window_size"] # 滑动窗口大小，限制同时优化的关键帧数量，当关键帧数量超过此值时，会根据重叠度等策略移除旧的关键帧
         self.single_thread = self.config["Training"]["single_thread"] # 如果为 True，前端在请求关键帧或初始化后会主动等待（sleep），直到后端处理完成，表现为串行执行；否则前端和后端并行工作。
 
+    def compute_error_mask(self, render_pkg, viewpoint):
+        """
+        基于当前渲染结果与真实观测的差异，计算哪里需要补点 (Error Mask)
+        """
+        gt_image = viewpoint.original_image.cuda()  # [3, H, W]
+        render_image = render_pkg["render"].detach()  # [3, H, W]
+        render_opacity = render_pkg["opacity"].detach()  # [1, H, W]
+
+        # 1. Silhouette / Opacity 掩膜 (寻找地图没覆盖到的“漏洞”)
+        # 如果某像素的不透明度小于 0.95，说明这里高斯覆盖不足，存在空洞
+        silhouette_mask = (render_opacity < 0.95).squeeze(0)  # [H, W]
+
+        # 2. RGB 光度误差掩膜 (寻找颜色重建错的地方)
+        rgb_error = torch.abs(gt_image - render_image).sum(dim=0)  # [H, W]
+        rgb_error_mask = rgb_error > 0.5  # 阈值 0.5 (可根据场景光照情况微调 0.3 ~ 0.8)
+
+        # 3. Depth 深度误差掩膜 (如果有 GT 深度的话)
+        # 如果是单目模式且没有提供先验深度，这部分可以忽略
+        depth_error_mask = torch.zeros_like(silhouette_mask, dtype=torch.bool)
+        if not self.monocular and viewpoint.depth is not None:
+            gt_depth = torch.from_numpy(viewpoint.depth).cuda()  # [H, W]
+            render_depth = render_pkg["depth"].detach().squeeze(0)  # [H, W]
+            depth_error = torch.abs(gt_depth - render_depth)
+
+            valid_depth = gt_depth > 0.01
+            if valid_depth.any():
+                median_error = depth_error[valid_depth].median()
+                # 渲染深度比GT深度远(说明渲染在背景上了，前景缺东西) 且 误差显著大于中位数
+                depth_error_mask = valid_depth & (render_depth > gt_depth) & (depth_error > 10.0 * median_error)
+
+        # 综合掩膜：没覆盖的 | 颜色错的 | 深度错的
+        # 只要满足其一，就说明这个像素点处“需要加高斯”
+        error_mask = silhouette_mask | rgb_error_mask | depth_error_mask
+
+        return error_mask
     '''
     -------------------新关键帧数据准备模块---------------------
     作用: 为新关键帧准备深度图和不透明度数据，用于后续后端初始化新的高斯点。
@@ -74,6 +111,19 @@ class FrontEnd(mp.Process):
         self.kf_indices.append(cur_frame_idx)
         viewpoint = self.cameras[cur_frame_idx]
         gt_img = viewpoint.original_image.cuda()
+        # =================================================================
+        # 【新增：FFT 频率掩膜计算】
+        # 1. 延迟初始化 FFTFilter，确保获取到正确的图像分辨率
+        if self.fft_filter is None:
+            self.fft_filter = FFTFrequencyFilter(gt_img.shape[1], gt_img.shape[2])
+
+        # 2. 将 PyTorch Tensor [3, H, W] (0~1) 转换为 OpenCV BGR [H, W, 3] (0~255)
+        img_np = (gt_img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
+        # 3. 计算二值掩膜并挂载到 viewpoint 上 (供后端高斯建图使用)
+        viewpoint.freq_mask = self.fft_filter.generate_frequency_mask(img_bgr)
+        # =================================================================
         valid_rgb = (gt_img.sum(dim=0) > rgb_boundary_threshold)[None] #首先根据图像像素亮度（RGB和）判断哪些像素是有效的（valid_rgb），过滤掉过暗的区域（通常视为无效边界）。
         if self.monocular: #单目模式下需要估计深度，由于单目相机没有深度传感器，系统无法获得真实的深度信息，必须通过“猜测”或利用已有的地图来估计深度，以便在 3D 空间中初始化新的高斯点。
             if depth is None: #初始帧 / 无先验深度的情况，通过设定一个统一的深度值（默认为 2）加上随机噪声来初始化深度图，在没有任何地图信息时，假设场景是一个距离相机 2 米的平面，以此作为 SLAM 系统初始化的起点（冷启动）
@@ -610,6 +660,10 @@ class FrontEnd(mp.Process):
                             "Keyframes lacks sufficient overlap to initialize the map, resetting."
                         )
                         continue
+                    # =========================================================
+                    # 【新增】：计算渲染误差掩膜，告诉后端“哪里破了”
+                    # =========================================================
+                    viewpoint.error_mask = self.compute_error_mask(render_pkg, viewpoint)
                     #为新关键帧准备深度图和不透明度数据，用于后续后端初始化新的高斯点。
                     depth_map = self.add_new_keyframe(
                         cur_frame_idx,

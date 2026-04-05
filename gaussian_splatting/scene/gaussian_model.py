@@ -136,7 +136,32 @@ class GaussianModel:
                     + (np.random.randn(depth_raw.shape[0], depth_raw.shape[1]) - 0.5)
                     * 0.05
                 ) * scale
+            # ==============================================================
+            # 【机制 1：FFT 掩膜密度控制】(力量 B：控制高频密、低频稀)
+            # ==============================================================
+            if hasattr(cam, 'freq_mask'):
+                freq_mask_np = cam.freq_mask.cpu().numpy()
+                H, W = depth_raw.shape
 
+                downsample_low = 3  # 将上一次的 4 改为 3 稍微保守一点
+                low_freq_grid = np.zeros((H, W), dtype=bool)
+                low_freq_grid[::downsample_low, ::downsample_low] = True
+
+                # 力量 B：符合密度要求的像素
+                valid_mask = freq_mask_np | low_freq_grid
+
+                # ==============================================================
+                # 【机制 2：渲染误差掩膜】(力量 A：只在地图破损处加点)
+                # ==============================================================
+                if hasattr(cam, 'error_mask'):
+                    error_mask_np = cam.error_mask.cpu().numpy()
+
+                    # 终极融合：既要符合密度分布规律，又必须是渲染出错的地方！
+                    valid_mask = valid_mask & error_mask_np
+
+                # 将不采样的像素深度强制置 0，后续 Open3D 会直接忽略它们
+                depth_raw[~valid_mask] = 0.0
+            # ==============================================================
             rgb = o3d.geometry.Image(rgb_raw.astype(np.uint8))
             depth = o3d.geometry.Image(depth_raw.astype(np.float32))
 
@@ -188,7 +213,28 @@ class GaussianModel:
         pcd_tmp = pcd_tmp.random_down_sample(1.0 / downsample_factor)
         new_xyz = np.asarray(pcd_tmp.points)
         new_rgb = np.asarray(pcd_tmp.colors)
+        # ==============================================================
+        # 【新增机制 2】：反投影 3D 点获取频率属性，动态调整 2DGS 初始尺度
+        # ==============================================================
+        is_high_freq = np.ones(new_xyz.shape[0], dtype=bool)  # 默认均为高频
+        if hasattr(cam, 'freq_mask'):
+            freq_mask_np = cam.freq_mask.cpu().numpy()
+            H, W = cam.image_height, cam.image_width
 
+            # 将下采样后的世界坐标系 3D 点，转回当前相机坐标系
+            pts_in_cam = (W2C[:3, :3] @ new_xyz.T).T + W2C[:3, 3]  # (N, 3)
+
+            # 透视投影到像素坐标 (u, v)
+            u = np.round((pts_in_cam[:, 0] * cam.fx / pts_in_cam[:, 2]) + cam.cx).astype(int)
+            v = np.round((pts_in_cam[:, 1] * cam.fy / pts_in_cam[:, 2]) + cam.cy).astype(int)
+
+            # 防止反投影越界
+            u = np.clip(u, 0, W - 1)
+            v = np.clip(v, 0, H - 1)
+
+            # 查表获取频率属性
+            is_high_freq = freq_mask_np[v, u]
+        # ==============================================================
         pcd = BasicPointCloud(
             points=new_xyz, colors=new_rgb, normals=np.zeros((new_xyz.shape[0], 3))
         )
@@ -211,12 +257,22 @@ class GaussianModel:
             )
             * point_size
         )
-        scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1,2) # 先对距离平方取平方根得到距离，然后取对数得到缩放值
-        # Isotropic (各向同性)：意味着高斯体在 X, Y, Z 所有方向上的性质（缩放比例）是相同的。在几何上，这代表一个标准的 球体 (Sphere)。
-        # Anisotropic (各向异性)：意味着不同方向的缩放比例可以不同。在几何上，这代表一个 椭球体 (Ellipsoid)。
-        # if not self.isotropic:
-        #     scales = scales.repeat(1, 3)
+        # 你的 2DGS 原始尺度
+        base_scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 2)
 
+        # ==============================================================
+        # 根据频率属性分配缩放倍率
+        # ==============================================================
+        is_high_freq_tensor = torch.from_numpy(is_high_freq).bool().cuda()
+        scale_multiplier = torch.ones(new_xyz.shape[0], device="cuda")
+
+        # 对低频区域（例如白墙）的点进行尺度放大，倍率设为 2.5 (可在此处微调 2.0~3.0)
+        # 这能让少量稀疏的 2D 盘覆盖住大面积空白，且配合法线 FDN 约束变得极度平滑
+        scale_multiplier[~is_high_freq_tensor] = 2.5
+
+        # 因为 base_scales 在对数域，依据对数乘法原理：log(A * B) = log(A) + log(B)
+        scales = base_scales + torch.log(scale_multiplier.unsqueeze(-1))
+        # ==============================================================
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda") # 存储每个点的四元数表示
         rots[:, 0] = 1 # 将每个四元数的第一个元素设置为 1，其他元素保持为 0。这相当于将所有四元数初始化为单位四元数 [1, 0, 0, 0]，表示没有旋转
         #rots = torch.rand((fused_point_cloud.shape[0], 4), device="cuda") # 2dgs原代码随机初始化四元数
