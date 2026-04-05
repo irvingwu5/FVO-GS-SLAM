@@ -364,7 +364,7 @@ class SLAM:
 
                 global_cam_optimizer = torch.optim.Adam(opt_params_cams)
 
-                iteration_total = 20000
+                iteration_total = 26000
                 for iteration in tqdm(range(1, iteration_total + 1)):
                     viewpoint_cam = random.choice(valid_cameras)
 

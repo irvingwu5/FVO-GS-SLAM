@@ -114,65 +114,73 @@ def eval_ate(frames, kf_ids, save_dir, iterations, final=False, monocular=False)
     wandb.log({"frame_idx": latest_frame_idx, "ate": ate})
     return ate
 
+'''
+计算psnr、ssim、lpips用的是非关键帧，即NVS
+关键帧参与建图优化，非关键帧测试泛化
+
+计算depth l1是关键帧还是非关键帧还是全部帧？
+全部帧，全局采样测试建图精度
+
+计算precision、recall、f-score是用关键帧还是非关键帧还是全部帧？
+因为使用了渲染rgb和渲染depth进行了TSDF生成recon mesh,这里渲染rgb和渲染depth是关键帧的还是非关键帧还是全部帧？
+全部帧按固定间隔（Interval）采样的结果，它完全没有区分关键帧还是非关键帧。
+'''
 
 def eval_rendering(
-    frames,
-    gaussians,
-    dataset,
-    save_dir,
-    pipe,
-    background,
-    kf_indices,
-    iteration="final",
+        frames,
+        gaussians,
+        dataset,
+        save_dir,
+        pipe,
+        background,
+        kf_indices,
+        iteration="final",
 ):
     interval = 5
     img_pred, img_gt, saved_frame_idx = [], [], []
-    end_idx = len(frames) - 1 if iteration == "final" or "before_opt" else iteration
-    psnr_array, ssim_array, lpips_array, depth_l1_array = [], [], [], []
+
+    # 防止传入字符串时报错
+    end_idx = len(frames) - 1 if isinstance(iteration, str) else iteration
+    is_final_eval = isinstance(iteration, str)
+
+    # 【解耦数据池】：分清 NVS(非关键帧) 和 All(全部采样帧)
+    nvs_psnr_array, nvs_ssim_array, nvs_lpips_array = [], [], []
+    all_depth_l1_array = []  # <== 专门用来装全部采样帧的深度误差
+
     cal_lpips = LearnedPerceptualImagePatchSimilarity(
         net_type="alex", normalize=True
     ).to("cuda")
-    #创建保存渲染图片的文件夹
+
+    # 创建必要的文件夹
     render_dir = os.path.join(save_dir, "rendering")
     mkdir_p(render_dir)
+
+    if is_final_eval:
+        mesh_render_dir = os.path.join(save_dir, "mesh_rendering")
+        mkdir_p(mesh_render_dir)
+        render_poses_dict = {}
+        Log("Rendering and saving all sampled frames for TSDF Fusion...", tag="Eval")
+
+    # =========================================================
+    # 核心大循环：遍历所有采样帧（包含关键帧和非关键帧）
+    # 在这里统一执行渲染，并一次性完成 Depth L1计算、TSDF数据保存 和 NVS评估
+    # =========================================================
     for idx in range(0, end_idx, interval):
-        if idx in kf_indices:
-            continue
-        saved_frame_idx.append(idx)
         frame = frames[idx]
         gt_image, gt_depth, _, _, _ = dataset[idx]
 
+        # 统一执行一次渲染，绝不浪费算力
         render_pkg = render(frame, gaussians, pipe, background)
         rendering = render_pkg["render"]
         render_depth = render_pkg["depth"]
 
+        # 提前把 clamped image 拿出来，供 TSDF 和 NVS 共用
         image = torch.clamp(rendering, 0.0, 1.0)
 
-        gt = (gt_image.cpu().numpy().transpose((1, 2, 0)) * 255).astype(np.uint8)
-        pred = (image.detach().cpu().numpy().transpose((1, 2, 0)) * 255).astype(
-            np.uint8
-        )
-        gt = cv2.cvtColor(gt, cv2.COLOR_BGR2RGB)
-        pred = cv2.cvtColor(pred, cv2.COLOR_BGR2RGB)
-        cv2.imwrite(f"{render_dir}/pred_{idx}.png", pred) #添加保存渲染图片
-        img_pred.append(pred)
-        img_gt.append(gt)
-
-        mask = gt_image > 0
-
-        psnr_score = psnr((image[mask]).unsqueeze(0), (gt_image[mask]).unsqueeze(0))
-        ssim_score = ssim((image).unsqueeze(0), (gt_image).unsqueeze(0))
-        lpips_score = cal_lpips((image).unsqueeze(0), (gt_image).unsqueeze(0))
-
-        psnr_array.append(psnr_score.item())
-        ssim_array.append(ssim_score.item())
-        lpips_array.append(lpips_score.item())
-
-        # =========================================================
-        # 【新增计算】：Depth L1 (深度绝对误差)
-        # =========================================================
+        # ---------------------------------------------------------
+        # [逻辑分支 A]：全局 Depth L1 计算 (所有人都要算)
+        # ---------------------------------------------------------
         if gt_depth is not None:
-            # 【核心修复】：如果是 numpy 数组，先转 tensor，再推到 GPU 并 squeeze
             if isinstance(gt_depth, np.ndarray):
                 gt_d = torch.from_numpy(gt_depth).float().cuda().squeeze()
             else:
@@ -180,23 +188,73 @@ def eval_rendering(
 
             rend_d = render_depth.squeeze()
 
-            # 只在有真实深度的有效像素（>0.01m）上计算误差
-            valid_depth_mask = gt_d > 0.01
+            # 确保 GT 和 Pred 的分辨率维度完全一致
+            if gt_d.shape != rend_d.shape:
+                gt_d = gt_d.view(rend_d.shape)
+
+            valid_depth_mask = gt_d > 0.0
+
             if valid_depth_mask.sum() > 0:
-                # 计算 L1 误差 (单位: 米)
                 depth_l1 = torch.abs(rend_d[valid_depth_mask] - gt_d[valid_depth_mask]).mean().item()
-                depth_l1_array.append(depth_l1)
+                all_depth_l1_array.append(depth_l1)
 
+        # ---------------------------------------------------------
+        # [逻辑分支 B]：保存用于 TSDF Mesh 生成的数据 (所有人都要存)
+        # ---------------------------------------------------------
+        if is_final_eval:
+            # 转换 RGB
+            pred_rgb = (image.detach().cpu().numpy().transpose((1, 2, 0)) * 255).astype(np.uint8)
+            pred_bgr = cv2.cvtColor(pred_rgb, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(f"{mesh_render_dir}/color_{idx:05d}.png", pred_bgr)
+
+            # 转换深度为 uint16 (mm)
+            depth_mm = (render_depth.squeeze().detach().cpu().numpy() * 1000.0).astype(np.uint16)
+            cv2.imwrite(f"{mesh_render_dir}/depth_{idx:05d}.png", depth_mm)
+
+            # 保存位姿
+            render_poses_dict[str(idx)] = frame.T.cpu().numpy().tolist()
+
+        # ---------------------------------------------------------
+        # [逻辑分支 C]：NVS 专属 -> 如果是关键帧，直接跳过指标计算！
+        # ---------------------------------------------------------
+        if idx in kf_indices:
+            continue
+
+        # 以下代码仅针对【非关键帧】（NVS 测试）执行
+        saved_frame_idx.append(idx)
+
+        # 获取 GT 并计算图像指标
+        gt = (gt_image.cpu().numpy().transpose((1, 2, 0)) * 255).astype(np.uint8)
+        pred_bgr_nvs = cv2.cvtColor((image.detach().cpu().numpy().transpose((1, 2, 0)) * 255).astype(np.uint8),
+                                    cv2.COLOR_RGB2BGR)
+        gt_bgr = cv2.cvtColor(gt, cv2.COLOR_RGB2BGR)
+
+        cv2.imwrite(f"{render_dir}/pred_{idx:05d}.png", pred_bgr_nvs)
+
+        img_pred.append(pred_bgr_nvs)
+        img_gt.append(gt_bgr)
+
+        mask = gt_image > 0
+
+        psnr_score = psnr((image[mask]).unsqueeze(0), (gt_image[mask]).unsqueeze(0))
+        ssim_score = ssim((image).unsqueeze(0), (gt_image).unsqueeze(0))
+        lpips_score = cal_lpips((image).unsqueeze(0), (gt_image).unsqueeze(0))
+
+        nvs_psnr_array.append(psnr_score.item())
+        nvs_ssim_array.append(ssim_score.item())
+        nvs_lpips_array.append(lpips_score.item())
+
+    # =========================================================
+    # 循环结束：汇总与保存 JSON 结果
+    # =========================================================
     output = dict()
-    output["mean_psnr"] = float(np.mean(psnr_array))
-    output["mean_ssim"] = float(np.mean(ssim_array))
-    output["mean_lpips"] = float(np.mean(lpips_array))
-    # 【新增】：保存深度误差
-    output["mean_depth_l1"] = float(np.mean(depth_l1_array)) if len(depth_l1_array) > 0 else 0.0
+    output["mean_psnr"] = float(np.mean(nvs_psnr_array)) if len(nvs_psnr_array) > 0 else 0.0
+    output["mean_ssim"] = float(np.mean(nvs_ssim_array)) if len(nvs_ssim_array) > 0 else 0.0
+    output["mean_lpips"] = float(np.mean(nvs_lpips_array)) if len(nvs_lpips_array) > 0 else 0.0
+    output["mean_depth_l1"] = float(np.mean(all_depth_l1_array)) if len(all_depth_l1_array) > 0 else 0.0
 
-    # 【修改】：在终端打印日志时，附加上 Depth L1
     Log(
-        f'mean psnr: {output["mean_psnr"]:.4f}, ssim: {output["mean_ssim"]:.4f}, lpips: {output["mean_lpips"]:.4f}, depth_l1: {output["mean_depth_l1"]:.4f}m',
+        f'NVS psnr: {output["mean_psnr"]:.4f}, ssim: {output["mean_ssim"]:.4f}, lpips: {output["mean_lpips"]:.4f} | ALL depth_l1: {output["mean_depth_l1"]:.4f}m',
         tag="Eval",
     )
 
@@ -208,6 +266,11 @@ def eval_rendering(
         open(os.path.join(psnr_save_dir, "final_result.json"), "w", encoding="utf-8"),
         indent=4,
     )
+
+    if is_final_eval:
+        with open(os.path.join(mesh_render_dir, "render_poses.json"), "w") as f:
+            json.dump(render_poses_dict, f, indent=4)
+
     return output
 
 
