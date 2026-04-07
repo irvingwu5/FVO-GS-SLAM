@@ -31,6 +31,41 @@ from utils.loop_closure import LoopClosureProcess
 from utils.loop_closure import rigid_transform_2dgs
 from utils.pose_utils import update_pose
 import glob
+import threading
+import subprocess
+import time
+
+class GPUMemoryMonitor:
+    def __init__(self, physical_gpu_id=0):
+        self.keep_measuring = True
+        self.peak_memory = 0
+        self.physical_gpu_id = physical_gpu_id
+        self.thread = threading.Thread(target=self.measure_usage)
+
+    def measure_usage(self):
+        while self.keep_measuring:
+            try:
+                # 调用系统底层的 nvidia-smi 获取最真实的物理显存占用
+                result = subprocess.check_output(
+                    [
+                        'nvidia-smi', f'--id={self.physical_gpu_id}',
+                        '--query-gpu=memory.used',
+                        '--format=csv,nounits,noheader'
+                    ], encoding='utf-8')
+                current_mem = int(result.strip())
+                if current_mem > self.peak_memory:
+                    self.peak_memory = current_mem
+            except Exception:
+                pass
+            time.sleep(0.2)  # 每 0.2 秒高频采样一次
+
+    def start(self):
+        self.thread.start()
+
+    def stop(self):
+        self.keep_measuring = False
+        self.thread.join()
+        return self.peak_memory
 
 class SLAM:
     def __init__(self, config, save_dir=None):
@@ -218,28 +253,36 @@ class SLAM:
             if not np.allclose(correct_tsfm, np.eye(4), atol=1e-4):
                 gp = rigid_transform_2dgs(gp, correct_tsfm)
 
-            merged_params["_xyz"].append(gp["_xyz"])
-            merged_params["_features_dc"].append(gp["_features_dc"])
-            merged_params["_features_rest"].append(gp["_features_rest"])
-            merged_params["_scaling"].append(gp["_scaling"])
-            merged_params["_rotation"].append(gp["_rotation"])
-            merged_params["_opacity"].append(gp["_opacity"])
+            # ==============================================================
+            # 【显存修复 1：用完即焚，踢回 CPU】
+            # 防止所有的子图在 GPU 显存里“大团圆”导致绝杀 OOM。
+            # 将它们缓存到 CPU 列表里，组装完了再送去 GPU。
+            # ==============================================================
+            merged_params["_xyz"].append(gp["_xyz"].detach().cpu())
+            merged_params["_features_dc"].append(gp["_features_dc"].detach().cpu())
+            merged_params["_features_rest"].append(gp["_features_rest"].detach().cpu())
+            merged_params["_scaling"].append(gp["_scaling"].detach().cpu())
+            merged_params["_rotation"].append(gp["_rotation"].detach().cpu())
+            merged_params["_opacity"].append(gp["_opacity"].detach().cpu())
             if "_normal" in gp:
                 has_normal = True
                 if "_normal" not in merged_params: merged_params["_normal"] = []
-                merged_params["_normal"].append(gp["_normal"])
+                merged_params["_normal"].append(gp["_normal"].detach().cpu())
+
+            # 手动销毁当前循环的字典，及时腾出显存
+            del gp, ckpt
 
         if len(merged_params["_xyz"]) > 0:
             import torch.nn as nn
-            # 彻底重建全局高斯模型
-            self.gaussians._xyz = nn.Parameter(torch.cat(merged_params["_xyz"], dim=0))
-            self.gaussians._features_dc = nn.Parameter(torch.cat(merged_params["_features_dc"], dim=0))
-            self.gaussians._features_rest = nn.Parameter(torch.cat(merged_params["_features_rest"], dim=0))
-            self.gaussians._scaling = nn.Parameter(torch.cat(merged_params["_scaling"], dim=0))
-            self.gaussians._rotation = nn.Parameter(torch.cat(merged_params["_rotation"], dim=0))
-            self.gaussians._opacity = nn.Parameter(torch.cat(merged_params["_opacity"], dim=0))
+            # 彻底重建全局高斯模型，在 CPU 上拼接 (cat) 后，最后统一 .cuda() 送回显存
+            self.gaussians._xyz = nn.Parameter(torch.cat(merged_params["_xyz"], dim=0).cuda())
+            self.gaussians._features_dc = nn.Parameter(torch.cat(merged_params["_features_dc"], dim=0).cuda())
+            self.gaussians._features_rest = nn.Parameter(torch.cat(merged_params["_features_rest"], dim=0).cuda())
+            self.gaussians._scaling = nn.Parameter(torch.cat(merged_params["_scaling"], dim=0).cuda())
+            self.gaussians._rotation = nn.Parameter(torch.cat(merged_params["_rotation"], dim=0).cuda())
+            self.gaussians._opacity = nn.Parameter(torch.cat(merged_params["_opacity"], dim=0).cuda())
             if has_normal:
-                self.gaussians._normal = nn.Parameter(torch.cat(merged_params["_normal"], dim=0))
+                self.gaussians._normal = nn.Parameter(torch.cat(merged_params["_normal"], dim=0).cuda())
 
             self.gaussians.active_sh_degree = self.gaussians.max_sh_degree
 
@@ -309,26 +352,7 @@ class SLAM:
             # 4.2 真正对全局地图执行 Global Bundle Adjustment (画质精修 + 几何缝合 + 位姿微调)
             Log("==> 开始全局大地图联合优化 (Global BA & Color Refinement)... <==")
 
-            # 【修复警告】：直接将所有前端相机列表赋值给 valid_cameras
             valid_cameras = list(self.frontend.cameras.values())
-
-            if len(valid_cameras) > 0:
-                # =========================================================
-                # 【优化版：使用 CPU 锁页内存 (Pin Memory) 彻底消除 I/O 瓶颈】
-                # 将所有图像缓存在系统主存中，既不撑爆显存，又能实现极速读取
-                # =========================================================
-                Log("==> 预加载 GT 图像至 CPU 主存，加速训练流... <==")
-                cpu_image_cache = {}
-                for cam in tqdm(valid_cameras, desc="Caching to CPU RAM"):
-                    try:
-                        gt_image_raw, _, _, _, _ = self.dataset[cam.uid]
-                        # 存放在 CPU，并启用 pin_memory 极大加速 CPU -> GPU 的拷贝速度
-                        cpu_image_cache[cam.uid] = gt_image_raw.cpu().pin_memory()
-                    except Exception as e:
-                        pass
-
-                # 过滤掉因为某种原因读取失败的相机
-                valid_cameras = [cam for cam in valid_cameras if cam.uid in cpu_image_cache]
 
             if len(valid_cameras) > 0:
                 self.gaussians.training_setup(self.opt_params)
@@ -374,56 +398,98 @@ class SLAM:
 
                 global_cam_optimizer = torch.optim.Adam(opt_params_cams)
 
-                # 【核心加速点 1：将迭代次数降为 10000】
-                iteration_total = 20000
-                for iteration in tqdm(range(1, iteration_total + 1)):
-                    viewpoint_cam = random.choice(valid_cameras)
+                # =========================================================
+                # 【终极形态：Epoch轮回分块缓存 (Epoch-based Chunked Caching)】
+                # 彻底解决局部遗忘（缺失半个房间）和 RAM 爆炸问题
+                # =========================================================
+                iteration_total = 26000
+                chunk_size = 400  # 每次最多塞 400 张图（约 4GB 内存，极度安全且兼顾 I/O）
+                iters_per_chunk = 1000  # 每个 Chunk 局部优化 1000 次（每张图复用 2.5 次）
 
-                    render_pkg = render(
-                        viewpoint_cam, self.gaussians, self.pipeline_params, self.background, surf=False
-                    )
-                    image = render_pkg["render"]
-                    visibility_filter = render_pkg["visibility_filter"]
-                    radii = render_pkg["radii"]
+                current_global_iter = 1
+                pbar = tqdm(total=iteration_total, desc="Global BA (Epoch Mode)")
 
-                    # =========================================================
-                    # 【核心加速点 2：从系统主存异步提取数据至显存】
-                    # non_blocking=True 允许 CPU 向 GPU 发送数据的同时执行计算
-                    # =========================================================
-                    gt_image = cpu_image_cache[viewpoint_cam.uid].cuda(non_blocking=True)
+                import copy
 
-                    Ll1 = l1_loss(image, gt_image)
-                    loss = (1.0 - self.opt_params.lambda_dssim) * Ll1 + self.opt_params.lambda_dssim * (
-                            1.0 - ssim(image.unsqueeze(0), gt_image.unsqueeze(0)))
+                while current_global_iter <= iteration_total:
+                    # 1. 每一轮 Epoch，打乱全局相机，保证空间随机性
+                    shuffled_cameras = copy.copy(valid_cameras)
+                    random.shuffle(shuffled_cameras)
 
-                    loss.backward()
-                    with torch.no_grad():
-                        self.gaussians.max_radii2D[visibility_filter] = torch.max(
-                            self.gaussians.max_radii2D[visibility_filter], radii[visibility_filter]
-                        )
-                        self.gaussians.optimizer.step()
-                        self.gaussians.optimizer.zero_grad(set_to_none=True)
-                        self.gaussians.update_learning_rate(iteration)
+                    # 2. 将打乱后的相机切分为多个 Chunk
+                    camera_chunks = [shuffled_cameras[i:i + chunk_size] for i in
+                                     range(0, len(shuffled_cameras), chunk_size)]
 
-                        global_cam_optimizer.step()
-                        global_cam_optimizer.zero_grad(set_to_none=True)
+                    for chunk_idx, cam_chunk in enumerate(camera_chunks):
+                        if current_global_iter > iteration_total:
+                            break
 
-                        update_pose(viewpoint_cam)
+                        # 3. 预加载当前 Chunk 到内存
+                        cpu_image_cache = {}
+                        for cam in cam_chunk:
+                            try:
+                                gt_image_raw, _, _, _, _ = self.dataset[cam.uid]
+                                cpu_image_cache[cam.uid] = gt_image_raw.cpu().pin_memory()
+                            except Exception:
+                                pass
 
-                        if iteration % 100 == 0:
-                            lr_factor = (0.01 ** (1.0 / (iteration_total / 100)))
-                            for param_group in global_cam_optimizer.param_groups:
-                                param_group['lr'] *= lr_factor
+                        valid_cam_chunk = [cam for cam in cam_chunk if cam.uid in cpu_image_cache]
+                        if not valid_cam_chunk:
+                            continue
 
-                        # 【核心加速点 3：透明度重置提前到第 1500 步】
-                        #if iteration == 1500:
-                        if iteration == 3000:
-                            Log("==> 执行全局透明度重置，零代价清洗浮游点与重影... <==")
-                            self.gaussians.reset_opacity()
+                        # 动态计算当前 Chunk 需要执行的迭代步数 (防止最后一块太小导致过拟合)
+                        current_iters = int(iters_per_chunk * (len(valid_cam_chunk) / chunk_size))
+                        current_iters = max(1, current_iters)
+                        current_iters = min(current_iters, iteration_total - current_global_iter + 1)
 
-                    # 释放显存引用，防止每一步累积
-                    del gt_image
+                        # 4. 执行局部精修
+                        for _ in range(current_iters):
+                            viewpoint_cam = random.choice(valid_cam_chunk)
 
+                            render_pkg = render(
+                                viewpoint_cam, self.gaussians, self.pipeline_params, self.background, surf=False
+                            )
+                            image = render_pkg["render"]
+                            visibility_filter = render_pkg["visibility_filter"]
+                            radii = render_pkg["radii"]
+
+                            # 从缓存中极速提取
+                            gt_image = cpu_image_cache[viewpoint_cam.uid].cuda(non_blocking=True)
+
+                            Ll1 = l1_loss(image, gt_image)
+                            loss = (1.0 - self.opt_params.lambda_dssim) * Ll1 + self.opt_params.lambda_dssim * (
+                                    1.0 - ssim(image.unsqueeze(0), gt_image.unsqueeze(0)))
+
+                            loss.backward()
+                            with torch.no_grad():
+                                self.gaussians.max_radii2D[visibility_filter] = torch.max(
+                                    self.gaussians.max_radii2D[visibility_filter], radii[visibility_filter]
+                                )
+                                self.gaussians.optimizer.step()
+                                self.gaussians.optimizer.zero_grad(set_to_none=True)
+                                self.gaussians.update_learning_rate(current_global_iter)
+
+                                global_cam_optimizer.step()
+                                global_cam_optimizer.zero_grad(set_to_none=True)
+
+                                update_pose(viewpoint_cam)
+
+                                # 学习率平滑衰减
+                                if current_global_iter % 100 == 0:
+                                    lr_factor = (0.01 ** (1.0 / (iteration_total / 100)))
+                                    for param_group in global_cam_optimizer.param_groups:
+                                        param_group['lr'] *= lr_factor
+
+                            del gt_image
+                            current_global_iter += 1
+                            pbar.update(1)
+
+                        # 5. 💣 用完即焚：清理内存，迎接下一个 Chunk
+                        del cpu_image_cache
+                        import gc
+                        gc.collect()
+
+                pbar.close()
                 Log("==> 全局大地图联合优化缝合完成！ <==")
             else:
                 Log("[Warning] 没有找到有效的图像缓存，跳过全局画质精修。")
@@ -520,22 +586,38 @@ if __name__ == "__main__":
         )
         wandb.define_metric("frame_idx")
         wandb.define_metric("ate*", step_metric="frame_idx")
+    # =========================================================================
+    # 【核心新增】：启动全局物理显存监控
+    # 注意：如果你用 CUDA_VISIBLE_DEVICES=1 启动，这里的 physical_gpu_id 就是 1
+    # 可以通过 os.environ 自动获取当前映射的物理 GPU ID
+    # =========================================================================
+    gpu_id_str = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+    # 如果有多个，取第一个
+    physical_gpu_id = int(gpu_id_str.split(',')[0])
+
+    mem_monitor = GPUMemoryMonitor(physical_gpu_id=physical_gpu_id)
+    mem_monitor.start()
+    Log(f"Started tracking physical GPU {physical_gpu_id} memory...")
     # 整个SLAM系统作为一个类实现在SLAM.py中，而且在__init__()的时候就运行了所有的线程：gui_process、frontend_process、backend_process
     slam = SLAM(config, save_dir=save_dir)
 
     slam.run()
     # =========================================================================
-    # 【新增】：学术级指标统计 (Peak GPU Memory & Map Size)
+    # 【修改】：学术级指标统计 (Peak GPU Memory & Map Size)
     # =========================================================================
     if save_dir is not None:
-        # 1. 统计峰值显存 (Peak GPU Memory)
-        # 获取自程序运行以来，由 PyTorch 分配的最大 GPU 显存 (单位: MB)
-        peak_memory_mb = torch.cuda.max_memory_allocated(device="cuda") / (1024 * 1024)
-        Log(f"Peak GPU Memory: {peak_memory_mb:.2f} MB", tag="Eval")
+        # 1. 停止监控并获取物理真实的 Peak GPU Memory
+        real_peak_memory_mb = mem_monitor.stop()
+
+        # 为了论文的严谨性，你可以同时把两个指标都打出来：
+        # - Allocated Peak: 算法理论极限（不含进程开销，供消融实验参考）
+        # - System Peak: 真实物理峰值（写在论文主表格里的数据）
+        algo_allocated_mb = torch.cuda.max_memory_allocated(device="cuda") / (1024 * 1024)
+
+        Log(f"🎯 Algorithm Allocated Peak: {algo_allocated_mb:.2f} MB", tag="Eval")
+        Log(f"🎯 System Physical Peak (Paper Metric): {real_peak_memory_mb:.2f} MB", tag="Eval")
 
         # 2. 统计地图大小 (Map Size)
-        # 寻找全局联合优化后保存的最终点云文件 (.ply)
-        # 显式使用 str(save_dir) 消除 IDE 类型检查警告
         final_ply_path = os.path.join(
             str(save_dir),
             "point_cloud",

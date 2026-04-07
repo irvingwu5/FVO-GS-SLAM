@@ -231,6 +231,340 @@ class BackEnd(mp.Process):
     渲染与损失计算: 渲染选定视角的图像，计算渲染图与真实图像的损失（get_loss_mapping，包含 L1 loss 和 SSIM loss），以及各项同性正则化损失（Isotropic loss）。
     参数更新: 利用 PyTorch 的自动微分，同时更新 GaussianModel 参数（位置、颜色、协方差等）和 关键帧位姿参数（update_pose）。这里的位姿优化相当于后端 BA（Bundle Adjustment）。
     '''
+    # def map(self, current_window, prune=False, iters=1):
+    #     if len(current_window) == 0:
+    #         return
+    #
+    #     viewpoint_stack = [self.viewpoints[kf_idx] for kf_idx in current_window]
+    #     random_viewpoint_stack = []
+    #
+    #     current_window_set = set(current_window)
+    #     for cam_idx, viewpoint in self.viewpoints.items(): #遍历窗口内所有关键帧
+    #         if cam_idx in current_window_set: #跳过当前窗口内的帧
+    #             continue
+    #         random_viewpoint_stack.append(viewpoint) #其余帧加入随机采样列表
+    #
+    #     # 获取当前窗口中最新的帧的索引（假设 current_window 是按时间顺序排列的）
+    #     # 通常 current_window[-1] 是最新的帧
+    #     for itr in range(iters):
+    #         self.iteration_count += 1
+    #         self.last_sent += 1
+    #         # 【新增】：计算衰减因子，从 1.0 线性衰减到 0.1
+    #         progress = itr / float(iters)
+    #         decay_factor = 1.0 - 0.9 * progress
+    #         loss_mapping = 0
+    #         viewspace_point_tensor_acm = []
+    #         visibility_filter_acm = []
+    #         radii_acm = []
+    #         n_touched_acm = []
+    #         keyframes_opt = []
+    #         # 对多帧渲染计算联合损失，对当前滑动窗口内的关键帧进行优化
+    #         # current_window 通常是 [oldest, ..., newest]
+    #         for i in range(len(current_window)):
+    #             viewpoint = viewpoint_stack[i]
+    #             keyframes_opt.append(viewpoint)
+    #
+    #             render_pkg = render(
+    #                 viewpoint, self.gaussians, self.pipeline_params, self.background,surf=False
+    #             )
+    #             # 解包数据 (注意：如果 surf=False，rend_normal/dist 会是 None 或无效值)
+    #             (
+    #                 image,
+    #                 viewspace_point_tensor,
+    #                 visibility_filter,
+    #                 radii,
+    #                 depth,
+    #                 opacity,
+    #                 n_touched,
+    #             ) = (
+    #                 render_pkg["render"],
+    #                 render_pkg["viewspace_points"],
+    #                 render_pkg["visibility_filter"],
+    #                 render_pkg["radii"],
+    #                 render_pkg["depth"],
+    #                 render_pkg["opacity"],
+    #                 render_pkg["n_touched"],
+    #             )
+    #             #_save_normal_pair(render_pkg, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/runtime_results/", cam_idx)
+    #             #_save_rendered_rgb(render_pkg, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/runtime_results/", cam_idx)
+    #             loss_mapping += get_loss_mapping(
+    #                 self.config, image, depth, viewpoint, opacity
+    #             ) #0.2503
+    #             # =========================================================
+    #             # 2DGS 专属损失 1: 深度失真损失 (Depth Distortion Loss)
+    #             # =========================================================
+    #             # 你的 diff-surfel-rasterization 渲染器在 surf=False/True 时，
+    #             # 通常会返回渲染过程中的 distortion 值。
+    #             # if self.use_distortion_loss and "rend_dist" in render_pkg:
+    #             #     distortion_loss = render_pkg["rend_dist"].mean() #1.0811e-05、6.0331e-06
+    #             #     # 权重通常设为 1000 到 3000，具体取决于场景尺度
+    #             #     lambda_dist = self.config.get("opt_params", {}).get("lambda_dist", 10.0)
+    #             #     #loss_mapping += lambda_dist * distortion_loss
+    #             #     loss_mapping += (lambda_dist * decay_factor) * distortion_loss
+    #             #
+    #             # if self.use_surf_normal and "surf_normal" in render_pkg:
+    #             #     normal_consistency_loss = get_normal_consistency_loss(render_pkg) #0.7075
+    #             #     lambda_surf_normal = self.config.get("opt_params", {}).get("lambda_surf_normal", 0.001)
+    #             #     loss_mapping += lambda_surf_normal * normal_consistency_loss
+    #
+    #             if self.use_external_normal and viewpoint.normal is not None:
+    #                 rend_normal = render_pkg["rend_normal"]
+    #                 rend_normal = F.normalize(rend_normal, p=2, dim=0)
+    #                 depth_pixel_mask = (viewpoint.gt_depth > 0.01).view(*depth.shape)
+    #                 # ==========================================
+    #                 # 模式 1: 纯传感器法线 (Sensor only)
+    #                 # ==========================================
+    #                 if self.normal_mode == "sensor":
+    #                     # 获取传感器法线并转到世界坐标系
+    #                     sensor_normal = viewpoint.normal
+    #                     # 注意：这里假设 viewpoint.T 是 World2Cam，具体转换需根据你的坐标系定义确认
+    #                     gt_normal = (viewpoint.T[0:3, 0:3].T @ sensor_normal.view(3, -1)).view(
+    #                         image.shape[0], image.shape[1], image.shape[2]
+    #                     )
+    #                     #_save_gt_normal(gt_normal, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/", viewpoint.uid)
+    #                     #_save_gt_normal(rend_normal,"/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid, "rend")
+    #                     # --- 新增：保存箭头图 ---
+    #                     #quiver_save_dir = "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/quivers/"
+    #                     #os.makedirs(quiver_save_dir, exist_ok=True)
+    #                     #save_normal_as_quiver(gt_normal, os.path.join(quiver_save_dir, f"gt_{viewpoint.uid}.png"))
+    #                     # 保存渲染结果的箭头图
+    #                     #save_normal_as_quiver(rend_normal, os.path.join(quiver_save_dir, f"rend_{viewpoint.uid}.png"))
+    #                     #normal_mask = gt_normal > 0
+    #                     #normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask * normal_mask).sum(dim=0))[None].mean() #0.9128
+    #                     normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean() #0.6932
+    #                     loss_mapping += (self.config["opt_params"]["lambda_sensor_normal"]  * normal_error)
+    #             # if self.use_plane_constraint:
+    #             #     proj_loss = get_loss_mapping_plane_constraint(self.gaussians, viewpoint, 'huber')  #0.0001、9.5036e-05、
+    #             #     loss_mapping += self.config["opt_params"]["lambda_plane"]*decay_factor * proj_loss
+    #
+    #             viewspace_point_tensor_acm.append(viewspace_point_tensor)
+    #             visibility_filter_acm.append(visibility_filter)
+    #             radii_acm.append(radii)
+    #             n_touched_acm.append(n_touched)
+    #
+    #         # 随机选取的历史关键帧进行迭代优化
+    #         for cam_idx in torch.randperm(len(random_viewpoint_stack))[:2]:
+    #             viewpoint = random_viewpoint_stack[cam_idx]
+    #             render_pkg = render(
+    #                 viewpoint, self.gaussians, self.pipeline_params, self.background, surf=False
+    #             )
+    #             (
+    #                 image,
+    #                 viewspace_point_tensor,
+    #                 visibility_filter,
+    #                 radii,
+    #                 depth,
+    #                 opacity,
+    #                 n_touched,
+    #             ) = (
+    #                 render_pkg["render"],
+    #                 render_pkg["viewspace_points"],
+    #                 render_pkg["visibility_filter"],
+    #                 render_pkg["radii"],
+    #                 render_pkg["depth"],
+    #                 render_pkg["opacity"],
+    #                 render_pkg["n_touched"],
+    #             )
+    #             loss_mapping += get_loss_mapping(
+    #                 self.config, image, depth, viewpoint, opacity
+    #             )
+    #             viewspace_point_tensor_acm.append(viewspace_point_tensor)
+    #             visibility_filter_acm.append(visibility_filter)
+    #             radii_acm.append(radii)
+    #
+    #         # =========================================================
+    #         # [位置 2] 各向同性/标度损失 (Isotropic Loss) 放在这里！
+    #         # 原因：
+    #         # 1. 这是对高斯球本身的形状做正则化 (self.gaussians)，是全局的。
+    #         # 2. 它不依赖于具体的相机视角 (Viewpoint)。
+    #         # 3. 如果在循环内计算，会导致每次渲染一个帧就加一次 loss，导致权重翻倍，梯度爆炸。
+    #         # =========================================================
+    #         # scaling = self.gaussians.get_scaling
+    #         # isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
+    #         # loss_mapping += 10 * isotropic_loss.mean() #0.1*0.0024=0.00024
+    #         # -----------------------------------------------
+    #         # if self.use_external_normal and viewpoint.normal is not None and itr == 0:
+    #         #     rend_normal = render_pkg["rend_normal"]
+    #         #     #rend_normal = F.normalize(rend_normal, p=2, dim=0)
+    #         #     depth_pixel_mask = (viewpoint.gt_depth > 0.01).view(*depth.shape)
+    #         #     # ==========================================
+    #         #     # 模式 1: 纯传感器法线 (Sensor only)
+    #         #     # ==========================================
+    #         #     if self.normal_mode == "sensor":
+    #         #         # 获取传感器法线并转到世界坐标系
+    #         #         sensor_normal = viewpoint.normal
+    #         #         # 注意：这里假设 viewpoint.T 是 World2Cam，具体转换需根据你的坐标系定义确认
+    #         #         gt_normal = (viewpoint.T[0:3, 0:3].T @ sensor_normal.view(3, -1)).view(
+    #         #             image.shape[0], image.shape[1], image.shape[2]
+    #         #         )
+    #         #         #_save_gt_normal(gt_normal, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/", viewpoint.uid)
+    #         #         #_save_gt_normal(rend_normal,"/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid, "rend")
+    #         #         # --- 新增：保存箭头图 ---
+    #         #         #quiver_save_dir = "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/quivers/"
+    #         #         #os.makedirs(quiver_save_dir, exist_ok=True)
+    #         #         #save_normal_as_quiver(gt_normal, os.path.join(quiver_save_dir, f"gt_{viewpoint.uid}.png"))
+    #         #         # 保存渲染结果的箭头图
+    #         #         #save_normal_as_quiver(rend_normal, os.path.join(quiver_save_dir, f"rend_{viewpoint.uid}.png"))
+    #         #         #normal_mask = gt_normal > 0
+    #         #         #normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask * normal_mask).sum(dim=0))[None].mean() #0.9128
+    #         #         normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()
+    #         #         loss_mapping += (self.config["opt_params"]["lambda_sensor_normal"] * normal_error)
+    #         #     # ==========================================
+    #         #     # 模式 2: 纯平面先验 (Plane only)
+    #         #     # ==========================================
+    #         #     elif self.normal_mode == "plane":
+    #         #         # 1. 获取世界坐标系下的 GT 法线和平面 Mask
+    #         #         gt_normal_world, plane_mask = build_plane_normal_gt(viewpoint,config=self.config)
+    #         #
+    #         #         # 2. 组合 Mask（假设 depth_pixel_mask 也是 [1, H, W] 的 bool/float 张量）
+    #         #         # 仅在同时具有深度 valid 且属于平面的像素上计算 loss
+    #         #         valid_mask = plane_mask & (depth_pixel_mask.bool())
+    #         #         _save_gt_normal(gt_normal_world, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/", viewpoint.uid)
+    #         #         _save_gt_normal(rend_normal,"/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid, "rend")
+    #         #         if valid_mask.sum() > 0:
+    #         #             # 3. 计算余弦相似度 (渲染法线与GT法线点乘)
+    #         #             # rend_normal: [3, H, W], gt_normal_world: [3, H, W]
+    #         #             # cosine_sim shape: [1, H, W]
+    #         #             cosine_sim = (rend_normal * gt_normal_world).sum(dim=0, keepdim=True)
+    #         #
+    #         #             # 4. 仅在 valid_mask 区域内计算 normal_error = 1 - cos(theta)
+    #         #             # 只取有效区域进行 mean，防止背景的大量 0 拉低了 loss 从而产生错误梯度
+    #         #             # 只要法线平行（共线），不管是同向还是反向，Loss 都会接近 0
+    #         #             normal_error = (1.0 - cosine_sim.abs())[valid_mask].mean()
+    #         #
+    #         #             # 5. 累加 Loss
+    #         #             loss_mapping += (self.config["opt_params"]["lambda_normal"] * normal_error)
+    #         #     # ==========================================
+    #         #     # 模式 3: 混合监督 (Mixed)
+    #         #     # ==========================================
+    #         #     elif self.normal_mode == "mixed":
+    #         #         # 假设 build_combined_normal_gt 内部处理了传感器法线与平面的融合，并返回世界坐标系法线
+    #         #         gt_normal = build_combined_normal_gt(viewpoint)
+    #         #         #_save_gt_normal(gt_normal, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid)
+    #         #         #_save_gt_normal(rend_normal,"/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid, "rend")
+    #         #         #check_normal_dir(rend_normal, gt_normal)
+    #         #         normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()  # 0.6849
+    #         #         loss_mapping += (self.config["opt_params"]["lambda_normal"] * normal_error)
+    #         #
+    #         # if self.use_plane_constraint:
+    #         #     proj_loss = get_loss_mapping_plane_constraint(self.gaussians, viewpoint,'huber') #5.3299e-05
+    #         #     loss_mapping += self.config["opt_params"]["lambda_plane"] * proj_loss
+    #
+    #         loss_mapping.backward()
+    #         gaussian_split = False
+    #         ## Deinsifying / Pruning Gaussians高斯密度自适应控制模块
+    #         # 该模块负责动态调整高斯球的数量和分布，以适应场景的几何细节
+    #         with torch.no_grad():
+    #             self.occ_aware_visibility = {}
+    #             for idx in range((len(current_window))):
+    #                 kf_idx = current_window[idx]
+    #                 n_touched = n_touched_acm[idx]
+    #                 self.occ_aware_visibility[kf_idx] = (n_touched > 0).long()
+    #
+    #             # # compute the visibility of the gaussians
+    #             # # Only prune on the last iteration and when we have full window
+    #             # 可见性修剪: 统计高斯球被观测的次数 (n_obs)。
+    #             # 在 prune_mode="slam" 模式下，移除观测次数过少（n_obs <= 3）且不稳定的高斯球，去除噪声
+    #             if prune:
+    #                 if len(current_window) == self.config["Training"]["window_size"]:
+    #                     prune_mode = self.config["Training"]["prune_mode"]
+    #                     prune_coviz = 3
+    #                     self.gaussians.n_obs.fill_(0)
+    #                     for window_idx, visibility in self.occ_aware_visibility.items():
+    #                         self.gaussians.n_obs += visibility.cpu()
+    #                     to_prune = None
+    #                     if prune_mode == "odometry":
+    #                         to_prune = self.gaussians.n_obs < 3
+    #                         # make sure we don't split the gaussians, break here.
+    #                     if prune_mode == "slam":
+    #                         # only prune keyframes which are relatively new
+    #                         sorted_window = sorted(current_window, reverse=True)
+    #                         mask = self.gaussians.unique_kfIDs >= sorted_window[2]
+    #                         if not self.initialized:
+    #                             mask = self.gaussians.unique_kfIDs >= 0
+    #                         to_prune = torch.logical_and(
+    #                             self.gaussians.n_obs <= prune_coviz, mask
+    #                         )
+    #                     if to_prune is not None and self.monocular:
+    #                         self.gaussians.prune_points(to_prune.cuda())
+    #                         for idx in range((len(current_window))):
+    #                             current_idx = current_window[idx]
+    #                             self.occ_aware_visibility[current_idx] = (
+    #                                 self.occ_aware_visibility[current_idx][~to_prune]
+    #                             )
+    #                     if not self.initialized:
+    #                         self.initialized = True
+    #                         Log("Initialized SLAM")
+    #                     # # make sure we don't split the gaussians, break here.
+    #                 return False
+    #
+    #             for idx in range(len(viewspace_point_tensor_acm)):
+    #                 self.gaussians.max_radii2D[visibility_filter_acm[idx]] = torch.max(
+    #                     self.gaussians.max_radii2D[visibility_filter_acm[idx]],
+    #                     radii_acm[idx][visibility_filter_acm[idx]],
+    #                 )
+    #                 self.gaussians.add_densification_stats(
+    #                     viewspace_point_tensor_acm[idx], visibility_filter_acm[idx]
+    #                 )
+    #
+    #             update_gaussian = (
+    #                 self.iteration_count % self.gaussian_update_every
+    #                 == self.gaussian_update_offset
+    #             ) #同余条件,固定周期带偏移，every=N,offset=m,则在m,m+N,m+2N,...迭代执行高斯更新
+    #             if update_gaussian:
+    #                 self.gaussians.densify_and_prune(
+    #                     self.opt_params.densify_grad_threshold,
+    #                     self.gaussian_th,
+    #                     self.gaussian_extent,
+    #                     self.size_threshold,
+    #                 )
+    #                 gaussian_split = True
+    #
+    #             ## Opacity reset
+    #             # 不透明度重置: 定期调用 reset_opacity 或 reset_opacity_nonvisible，
+    #             # 将高斯不透明度重置为低值。这有助于去除错误的“漂浮物”并重新收敛几何结构
+    #             if (self.iteration_count % self.gaussian_reset) == 0 and (
+    #                 not update_gaussian
+    #             ):
+    #                 Log("Resetting the opacity of non-visible Gaussians")
+    #                 self.gaussians.reset_opacity_nonvisible(visibility_filter_acm)
+    #                 gaussian_split = True
+    #
+    #             self.gaussians.optimizer.step()
+    #             self.gaussians.optimizer.zero_grad(set_to_none=True)
+    #             self.gaussians.update_learning_rate(self.iteration_count)
+    #             self.keyframe_optimizers.step()
+    #             self.keyframe_optimizers.zero_grad(set_to_none=True)
+    #             # # Pose update 只更新位姿优化窗口内的相机位姿
+    #             # for cam_idx in range(min(frames_to_optimize, len(current_window))): #min(3,2)[5,0]
+    #             #     viewpoint = viewpoint_stack[cam_idx]
+    #             #     if viewpoint.uid == 0: #世界坐标系/第一帧位姿固定不变
+    #             #         continue
+    #             #     update_pose(viewpoint)
+    #             # --- 修改重点 ---
+    #             # 只有在优化器被初始化后才执行 step
+    #             if self.keyframe_optimizers is not None:
+    #                 self.gaussians.optimizer.step()
+    #                 self.gaussians.optimizer.zero_grad(set_to_none=True)
+    #                 self.gaussians.update_learning_rate(self.iteration_count)
+    #
+    #                 # 执行位姿和曝光优化
+    #                 self.keyframe_optimizers.step()
+    #                 self.keyframe_optimizers.zero_grad(set_to_none=True)
+    #
+    #                 # 更新相机位姿
+    #                 frames_to_optimize = self.config["Training"]["pose_window"]
+    #                 for cam_idx in range(min(frames_to_optimize, len(current_window))):
+    #                     viewpoint = viewpoint_stack[cam_idx]
+    #                     if viewpoint.uid == 0:
+    #                         continue
+    #                     update_pose(viewpoint)
+    #             else:
+    #                 # 如果没有位姿优化器（处于切图间隙），只更新高斯模型本身
+    #                 self.gaussians.optimizer.step()
+    #                 self.gaussians.optimizer.zero_grad(set_to_none=True)
+    #                 self.gaussians.update_learning_rate(self.iteration_count)
+    #     return gaussian_split
     def map(self, current_window, prune=False, iters=1):
         if len(current_window) == 0:
             return
@@ -239,35 +573,36 @@ class BackEnd(mp.Process):
         random_viewpoint_stack = []
 
         current_window_set = set(current_window)
-        for cam_idx, viewpoint in self.viewpoints.items(): #遍历窗口内所有关键帧
-            if cam_idx in current_window_set: #跳过当前窗口内的帧
+        for cam_idx, viewpoint in self.viewpoints.items():  # 遍历窗口内所有关键帧
+            if cam_idx in current_window_set:  # 跳过当前窗口内的帧
                 continue
-            random_viewpoint_stack.append(viewpoint) #其余帧加入随机采样列表
+            random_viewpoint_stack.append(viewpoint)  # 其余帧加入随机采样列表
 
-        # 获取当前窗口中最新的帧的索引（假设 current_window 是按时间顺序排列的）
-        # 通常 current_window[-1] 是最新的帧
+        # 获取当前窗口中最新的帧的索引
         for itr in range(iters):
             self.iteration_count += 1
             self.last_sent += 1
             # 【新增】：计算衰减因子，从 1.0 线性衰减到 0.1
             progress = itr / float(iters)
             decay_factor = 1.0 - 0.9 * progress
-            loss_mapping = 0
+
+            # 🔴 修改点 1：删除原有的 loss_mapping = 0，不再将多帧 loss 拼接成一个巨大的计算图
+
             viewspace_point_tensor_acm = []
             visibility_filter_acm = []
             radii_acm = []
             n_touched_acm = []
             keyframes_opt = []
+
             # 对多帧渲染计算联合损失，对当前滑动窗口内的关键帧进行优化
-            # current_window 通常是 [oldest, ..., newest]
             for i in range(len(current_window)):
                 viewpoint = viewpoint_stack[i]
                 keyframes_opt.append(viewpoint)
 
                 render_pkg = render(
-                    viewpoint, self.gaussians, self.pipeline_params, self.background,surf=False
+                    viewpoint, self.gaussians, self.pipeline_params, self.background, surf=False
                 )
-                # 解包数据 (注意：如果 surf=False，rend_normal/dist 会是 None 或无效值)
+                # 解包数据
                 (
                     image,
                     viewspace_point_tensor,
@@ -285,57 +620,45 @@ class BackEnd(mp.Process):
                     render_pkg["opacity"],
                     render_pkg["n_touched"],
                 )
-                #_save_normal_pair(render_pkg, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/runtime_results/", cam_idx)
-                #_save_rendered_rgb(render_pkg, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/runtime_results/", cam_idx)
-                loss_mapping += get_loss_mapping(
+
+                # 🔴 修改点 2：将全局 loss_mapping 改为单帧局部变量 loss_view
+                loss_view = get_loss_mapping(
                     self.config, image, depth, viewpoint, opacity
-                ) #0.2503
+                )
+
                 # =========================================================
-                # 2DGS 专属损失 1: 深度失真损失 (Depth Distortion Loss)
+                # 2DGS 专属损失等附加损失 (保持你原来的逻辑即可，变量名改为 loss_view)
                 # =========================================================
-                # 你的 diff-surfel-rasterization 渲染器在 surf=False/True 时，
-                # 通常会返回渲染过程中的 distortion 值。
                 # if self.use_distortion_loss and "rend_dist" in render_pkg:
-                #     distortion_loss = render_pkg["rend_dist"].mean() #1.0811e-05、6.0331e-06
-                #     # 权重通常设为 1000 到 3000，具体取决于场景尺度
+                #     distortion_loss = render_pkg["rend_dist"].mean()
                 #     lambda_dist = self.config.get("opt_params", {}).get("lambda_dist", 10.0)
-                #     #loss_mapping += lambda_dist * distortion_loss
-                #     loss_mapping += (lambda_dist * decay_factor) * distortion_loss
+                #     loss_view += (lambda_dist * decay_factor) * distortion_loss
                 #
                 # if self.use_surf_normal and "surf_normal" in render_pkg:
-                #     normal_consistency_loss = get_normal_consistency_loss(render_pkg) #0.7075
+                #     normal_consistency_loss = get_normal_consistency_loss(render_pkg)
                 #     lambda_surf_normal = self.config.get("opt_params", {}).get("lambda_surf_normal", 0.001)
-                #     loss_mapping += lambda_surf_normal * normal_consistency_loss
+                #     loss_view += lambda_surf_normal * normal_consistency_loss
 
                 if self.use_external_normal and viewpoint.normal is not None:
                     rend_normal = render_pkg["rend_normal"]
                     rend_normal = F.normalize(rend_normal, p=2, dim=0)
                     depth_pixel_mask = (viewpoint.gt_depth > 0.01).view(*depth.shape)
-                    # ==========================================
-                    # 模式 1: 纯传感器法线 (Sensor only)
-                    # ==========================================
+
                     if self.normal_mode == "sensor":
-                        # 获取传感器法线并转到世界坐标系
                         sensor_normal = viewpoint.normal
-                        # 注意：这里假设 viewpoint.T 是 World2Cam，具体转换需根据你的坐标系定义确认
                         gt_normal = (viewpoint.T[0:3, 0:3].T @ sensor_normal.view(3, -1)).view(
                             image.shape[0], image.shape[1], image.shape[2]
                         )
-                        #_save_gt_normal(gt_normal, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/", viewpoint.uid)
-                        #_save_gt_normal(rend_normal,"/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid, "rend")
-                        # --- 新增：保存箭头图 ---
-                        #quiver_save_dir = "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/quivers/"
-                        #os.makedirs(quiver_save_dir, exist_ok=True)
-                        #save_normal_as_quiver(gt_normal, os.path.join(quiver_save_dir, f"gt_{viewpoint.uid}.png"))
-                        # 保存渲染结果的箭头图
-                        #save_normal_as_quiver(rend_normal, os.path.join(quiver_save_dir, f"rend_{viewpoint.uid}.png"))
-                        #normal_mask = gt_normal > 0
-                        #normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask * normal_mask).sum(dim=0))[None].mean() #0.9128
-                        normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean() #0.6932
-                        loss_mapping += (self.config["opt_params"]["lambda_sensor_normal"]  * normal_error)
+                        normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()
+                        loss_view += (self.config["opt_params"]["lambda_sensor_normal"] * normal_error)
+
                 # if self.use_plane_constraint:
-                #     proj_loss = get_loss_mapping_plane_constraint(self.gaussians, viewpoint, 'huber')  #0.0001、9.5036e-05、
-                #     loss_mapping += self.config["opt_params"]["lambda_plane"]*decay_factor * proj_loss
+                #     proj_loss = get_loss_mapping_plane_constraint(self.gaussians, viewpoint, 'huber')
+                #     loss_view += self.config["opt_params"]["lambda_plane"]*decay_factor * proj_loss
+
+                # 🔴 修改点 3：【核心】单帧计算完毕，立刻反向传播！
+                # 此时 PyTorch 会把梯度累加到模型参数的 .grad 中，并立刻释放这一帧庞大的渲染计算图
+                loss_view.backward()
 
                 viewspace_point_tensor_acm.append(viewspace_point_tensor)
                 visibility_filter_acm.append(visibility_filter)
@@ -365,92 +688,22 @@ class BackEnd(mp.Process):
                     render_pkg["opacity"],
                     render_pkg["n_touched"],
                 )
-                loss_mapping += get_loss_mapping(
+
+                # 🔴 修改点 4：历史帧同样使用局部变量 loss_view
+                loss_view = get_loss_mapping(
                     self.config, image, depth, viewpoint, opacity
                 )
+
+                # 🔴 修改点 5：立刻反向传播，释放历史帧计算图
+                loss_view.backward()
+
                 viewspace_point_tensor_acm.append(viewspace_point_tensor)
                 visibility_filter_acm.append(visibility_filter)
                 radii_acm.append(radii)
 
-            # =========================================================
-            # [位置 2] 各向同性/标度损失 (Isotropic Loss) 放在这里！
-            # 原因：
-            # 1. 这是对高斯球本身的形状做正则化 (self.gaussians)，是全局的。
-            # 2. 它不依赖于具体的相机视角 (Viewpoint)。
-            # 3. 如果在循环内计算，会导致每次渲染一个帧就加一次 loss，导致权重翻倍，梯度爆炸。
-            # =========================================================
-            # scaling = self.gaussians.get_scaling
-            # isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
-            # loss_mapping += 10 * isotropic_loss.mean() #0.1*0.0024=0.00024
-            # -----------------------------------------------
-            # if self.use_external_normal and viewpoint.normal is not None and itr == 0:
-            #     rend_normal = render_pkg["rend_normal"]
-            #     #rend_normal = F.normalize(rend_normal, p=2, dim=0)
-            #     depth_pixel_mask = (viewpoint.gt_depth > 0.01).view(*depth.shape)
-            #     # ==========================================
-            #     # 模式 1: 纯传感器法线 (Sensor only)
-            #     # ==========================================
-            #     if self.normal_mode == "sensor":
-            #         # 获取传感器法线并转到世界坐标系
-            #         sensor_normal = viewpoint.normal
-            #         # 注意：这里假设 viewpoint.T 是 World2Cam，具体转换需根据你的坐标系定义确认
-            #         gt_normal = (viewpoint.T[0:3, 0:3].T @ sensor_normal.view(3, -1)).view(
-            #             image.shape[0], image.shape[1], image.shape[2]
-            #         )
-            #         #_save_gt_normal(gt_normal, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/", viewpoint.uid)
-            #         #_save_gt_normal(rend_normal,"/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid, "rend")
-            #         # --- 新增：保存箭头图 ---
-            #         #quiver_save_dir = "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/quivers/"
-            #         #os.makedirs(quiver_save_dir, exist_ok=True)
-            #         #save_normal_as_quiver(gt_normal, os.path.join(quiver_save_dir, f"gt_{viewpoint.uid}.png"))
-            #         # 保存渲染结果的箭头图
-            #         #save_normal_as_quiver(rend_normal, os.path.join(quiver_save_dir, f"rend_{viewpoint.uid}.png"))
-            #         #normal_mask = gt_normal > 0
-            #         #normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask * normal_mask).sum(dim=0))[None].mean() #0.9128
-            #         normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()
-            #         loss_mapping += (self.config["opt_params"]["lambda_sensor_normal"] * normal_error)
-            #     # ==========================================
-            #     # 模式 2: 纯平面先验 (Plane only)
-            #     # ==========================================
-            #     elif self.normal_mode == "plane":
-            #         # 1. 获取世界坐标系下的 GT 法线和平面 Mask
-            #         gt_normal_world, plane_mask = build_plane_normal_gt(viewpoint,config=self.config)
-            #
-            #         # 2. 组合 Mask（假设 depth_pixel_mask 也是 [1, H, W] 的 bool/float 张量）
-            #         # 仅在同时具有深度 valid 且属于平面的像素上计算 loss
-            #         valid_mask = plane_mask & (depth_pixel_mask.bool())
-            #         _save_gt_normal(gt_normal_world, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/", viewpoint.uid)
-            #         _save_gt_normal(rend_normal,"/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid, "rend")
-            #         if valid_mask.sum() > 0:
-            #             # 3. 计算余弦相似度 (渲染法线与GT法线点乘)
-            #             # rend_normal: [3, H, W], gt_normal_world: [3, H, W]
-            #             # cosine_sim shape: [1, H, W]
-            #             cosine_sim = (rend_normal * gt_normal_world).sum(dim=0, keepdim=True)
-            #
-            #             # 4. 仅在 valid_mask 区域内计算 normal_error = 1 - cos(theta)
-            #             # 只取有效区域进行 mean，防止背景的大量 0 拉低了 loss 从而产生错误梯度
-            #             # 只要法线平行（共线），不管是同向还是反向，Loss 都会接近 0
-            #             normal_error = (1.0 - cosine_sim.abs())[valid_mask].mean()
-            #
-            #             # 5. 累加 Loss
-            #             loss_mapping += (self.config["opt_params"]["lambda_normal"] * normal_error)
-            #     # ==========================================
-            #     # 模式 3: 混合监督 (Mixed)
-            #     # ==========================================
-            #     elif self.normal_mode == "mixed":
-            #         # 假设 build_combined_normal_gt 内部处理了传感器法线与平面的融合，并返回世界坐标系法线
-            #         gt_normal = build_combined_normal_gt(viewpoint)
-            #         #_save_gt_normal(gt_normal, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid)
-            #         #_save_gt_normal(rend_normal,"/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid, "rend")
-            #         #check_normal_dir(rend_normal, gt_normal)
-            #         normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()  # 0.6849
-            #         loss_mapping += (self.config["opt_params"]["lambda_normal"] * normal_error)
-            #
-            # if self.use_plane_constraint:
-            #     proj_loss = get_loss_mapping_plane_constraint(self.gaussians, viewpoint,'huber') #5.3299e-05
-            #     loss_mapping += self.config["opt_params"]["lambda_plane"] * proj_loss
+            # 🔴 修改点 6：彻底删除原来在循环外面的 loss_mapping.backward() ！！！
+            # (如果你有 Isotropic Loss 等全局损失，应在上方单独算完后调用 .backward())
 
-            loss_mapping.backward()
             gaussian_split = False
             ## Deinsifying / Pruning Gaussians高斯密度自适应控制模块
             # 该模块负责动态调整高斯球的数量和分布，以适应场景的几何细节
@@ -461,10 +714,7 @@ class BackEnd(mp.Process):
                     n_touched = n_touched_acm[idx]
                     self.occ_aware_visibility[kf_idx] = (n_touched > 0).long()
 
-                # # compute the visibility of the gaussians
-                # # Only prune on the last iteration and when we have full window
                 # 可见性修剪: 统计高斯球被观测的次数 (n_obs)。
-                # 在 prune_mode="slam" 模式下，移除观测次数过少（n_obs <= 3）且不稳定的高斯球，去除噪声
                 if prune:
                     if len(current_window) == self.config["Training"]["window_size"]:
                         prune_mode = self.config["Training"]["prune_mode"]
@@ -475,9 +725,7 @@ class BackEnd(mp.Process):
                         to_prune = None
                         if prune_mode == "odometry":
                             to_prune = self.gaussians.n_obs < 3
-                            # make sure we don't split the gaussians, break here.
                         if prune_mode == "slam":
-                            # only prune keyframes which are relatively new
                             sorted_window = sorted(current_window, reverse=True)
                             mask = self.gaussians.unique_kfIDs >= sorted_window[2]
                             if not self.initialized:
@@ -495,7 +743,6 @@ class BackEnd(mp.Process):
                         if not self.initialized:
                             self.initialized = True
                             Log("Initialized SLAM")
-                        # # make sure we don't split the gaussians, break here.
                     return False
 
                 for idx in range(len(viewspace_point_tensor_acm)):
@@ -508,9 +755,9 @@ class BackEnd(mp.Process):
                     )
 
                 update_gaussian = (
-                    self.iteration_count % self.gaussian_update_every
-                    == self.gaussian_update_offset
-                ) #同余条件,固定周期带偏移，every=N,offset=m,则在m,m+N,m+2N,...迭代执行高斯更新
+                        self.iteration_count % self.gaussian_update_every
+                        == self.gaussian_update_offset
+                )
                 if update_gaussian:
                     self.gaussians.densify_and_prune(
                         self.opt_params.densify_grad_threshold,
@@ -520,39 +767,23 @@ class BackEnd(mp.Process):
                     )
                     gaussian_split = True
 
-                ## Opacity reset
-                # 不透明度重置: 定期调用 reset_opacity 或 reset_opacity_nonvisible，
-                # 将高斯不透明度重置为低值。这有助于去除错误的“漂浮物”并重新收敛几何结构
                 if (self.iteration_count % self.gaussian_reset) == 0 and (
-                    not update_gaussian
+                        not update_gaussian
                 ):
                     Log("Resetting the opacity of non-visible Gaussians")
                     self.gaussians.reset_opacity_nonvisible(visibility_filter_acm)
                     gaussian_split = True
 
-                self.gaussians.optimizer.step()
-                self.gaussians.optimizer.zero_grad(set_to_none=True)
-                self.gaussians.update_learning_rate(self.iteration_count)
-                self.keyframe_optimizers.step()
-                self.keyframe_optimizers.zero_grad(set_to_none=True)
-                # # Pose update 只更新位姿优化窗口内的相机位姿
-                # for cam_idx in range(min(frames_to_optimize, len(current_window))): #min(3,2)[5,0]
-                #     viewpoint = viewpoint_stack[cam_idx]
-                #     if viewpoint.uid == 0: #世界坐标系/第一帧位姿固定不变
-                #         continue
-                #     update_pose(viewpoint)
-                # --- 修改重点 ---
                 # 只有在优化器被初始化后才执行 step
                 if self.keyframe_optimizers is not None:
+                    # 🔴 关键机制：所有上面累加在 .grad 里的梯度，在这里一次性更新！
                     self.gaussians.optimizer.step()
                     self.gaussians.optimizer.zero_grad(set_to_none=True)
                     self.gaussians.update_learning_rate(self.iteration_count)
 
-                    # 执行位姿和曝光优化
                     self.keyframe_optimizers.step()
                     self.keyframe_optimizers.zero_grad(set_to_none=True)
 
-                    # 更新相机位姿
                     frames_to_optimize = self.config["Training"]["pose_window"]
                     for cam_idx in range(min(frames_to_optimize, len(current_window))):
                         viewpoint = viewpoint_stack[cam_idx]
@@ -560,10 +791,10 @@ class BackEnd(mp.Process):
                             continue
                         update_pose(viewpoint)
                 else:
-                    # 如果没有位姿优化器（处于切图间隙），只更新高斯模型本身
                     self.gaussians.optimizer.step()
                     self.gaussians.optimizer.zero_grad(set_to_none=True)
                     self.gaussians.update_learning_rate(self.iteration_count)
+
         return gaussian_split
     '''
     ------------------离线精修模块(Color Refinement)------------------
@@ -625,7 +856,6 @@ class BackEnd(mp.Process):
             keyframes.append((kf_idx, kf.T.clone()))
         if tag is None:
             tag = "sync_backend"
-
         msg = [tag, clone_obj(self.gaussians), self.occ_aware_visibility, keyframes]
         self.frontend_queue.put(msg)
 

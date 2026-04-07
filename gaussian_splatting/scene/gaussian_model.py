@@ -710,41 +710,114 @@ class GaussianModel:
         self.unique_kfIDs = torch.zeros((self._xyz.shape[0]))
         self.n_obs = torch.zeros((self._xyz.shape[0]), device="cpu").int()
 
+    # def replace_tensor_to_optimizer(self, tensor, name):
+    #     optimizable_tensors = {}
+    #     for group in self.optimizer.param_groups:
+    #         if group["name"] == name:
+    #             stored_state = self.optimizer.state.get(group["params"][0], None)
+    #             stored_state["exp_avg"] = torch.zeros_like(tensor)
+    #             stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
+    #
+    #             del self.optimizer.state[group["params"][0]]
+    #             group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
+    #             self.optimizer.state[group["params"][0]] = stored_state
+    #
+    #             optimizable_tensors[group["name"]] = group["params"][0]
+    #     return optimizable_tensors
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             if group["name"] == name:
-                stored_state = self.optimizer.state.get(group["params"][0], None)
-                stored_state["exp_avg"] = torch.zeros_like(tensor)
-                stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
+                old_param = group["params"][0]
+                stored_state = self.optimizer.state.get(old_param, None)
 
-                del self.optimizer.state[group["params"][0]]
-                group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
-                self.optimizer.state[group["params"][0]] = stored_state
+                if stored_state is not None:
+                    # 分配新状态
+                    new_exp_avg = torch.zeros_like(tensor)
+                    new_exp_avg_sq = torch.zeros_like(tensor)
 
-                optimizable_tensors[group["name"]] = group["params"][0]
+                    # 1. 显式删除旧状态引用，释放显存
+                    del self.optimizer.state[old_param]
+                    if "exp_avg" in stored_state:
+                        del stored_state["exp_avg"]
+                    if "exp_avg_sq" in stored_state:
+                        del stored_state["exp_avg_sq"]
+
+                    # 2. 创建并绑定新参数
+                    new_param = nn.Parameter(tensor.requires_grad_(True))
+                    group["params"][0] = new_param
+
+                    self.optimizer.state[new_param] = stored_state
+                    self.optimizer.state[new_param]["exp_avg"] = new_exp_avg
+                    self.optimizer.state[new_param]["exp_avg_sq"] = new_exp_avg_sq
+
+                    optimizable_tensors[group["name"]] = new_param
+                else:
+                    new_param = nn.Parameter(tensor.requires_grad_(True))
+                    group["params"][0] = new_param
+                    optimizable_tensors[group["name"]] = new_param
+
+                # 【核心】：彻底切断旧参数的梯度图引用，强迫 PyTorch 当场回收！
+                old_param.grad = None
+                del old_param
+
         return optimizable_tensors
 
+    # def _prune_optimizer(self, mask):
+    #     optimizable_tensors = {}
+    #     for group in self.optimizer.param_groups:
+    #         stored_state = self.optimizer.state.get(group["params"][0], None)
+    #         if stored_state is not None:
+    #             stored_state["exp_avg"] = stored_state["exp_avg"][mask]
+    #             stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
+    #
+    #             del self.optimizer.state[group["params"][0]]
+    #             group["params"][0] = nn.Parameter(
+    #                 (group["params"][0][mask].requires_grad_(True))
+    #             )
+    #             self.optimizer.state[group["params"][0]] = stored_state
+    #
+    #             optimizable_tensors[group["name"]] = group["params"][0]
+    #         else:
+    #             group["params"][0] = nn.Parameter(
+    #                 group["params"][0][mask].requires_grad_(True)
+    #             )
+    #             optimizable_tensors[group["name"]] = group["params"][0]
+    #     return optimizable_tensors
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
-            stored_state = self.optimizer.state.get(group["params"][0], None)
+            old_param = group["params"][0]
+            stored_state = self.optimizer.state.get(old_param, None)
+
             if stored_state is not None:
-                stored_state["exp_avg"] = stored_state["exp_avg"][mask]
-                stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
+                # 使用 .clone() 强行分配紧凑的内存块，防止掩码切片产生的显存碎片
+                new_exp_avg = stored_state["exp_avg"][mask].clone()
+                new_exp_avg_sq = stored_state["exp_avg_sq"][mask].clone()
 
-                del self.optimizer.state[group["params"][0]]
-                group["params"][0] = nn.Parameter(
-                    (group["params"][0][mask].requires_grad_(True))
-                )
-                self.optimizer.state[group["params"][0]] = stored_state
+                # 1. 显式删除旧状态引用
+                del self.optimizer.state[old_param]
+                del stored_state["exp_avg"]
+                del stored_state["exp_avg_sq"]
 
-                optimizable_tensors[group["name"]] = group["params"][0]
+                # 2. 创建并绑定新参数
+                new_param = nn.Parameter(old_param[mask].requires_grad_(True))
+                group["params"][0] = new_param
+
+                self.optimizer.state[new_param] = stored_state
+                self.optimizer.state[new_param]["exp_avg"] = new_exp_avg
+                self.optimizer.state[new_param]["exp_avg_sq"] = new_exp_avg_sq
+
+                optimizable_tensors[group["name"]] = new_param
             else:
-                group["params"][0] = nn.Parameter(
-                    group["params"][0][mask].requires_grad_(True)
-                )
-                optimizable_tensors[group["name"]] = group["params"][0]
+                new_param = nn.Parameter(old_param[mask].requires_grad_(True))
+                group["params"][0] = new_param
+                optimizable_tensors[group["name"]] = new_param
+
+            # 【核心】：彻底切断旧参数的梯度图引用，强迫 PyTorch 当场回收！
+            old_param.grad = None
+            del old_param
+
         return optimizable_tensors
 
     # 通过剪枝操作，移除不需要的高斯点，并更新剩余高斯点的相关属性，原mask中大于梯度阈值的点被标记为True(要剔除的)
@@ -768,37 +841,76 @@ class GaussianModel:
         self.n_obs = self.n_obs[valid_points_mask.cpu()]
 
     # 将新的张量（tensors_dict 中的张量）添加到现有的优化器参数中，并更新优化器的状态
+    # def cat_tensors_to_optimizer(self, tensors_dict):
+    #     optimizable_tensors = {}
+    #     for group in self.optimizer.param_groups:
+    #         assert len(group["params"]) == 1
+    #         extension_tensor = tensors_dict[group["name"]]
+    #         stored_state = self.optimizer.state.get(group["params"][0], None)
+    #         if stored_state is not None:
+    #             stored_state["exp_avg"] = torch.cat(
+    #                 (stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0
+    #             )
+    #             stored_state["exp_avg_sq"] = torch.cat(
+    #                 (stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)),
+    #                 dim=0,
+    #             )
+    #
+    #             del self.optimizer.state[group["params"][0]]
+    #             group["params"][0] = nn.Parameter(
+    #                 torch.cat(
+    #                     (group["params"][0], extension_tensor), dim=0
+    #                 ).requires_grad_(True)
+    #             )
+    #             self.optimizer.state[group["params"][0]] = stored_state
+    #
+    #             optimizable_tensors[group["name"]] = group["params"][0]
+    #         else:
+    #             group["params"][0] = nn.Parameter(
+    #                 torch.cat(
+    #                     (group["params"][0], extension_tensor), dim=0
+    #                 ).requires_grad_(True)
+    #             )
+    #             optimizable_tensors[group["name"]] = group["params"][0]
+    #
+    #     return optimizable_tensors
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]
-            stored_state = self.optimizer.state.get(group["params"][0], None)
+            old_param = group["params"][0]
+            stored_state = self.optimizer.state.get(old_param, None)
+
             if stored_state is not None:
-                stored_state["exp_avg"] = torch.cat(
-                    (stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0
-                )
-                stored_state["exp_avg_sq"] = torch.cat(
-                    (stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)),
-                    dim=0,
-                )
+                # 避免在 concat 时产生无法及时释放的幽灵张量
+                zeros_ext = torch.zeros_like(extension_tensor)
+                new_exp_avg = torch.cat((stored_state["exp_avg"], zeros_ext), dim=0)
+                new_exp_avg_sq = torch.cat((stored_state["exp_avg_sq"], zeros_ext), dim=0)
 
-                del self.optimizer.state[group["params"][0]]
-                group["params"][0] = nn.Parameter(
-                    torch.cat(
-                        (group["params"][0], extension_tensor), dim=0
-                    ).requires_grad_(True)
-                )
-                self.optimizer.state[group["params"][0]] = stored_state
+                # 1. 显式删除旧状态引用
+                del self.optimizer.state[old_param]
+                del stored_state["exp_avg"]
+                del stored_state["exp_avg_sq"]
+                del zeros_ext  # 用完即焚
 
-                optimizable_tensors[group["name"]] = group["params"][0]
+                # 2. 创建并绑定新参数
+                new_param = nn.Parameter(torch.cat((old_param, extension_tensor), dim=0).requires_grad_(True))
+                group["params"][0] = new_param
+
+                self.optimizer.state[new_param] = stored_state
+                self.optimizer.state[new_param]["exp_avg"] = new_exp_avg
+                self.optimizer.state[new_param]["exp_avg_sq"] = new_exp_avg_sq
+
+                optimizable_tensors[group["name"]] = new_param
             else:
-                group["params"][0] = nn.Parameter(
-                    torch.cat(
-                        (group["params"][0], extension_tensor), dim=0
-                    ).requires_grad_(True)
-                )
-                optimizable_tensors[group["name"]] = group["params"][0]
+                new_param = nn.Parameter(torch.cat((old_param, extension_tensor), dim=0).requires_grad_(True))
+                group["params"][0] = new_param
+                optimizable_tensors[group["name"]] = new_param
+
+            # 【核心】：彻底切断旧参数的梯度图引用，强迫 PyTorch 当场回收！
+            old_param.grad = None
+            del old_param
 
         return optimizable_tensors
 
@@ -957,12 +1069,25 @@ class GaussianModel:
             big_points_vs = self.max_radii2D > max_screen_size # 将2D高斯半径大于max_screen_size的高斯点标记出来，生成布尔掩码big_points_vs
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent # 将3D高斯缩放值大于场景范围10%的高斯点标记出来，生成布尔掩码big_points_ws
 
-            prune_mask = torch.logical_or(
-                torch.logical_or(prune_mask, big_points_vs), big_points_ws
-            )# 进行逻辑或操作，更新剪枝掩码prune_mask，标记出所有需要剪枝的高斯点
+            # prune_mask = torch.logical_or(
+            #     torch.logical_or(prune_mask, big_points_vs), big_points_ws
+            # )# 进行逻辑或操作，更新剪枝掩码prune_mask，标记出所有需要剪枝的高斯点
+            # ==============================================================
+            # 【新增：FGS-SLAM 细针剔除机制 (Needle Pruning)】
+            # 防止 2DGS 退化为极度细长、疯狂消耗显存和算力的“废点”
+            # ==============================================================
+            scales = self.get_scaling
+            # 防止分母为 0 导致 nan
+            scale_ratio = scales[:, 1] / (scales[:, 0] + 1e-8)
+            big_points_ws_0 = scale_ratio > 10.0
+            big_points_ws_1 = scale_ratio < 0.1
+
+            # 将所有不合规的点全部加入剪枝名单
+            prune_mask = prune_mask | big_points_vs | big_points_ws | big_points_ws_0 | big_points_ws_1
+            # ==============================================================
         self.prune_points(prune_mask) # 移除那些不透明度小于min_opacity的高斯点，以及那些2D高斯半径大于max_screen_size或3D高斯缩放值大于场景范围10%的高斯点
 
-        #torch.cuda.empty_cache() #-----------------2dgs中有这一句-----------------------
+
     # 所有高斯点的张量、半径大于0的高斯点的索引
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(
