@@ -40,7 +40,8 @@ class GPUMemoryMonitor:
         self.keep_measuring = True
         self.peak_memory = 0
         self.physical_gpu_id = physical_gpu_id
-        self.thread = threading.Thread(target=self.measure_usage)
+        # 🟢 设置为 daemon=True，主进程退出时它会自动陪葬，绝不死缠烂打
+        self.thread = threading.Thread(target=self.measure_usage, daemon=True)
 
     def measure_usage(self):
         while self.keep_measuring:
@@ -64,7 +65,9 @@ class GPUMemoryMonitor:
 
     def stop(self):
         self.keep_measuring = False
-        self.thread.join()
+        # 🟢 取消 thread.join()。既然是 daemon 线程，我们拿完数据直接走人
+        # 睡一小会儿（0.1s），给它最后一次记录的机会
+        time.sleep(0.1)
         return self.peak_memory
 
 class SLAM:
@@ -375,8 +378,7 @@ class SLAM:
                     if param_group["name"] in ["xyz", "rotation", "scaling", "normal"]:
                         param_group["lr"] = param_group["lr"] * 0.2
 
-                # 2. 全局相机微调优化器 (Global Camera Optimizer)
-                opt_params_cams = []
+                # 2. 【极速优化】：为每个相机绑定独立的优化器，拒绝全局遍历！
                 for cam in valid_cameras:
                     if getattr(cam, 'cam_rot_delta', None) is None:
                         cam.cam_rot_delta = torch.nn.Parameter(torch.zeros(3, requires_grad=True, device="cuda"))
@@ -387,107 +389,81 @@ class SLAM:
                     if getattr(cam, 'exposure_b', None) is None:
                         cam.exposure_b = torch.nn.Parameter(torch.tensor([0.0], requires_grad=True, device="cuda"))
 
-                    opt_params_cams.append(
-                        {"params": [cam.cam_rot_delta], "lr": self.config["Training"]["lr"]["cam_rot_delta"] * 0.2,
-                         "name": f"rot_{cam.uid}"})
-                    opt_params_cams.append(
-                        {"params": [cam.cam_trans_delta], "lr": self.config["Training"]["lr"]["cam_trans_delta"] * 0.2,
-                         "name": f"trans_{cam.uid}"})
-                    opt_params_cams.append({"params": [cam.exposure_a], "lr": 0.01, "name": f"exp_a_{cam.uid}"})
-                    opt_params_cams.append({"params": [cam.exposure_b], "lr": 0.01, "name": f"exp_b_{cam.uid}"})
-
-                global_cam_optimizer = torch.optim.Adam(opt_params_cams)
+                    cam_opt_params = [
+                        {"params": [cam.cam_rot_delta], "lr": self.config["Training"]["lr"]["cam_rot_delta"] * 0.2},
+                        {"params": [cam.cam_trans_delta], "lr": self.config["Training"]["lr"]["cam_trans_delta"] * 0.2},
+                        {"params": [cam.exposure_a], "lr": 0.01},
+                        {"params": [cam.exposure_b], "lr": 0.01}
+                    ]
+                    # 给每一个相机挂载自己的私有优化器
+                    cam.optimizer = torch.optim.Adam(cam_opt_params)
 
                 # =========================================================
-                # 【终极形态：Epoch轮回分块缓存 (Epoch-based Chunked Caching)】
-                # 彻底解决局部遗忘（缺失半个房间）和 RAM 爆炸问题
+                # 3. 极简智能动态缓存池 (最大缓存 800 张，通吃一切情况)
                 # =========================================================
                 iteration_total = 26000
-                chunk_size = 400  # 每次最多塞 400 张图（约 4GB 内存，极度安全且兼顾 I/O）
-                iters_per_chunk = 1000  # 每个 Chunk 局部优化 1000 次（每张图复用 2.5 次）
+                cpu_image_cache = {}
+                MAX_CACHE_SIZE = 800
 
-                current_global_iter = 1
-                pbar = tqdm(total=iteration_total, desc="Global BA (Epoch Mode)")
+                pbar = tqdm(total=iteration_total, desc="Global BA (Ultra Speed)")
 
-                import copy
+                for iteration in range(1, iteration_total + 1):
+                    viewpoint_cam = random.choice(valid_cameras)
 
-                while current_global_iter <= iteration_total:
-                    # 1. 每一轮 Epoch，打乱全局相机，保证空间随机性
-                    shuffled_cameras = copy.copy(valid_cameras)
-                    random.shuffle(shuffled_cameras)
+                    # 【智能命中机制】：如果在内存里，瞬间提取；如果不在，读硬盘并加入缓存。
+                    if viewpoint_cam.uid in cpu_image_cache:
+                        gt_image_raw = cpu_image_cache[viewpoint_cam.uid]
+                    else:
+                        gt_image_raw, _, _, _, _ = self.dataset[viewpoint_cam.uid]
+                        # 超过安全上限就随机踢掉一个旧的，保护 RAM 永不爆炸
+                        if len(cpu_image_cache) >= MAX_CACHE_SIZE:
+                            del_key = random.choice(list(cpu_image_cache.keys()))
+                            del cpu_image_cache[del_key]
+                        cpu_image_cache[viewpoint_cam.uid] = gt_image_raw
 
-                    # 2. 将打乱后的相机切分为多个 Chunk
-                    camera_chunks = [shuffled_cameras[i:i + chunk_size] for i in
-                                     range(0, len(shuffled_cameras), chunk_size)]
+                    gt_image = gt_image_raw.cuda(non_blocking=True)
 
-                    for chunk_idx, cam_chunk in enumerate(camera_chunks):
-                        if current_global_iter > iteration_total:
-                            break
+                    render_pkg = render(
+                        viewpoint_cam, self.gaussians, self.pipeline_params, self.background, surf=False
+                    )
+                    image = render_pkg["render"]
+                    visibility_filter = render_pkg["visibility_filter"]
+                    radii = render_pkg["radii"]
 
-                        # 3. 预加载当前 Chunk 到内存
-                        cpu_image_cache = {}
-                        for cam in cam_chunk:
-                            try:
-                                gt_image_raw, _, _, _, _ = self.dataset[cam.uid]
-                                cpu_image_cache[cam.uid] = gt_image_raw.cpu().pin_memory()
-                            except Exception:
-                                pass
+                    Ll1 = l1_loss(image, gt_image)
+                    loss = (1.0 - self.opt_params.lambda_dssim) * Ll1 + self.opt_params.lambda_dssim * (
+                            1.0 - ssim(image.unsqueeze(0), gt_image.unsqueeze(0)))
 
-                        valid_cam_chunk = [cam for cam in cam_chunk if cam.uid in cpu_image_cache]
-                        if not valid_cam_chunk:
-                            continue
+                    loss.backward()
 
-                        # 动态计算当前 Chunk 需要执行的迭代步数 (防止最后一块太小导致过拟合)
-                        current_iters = int(iters_per_chunk * (len(valid_cam_chunk) / chunk_size))
-                        current_iters = max(1, current_iters)
-                        current_iters = min(current_iters, iteration_total - current_global_iter + 1)
+                    with torch.no_grad():
+                        self.gaussians.max_radii2D[visibility_filter] = torch.max(
+                            self.gaussians.max_radii2D[visibility_filter], radii[visibility_filter]
+                        )
+                        self.gaussians.optimizer.step()
+                        self.gaussians.optimizer.zero_grad(set_to_none=True)
+                        self.gaussians.update_learning_rate(iteration)
 
-                        # 4. 执行局部精修
-                        for _ in range(current_iters):
-                            viewpoint_cam = random.choice(valid_cam_chunk)
+                        # 【速度起飞核心】：只更新这 1 个相机的参数，省略了另外 499 个相机的无效开销！
+                        viewpoint_cam.optimizer.step()
+                        viewpoint_cam.optimizer.zero_grad(set_to_none=True)
 
-                            render_pkg = render(
-                                viewpoint_cam, self.gaussians, self.pipeline_params, self.background, surf=False
-                            )
-                            image = render_pkg["render"]
-                            visibility_filter = render_pkg["visibility_filter"]
-                            radii = render_pkg["radii"]
+                        update_pose(viewpoint_cam)
 
-                            # 从缓存中极速提取
-                            gt_image = cpu_image_cache[viewpoint_cam.uid].cuda(non_blocking=True)
+                        # 每 100 步统一衰减所有相机的学习率
+                        if iteration % 100 == 0:
+                            lr_factor = (0.01 ** (1.0 / (iteration_total / 100)))
+                            for cam in valid_cameras:
+                                for param_group in cam.optimizer.param_groups:
+                                    param_group['lr'] *= lr_factor
 
-                            Ll1 = l1_loss(image, gt_image)
-                            loss = (1.0 - self.opt_params.lambda_dssim) * Ll1 + self.opt_params.lambda_dssim * (
-                                    1.0 - ssim(image.unsqueeze(0), gt_image.unsqueeze(0)))
+                    del gt_image
+                    pbar.update(1)
 
-                            loss.backward()
-                            with torch.no_grad():
-                                self.gaussians.max_radii2D[visibility_filter] = torch.max(
-                                    self.gaussians.max_radii2D[visibility_filter], radii[visibility_filter]
-                                )
-                                self.gaussians.optimizer.step()
-                                self.gaussians.optimizer.zero_grad(set_to_none=True)
-                                self.gaussians.update_learning_rate(current_global_iter)
-
-                                global_cam_optimizer.step()
-                                global_cam_optimizer.zero_grad(set_to_none=True)
-
-                                update_pose(viewpoint_cam)
-
-                                # 学习率平滑衰减
-                                if current_global_iter % 100 == 0:
-                                    lr_factor = (0.01 ** (1.0 / (iteration_total / 100)))
-                                    for param_group in global_cam_optimizer.param_groups:
-                                        param_group['lr'] *= lr_factor
-
-                            del gt_image
-                            current_global_iter += 1
-                            pbar.update(1)
-
-                        # 5. 💣 用完即焚：清理内存，迎接下一个 Chunk
-                        del cpu_image_cache
-                        import gc
-                        gc.collect()
+                # 用完即焚清理所有内存缓存
+                del cpu_image_cache
+                import gc
+                gc.collect()
 
                 pbar.close()
                 Log("==> 全局大地图联合优化缝合完成！ <==")
