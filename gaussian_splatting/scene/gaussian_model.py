@@ -121,7 +121,9 @@ class GaussianModel:
         image_ab = (torch.exp(cam.exposure_a)) * cam.original_image + cam.exposure_b
         image_ab = torch.clamp(image_ab, 0.0, 1.0)
         rgb_raw = (image_ab * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy()
-
+        # 【新增：读取消融开关】
+        use_fft_mask = self.config.get("Ablation", {}).get("use_fft_mask", True)
+        use_error_mask = self.config.get("Ablation", {}).get("use_error_mask", True)
         if depthmap is not None:
             rgb = o3d.geometry.Image(rgb_raw.astype(np.uint8))
             depth = o3d.geometry.Image(depthmap.astype(np.float32))
@@ -136,32 +138,39 @@ class GaussianModel:
                     + (np.random.randn(depth_raw.shape[0], depth_raw.shape[1]) - 0.5)
                     * 0.05
                 ) * scale
+
+            # ==============================================================
+            # 【掩膜融合机制初始化】默认所有深度像素都有效
+            # ==============================================================
             # ==============================================================
             # 【机制 1：FFT 掩膜密度控制】(力量 B：控制高频密、低频稀)
-            # ==============================================================
-            if hasattr(cam, 'freq_mask'):
-                freq_mask_np = cam.freq_mask.cpu().numpy()
-                H, W = depth_raw.shape
+            H, W = depth_raw.shape
+            # 默认掩膜全 True（即不进行任何过滤采样）
+            valid_mask = np.ones((H, W), dtype=bool)
 
-                downsample_low = 3  # 将上一次的 4 改为 3 稍微保守一点
+            # ==============================================================
+            # 【机制 1：FFT 频率掩膜应用】
+            # ==============================================================
+            if use_fft_mask and hasattr(cam, 'freq_mask'):
+                freq_mask_np = cam.freq_mask.cpu().numpy()
+                downsample_low = 3
                 low_freq_grid = np.zeros((H, W), dtype=bool)
                 low_freq_grid[::downsample_low, ::downsample_low] = True
 
-                # 力量 B：符合密度要求的像素
-                valid_mask = freq_mask_np | low_freq_grid
+                # 高频全保，低频抽稀
+                freq_valid = freq_mask_np | low_freq_grid
+                valid_mask = valid_mask & freq_valid
 
-                # ==============================================================
-                # 【机制 2：渲染误差掩膜】(力量 A：只在地图破损处加点)
-                # ==============================================================
-                if hasattr(cam, 'error_mask'):
-                    error_mask_np = cam.error_mask.cpu().numpy()
-
-                    # 终极融合：既要符合密度分布规律，又必须是渲染出错的地方！
-                    valid_mask = valid_mask & error_mask_np
-
-                # 将不采样的像素深度强制置 0，后续 Open3D 会直接忽略它们
-                depth_raw[~valid_mask] = 0.0
             # ==============================================================
+            # 【机制 2：渲染误差掩膜应用】
+            # ==============================================================
+            if use_error_mask and hasattr(cam, 'error_mask'):
+                error_mask_np = cam.error_mask.cpu().numpy()
+                # 仅在误差大的地方采样
+                valid_mask = valid_mask & error_mask_np
+
+            # 应用最终融合的掩膜
+            depth_raw[~valid_mask] = 0.0
             rgb = o3d.geometry.Image(rgb_raw.astype(np.uint8))
             depth = o3d.geometry.Image(depth_raw.astype(np.float32))
 
@@ -216,25 +225,25 @@ class GaussianModel:
         # ==============================================================
         # 【新增机制 2】：反投影 3D 点获取频率属性，动态调整 2DGS 初始尺度
         # ==============================================================
-        is_high_freq = np.ones(new_xyz.shape[0], dtype=bool)  # 默认均为高频
-        if hasattr(cam, 'freq_mask'):
+        # 【新增：读取开关】
+        use_fft_mask = self.config.get("Ablation", {}).get("use_fft_mask", True)
+        is_high_freq = np.ones(new_xyz.shape[0], dtype=bool)
+        # ==============================================================
+        # 【修改：仅在开关开启且有数据时，才根据频率查表】
+        # ==============================================================
+        if use_fft_mask and hasattr(cam, 'freq_mask'):
             freq_mask_np = cam.freq_mask.cpu().numpy()
+            W2C = cam.T.cpu().numpy()
             H, W = cam.image_height, cam.image_width
 
-            # 将下采样后的世界坐标系 3D 点，转回当前相机坐标系
-            pts_in_cam = (W2C[:3, :3] @ new_xyz.T).T + W2C[:3, 3]  # (N, 3)
-
-            # 透视投影到像素坐标 (u, v)
+            # (反投影查表逻辑...)
+            pts_in_cam = (W2C[:3, :3] @ new_xyz.T).T + W2C[:3, 3]
             u = np.round((pts_in_cam[:, 0] * cam.fx / pts_in_cam[:, 2]) + cam.cx).astype(int)
             v = np.round((pts_in_cam[:, 1] * cam.fy / pts_in_cam[:, 2]) + cam.cy).astype(int)
-
-            # 防止反投影越界
             u = np.clip(u, 0, W - 1)
             v = np.clip(v, 0, H - 1)
-
-            # 查表获取频率属性
             is_high_freq = freq_mask_np[v, u]
-        # ==============================================================
+
         pcd = BasicPointCloud(
             points=new_xyz, colors=new_rgb, normals=np.zeros((new_xyz.shape[0], 3))
         )

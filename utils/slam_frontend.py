@@ -47,13 +47,16 @@ class FrontEnd(mp.Process):
         # ========== 新增：子图策略状态变量 ==========
         self.current_submap_id = 0
         self.submap_anchor_pose = None  # 记录当前子图第一帧的位姿 (World to Camera)
-        #self.submap_trans_thre = self.config.get("Submap", {}).get("trans_thre", 0.5)  # 默认 0.5 米
-        #self.submap_rot_thre = self.config.get("Submap", {}).get("rot_thre", 50.0)  # 默认 50 度
         self.submap_trans_thre = self.config["Submap"]["trans_thre"]
         self.submap_rot_thre = self.config["Submap"]["rot_thre"]
         self.frame_to_submap = {}  # <--- 新增这行：记录每帧属于哪个子图
         # ============================================
         self.fft_filter = None  # <--- 新增这行：频域滤波器实例
+        # 【新增：读取消融实验开关，兼容旧版配置防止报错】
+        self.use_submap = self.config.get("Ablation", {}).get("use_submap", True)
+        # 【新增：消融实验开关】
+        self.use_fft_mask = self.config.get("Ablation", {}).get("use_fft_mask", True)
+        self.use_error_mask = self.config.get("Ablation", {}).get("use_error_mask", True)
 
     def set_hyperparams(self):
         self.save_dir = self.config["Results"]["save_dir"] # 结果保存路径
@@ -112,17 +115,15 @@ class FrontEnd(mp.Process):
         viewpoint = self.cameras[cur_frame_idx]
         gt_img = viewpoint.original_image.cuda()
         # =================================================================
-        # 【新增：FFT 频率掩膜计算】
-        # 1. 延迟初始化 FFTFilter，确保获取到正确的图像分辨率
-        if self.fft_filter is None:
-            self.fft_filter = FFTFrequencyFilter(gt_img.shape[1], gt_img.shape[2])
+        # 【修改：FFT 频率掩膜条件计算】
+        # =================================================================
+        if self.use_fft_mask:
+            if self.fft_filter is None:
+                self.fft_filter = FFTFrequencyFilter(gt_img.shape[1], gt_img.shape[2])
 
-        # 2. 将 PyTorch Tensor [3, H, W] (0~1) 转换为 OpenCV BGR [H, W, 3] (0~255)
-        img_np = (gt_img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-
-        # 3. 计算二值掩膜并挂载到 viewpoint 上 (供后端高斯建图使用)
-        viewpoint.freq_mask = self.fft_filter.generate_frequency_mask(img_bgr)
+            img_np = (gt_img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+            viewpoint.freq_mask = self.fft_filter.generate_frequency_mask(img_bgr)
         # =================================================================
         valid_rgb = (gt_img.sum(dim=0) > rgb_boundary_threshold)[None] #首先根据图像像素亮度（RGB和）判断哪些像素是有效的（valid_rgb），过滤掉过暗的区域（通常视为无效边界）。
         if self.monocular: #单目模式下需要估计深度，由于单目相机没有深度传感器，系统无法获得真实的深度信息，必须通过“猜测”或利用已有的地图来估计深度，以便在 3D 空间中初始化新的高斯点。
@@ -304,8 +305,6 @@ class FrontEnd(mp.Process):
         # ====================================================================
 
         #计算相对位移（几何距离判断）这部分计算当前帧相对于上一关键帧移动了多少距离
-        # pose_CW = getWorld2View2(curr_frame.R, curr_frame.T) # 当前帧的世界到相机变换矩阵 (World to Camera)
-        # last_kf_CW = getWorld2View2(last_kf.R, last_kf.T) # 上一关键帧的世界到相机变换矩阵
         pose_CW = curr_frame.T
         last_kf_CW = last_kf.T
         last_kf_WC = torch.linalg.inv(last_kf_CW) # 上一关键帧的相机到世界变换矩阵 (Camera to World)
@@ -384,14 +383,12 @@ class FrontEnd(mp.Process):
                 inv_dists = []
                 kf_i_idx = window[i]
                 kf_i = self.cameras[kf_i_idx]
-                # kf_i_CW = getWorld2View2(kf_i.R, kf_i.T)
                 kf_i_CW = kf_i.T
                 for j in range(N_dont_touch, len(window)):
                     if i == j:
                         continue
                     kf_j_idx = window[j]
                     kf_j = self.cameras[kf_j_idx]
-                    # kf_j_WC = torch.linalg.inv(getWorld2View2(kf_j.R, kf_j.T))
                     kf_j_WC = torch.linalg.inv(kf_j.T)
                     T_CiCj = kf_i_CW @ kf_j_WC
                     inv_dists.append(1.0 / (torch.norm(T_CiCj[0:3, 3]) + 1e-6).item())
@@ -431,7 +428,6 @@ class FrontEnd(mp.Process):
         keyframes = data[3] #修正后的关键帧位姿列表，包含 (kf_id, kf_R, kf_T)
 
         for kf_id, kf_T in keyframes:
-            #self.cameras[kf_id].update_RT(kf_R.clone(), kf_T.clone())
             self.cameras[kf_id].T = kf_T
 
     def cleanup(self, cur_frame_idx):
@@ -440,6 +436,11 @@ class FrontEnd(mp.Process):
             torch.cuda.empty_cache()
 
     def exceeds_motion_thresholds(self, current_c2w, anchor_c2w):
+        # =========================================================
+        # 【消融控制】：如果子图开关关闭，永远返回 False，退化为单地图
+        # =========================================================
+        if not self.use_submap:
+            return False
         """
         判断当前位姿与子图起始位姿之间的相对运动是否超过阈值。
         注意：MonoGS 中 curr_frame.T 通常是 World to Camera (W2C) 变换。
@@ -512,21 +513,6 @@ class FrontEnd(mp.Process):
                     # ========== 新增：退出前将从属关系存入硬盘 ==========
                     torch.save(self.frame_to_submap, os.path.join(self.save_dir, "frame_to_submap.pt"))
                     # ====================================================
-                    if self.save_results:
-                        # 注意：此处的 ATE 评估我们会在 slam.py 中合并后再做，这里可以先注释掉或保留(评估未修正前)
-                        # 这里原本的 eval_ate 和 save_gaussians 先保留，它会评估未修正前的最终状态
-                        # eval_ate(
-                        #     self.cameras,
-                        #     self.kf_indices,
-                        #     self.save_dir,
-                        #     0,
-                        #     final=True,
-                        #     monocular=self.monocular,
-                        # )
-                        # save_gaussians(
-                        #     self.gaussians, self.save_dir, "final", final=True
-                        # )
-                        pass
                     break
                 # 当调用前端initialize函数时，会将 self.requested_init 设为 True，并向后端发送初始化请求。只有当后端完成初始化并通过队列发回 init 消息时（第 534-536 行），前端才会将此标志重置为 False
                 if self.requested_init:
@@ -660,10 +646,11 @@ class FrontEnd(mp.Process):
                             "Keyframes lacks sufficient overlap to initialize the map, resetting."
                         )
                         continue
+                    # 【新增】：计算渲染误差掩膜，告诉后端“哪里破了”【修改：条件计算渲染误差掩膜】
                     # =========================================================
-                    # 【新增】：计算渲染误差掩膜，告诉后端“哪里破了”
+                    if self.use_error_mask:
+                        viewpoint.error_mask = self.compute_error_mask(render_pkg, viewpoint)
                     # =========================================================
-                    viewpoint.error_mask = self.compute_error_mask(render_pkg, viewpoint)
                     #为新关键帧准备深度图和不透明度数据，用于后续后端初始化新的高斯点。
                     depth_map = self.add_new_keyframe(
                         cur_frame_idx,

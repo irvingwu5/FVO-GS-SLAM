@@ -15,7 +15,7 @@ Dataset:
   pcd_downsample_init: 32
   adaptive_pointsize: True
   point_size: 0.01
-  use_label: True
+  use_label: False
 
 Training:
   #Initialization
@@ -49,21 +49,12 @@ Training:
   lr:
     cam_rot_delta: 0.003
     cam_trans_delta: 0.001
-  sagsslam:
-    use_external_normal: True
-    use_surf_normal: False
-    use_distortion_loss: False
-    # 互斥选择: "sensor", "plane", "mixed"
-    #sensor_depthnomal_supervision、plane_normal_supervision、mixed_normal_supervision
-    normal_mode: "sensor"
-    use_plane_constraint: False
-    loss_type: "Huber"  # "l1" or "l2"
-    warmup_iter: 2500
+
 Submap:
   trans_thre: 1.5     # 平移切图阈值(米)
   rot_thre: 60           # 旋转切图阈值(度)
+
 LoopClosure:
-  enable: True
   min_interval: 2        # 触发闭环的最小子图间隔
   voxel_size: 0.02
 
@@ -106,3 +97,11 @@ pipeline_params:
   # surf depth is either median or expected by setting depth_ratio to 1 or 0
   # for bounded scene, use median depth, i.e., depth_ratio = 1;
   # for unbounded scene, use expected depth, i.e., depth_ration = 0, to reduce disk anliasing.
+Ablation:
+  use_submap: False          # (2) 是否开启子图切图策略 (关闭时退化为全局单地图)
+  use_loop_closure: False     # (3)&(4) 是否开启回环检测与全局 PGO 修正
+  use_fdn: False              # (5) 是否开启有限差分法线监督及相关 Loss 衰减
+  use_fft_mask: False         # (6) 是否开启 FFT 高低频掩膜指导采样与初始尺度设定
+  use_error_mask: False       # (6) 是否开启渲染误差掩膜指导动态补点
+  use_global_ba: False         # (7) 是否开启全局 BA 优化（如果开启，则迭代次数 opt_params.iterations 代表全局 BA 的迭代次数；如果关闭，则代表每个子图的局部优化迭代次数）
+  use_color_refinement: True   # (8) 是否开启颜色优化（如果开启，则在每次优化迭代中同时优化颜色相关参数；如果关闭，则只优化几何相关参数，颜色参数保持不变）
