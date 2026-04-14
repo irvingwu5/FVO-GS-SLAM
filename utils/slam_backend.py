@@ -514,19 +514,20 @@ class BackEnd(mp.Process):
                     torch.save(ckpt_data, ckpt_path)
 
                     # =========================================================
-                    # 【新增】：提取终局子图的代表性图像 (取中间关键帧)
+                    # 【核心修正】：终局保存也要保存多帧列表，而不是单张图片！
                     # =========================================================
+                    kf_image_paths = []
                     if len(submap_keyframes) > 0:
-                        rep_kf_idx = submap_keyframes[len(submap_keyframes) // 2]
-                        rep_image = self.viewpoints[rep_kf_idx].original_image.cpu()
-                        img_path = os.path.join(submaps_dir, f"{self.current_submap_id:06d}_img.pt")
-                        torch.save(rep_image, img_path)
-                    else:
-                        img_path = None
+                        for kf_idx in submap_keyframes:
+                            kf_image = self.viewpoints[kf_idx].original_image.cpu()
+                            # 文件名带上关键帧的 ID，防止覆盖
+                            img_path = os.path.join(submaps_dir, f"{self.current_submap_id:06d}_img_{kf_idx}.pt")
+                            torch.save(kf_image, img_path)
+                            kf_image_paths.append(img_path)
 
-                    # 【修改】：传入 4 个参数 (带上 img_path)
-                    if hasattr(self, 'loop_queue') and self.loop_queue is not None and img_path is not None:
-                        self.loop_queue.put(["submap_saved", self.current_submap_id, ckpt_path, img_path])
+                    if hasattr(self, 'loop_queue') and self.loop_queue is not None and len(kf_image_paths) > 0:
+                        # 确保发送的是 list，而不是单字符串
+                        self.loop_queue.put(["submap_saved", self.current_submap_id, ckpt_path, kf_image_paths])
 
                     Log(f"==> 终局保存：最后一块子图 {self.current_submap_id} 已存入硬盘。 <==")
                     break
@@ -646,19 +647,20 @@ class BackEnd(mp.Process):
                     torch.save(ckpt_data, ckpt_path)
 
                     # =========================================================
-                    # 【新增】：提取该子图的代表性图像 (取中间关键帧)
+                    # 【核心升级】：提取该子图的所有关键帧图像，组成 list 传给闭环模块
                     # =========================================================
+                    kf_image_paths = []
                     if len(submap_keyframes) > 0:
-                        rep_kf_idx = submap_keyframes[len(submap_keyframes) // 2]
-                        rep_image = self.viewpoints[rep_kf_idx].original_image.cpu()
-                        img_path = os.path.join(submaps_dir, f"{completed_submap_id:06d}_img.pt")
-                        torch.save(rep_image, img_path)
-                    else:
-                        img_path = None
+                        for kf_idx in submap_keyframes:
+                            kf_image = self.viewpoints[kf_idx].original_image.cpu()
+                            # 文件名带上关键帧的 ID，防止覆盖
+                            img_path = os.path.join(submaps_dir, f"{completed_submap_id:06d}_img_{kf_idx}.pt")
+                            torch.save(kf_image, img_path)
+                            kf_image_paths.append(img_path)
 
-                    # 【修改】：传入 4 个参数 (带上 img_path)
-                    if hasattr(self, 'loop_queue') and self.loop_queue is not None and img_path is not None:
-                        self.loop_queue.put(["submap_saved", completed_submap_id, ckpt_path, img_path])
+                    # 【修改】：第四个参数传入包含多帧路径的 list
+                    if hasattr(self, 'loop_queue') and self.loop_queue is not None and len(kf_image_paths) > 0:
+                        self.loop_queue.put(["submap_saved", completed_submap_id, ckpt_path, kf_image_paths])
 
                     # =================================================================
                     # 【终极核心修复】：时空双重缓冲 (无痛版，彻底消灭 KeyError)
