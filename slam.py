@@ -46,7 +46,6 @@ class GPUMemoryMonitor:
     def measure_usage(self):
         while self.keep_measuring:
             try:
-                # 调用系统底层的 nvidia-smi 获取最真实的物理显存占用
                 result = subprocess.check_output(
                     [
                         'nvidia-smi', f'--id={self.physical_gpu_id}',
@@ -56,9 +55,12 @@ class GPUMemoryMonitor:
                 current_mem = int(result.strip())
                 if current_mem > self.peak_memory:
                     self.peak_memory = current_mem
+
+                # 新增：让守护进程每隔 2 秒播报一次当前物理显存
+                print(f"[Monitor] 物理显存监控: {current_mem} MB / 24576 MB")
             except Exception:
                 pass
-            time.sleep(0.2)  # 每 0.2 秒高频采样一次
+            time.sleep(2.0)  # 放慢采样率到 2 秒，避免终端被日志淹没
 
     def start(self):
         self.thread.start()
@@ -240,100 +242,139 @@ class SLAM:
             Log("Loop Closure is disabled, skipping PGO finalize.")
 
         # =========================================================================
-        # 3. THE GRAND MERGE: 全局子图合并与相机轨迹深度校正
+        # 3. STREAMING MERGE: 流式子图合并与内存边缘化
         # =========================================================================
-        Log("==> 开始合并所有子图并校正全局相机轨迹... <==")
+        Log("==> 开启流式合并模式，正在拉取硬盘子图数据... <==")
 
         submaps_dir = os.path.join(self.save_dir, "submaps")
         ckpt_files = sorted(glob.glob(os.path.join(submaps_dir, "*.ckpt")))
 
-        merged_params = {
+        # 定义累加器列表，仅存储在 CPU 内存
+        final_params = {
             "_xyz": [], "_features_dc": [], "_features_rest": [],
             "_scaling": [], "_rotation": [], "_opacity": []
         }
         has_normal = False
+
+        # 读取从属关系映射
         frame_to_submap = torch.load(os.path.join(self.save_dir, "frame_to_submap.pt"))
         submap_tsfms = {}
 
-        # 遍历读取所有存入硬盘的子图
+        # 🟢 第一步：仅读取 PGO 修正矩阵（体积极小）
         for ckpt_path in ckpt_files:
-            ckpt = torch.load(ckpt_path, map_location="cuda")
-            gp = ckpt["gaussian_params"]
-
-            # 提取 PGO 修正矩阵
-            submap_id = int(os.path.basename(ckpt_path).split('.')[0])
+            sid = int(os.path.basename(ckpt_path).split('.')[0])
+            # map_location="cpu" 确保加载时不占显存，仅加载 header 获取修正矩阵
+            ckpt = torch.load(ckpt_path, map_location="cpu")
             correct_tsfm = ckpt.get("correct_tsfm", np.eye(4))
-            # =========================================================
-            # 【消融拦截】：如果关闭了回环，强制将修正矩阵设为单位阵！
-            # 防止复用同一输出目录时，意外读取到上一次跑出来的 PGO 矩阵
-            # =========================================================
+
+            # 消融拦截
             if not getattr(self, 'use_loop_closure', True):
                 correct_tsfm = np.eye(4)
 
-            submap_tsfms[submap_id] = torch.from_numpy(correct_tsfm).float().cuda()
+            submap_tsfms[sid] = torch.from_numpy(correct_tsfm).float()  # 保持在 CPU
+            del ckpt  # 立即释放
 
-            # 【核心】：在合并前，仅在此处执行一次刚体变换到高斯点云上！
-            if not np.allclose(correct_tsfm, np.eye(4), atol=1e-4):
-                gp = rigid_transform_2dgs(gp, correct_tsfm)
+        # 🟢 第二步：流式读取、变换、存入 CPU 累加器
+        for ckpt_path in tqdm(ckpt_files, desc="Streaming Submap Concatenation"):
+            sid = int(os.path.basename(ckpt_path).split('.')[0])
 
-            # ==============================================================
-            # 【显存修复 1：用完即焚，踢回 CPU】
-            # 防止所有的子图在 GPU 显存里“大团圆”导致绝杀 OOM。
-            # 将它们缓存到 CPU 列表里，组装完了再送去 GPU。
-            # ==============================================================
-            merged_params["_xyz"].append(gp["_xyz"].detach().cpu())
-            merged_params["_features_dc"].append(gp["_features_dc"].detach().cpu())
-            merged_params["_features_rest"].append(gp["_features_rest"].detach().cpu())
-            merged_params["_scaling"].append(gp["_scaling"].detach().cpu())
-            merged_params["_rotation"].append(gp["_rotation"].detach().cpu())
-            merged_params["_opacity"].append(gp["_opacity"].detach().cpu())
-            if "_normal" in gp:
+            # 1. 读入一个子图到内存 (CPU)
+            ckpt = torch.load(ckpt_path, map_location="cpu")
+            gp = ckpt["gaussian_params"]
+
+            # 2. 获取对应的 PGO 修正矩阵
+            tsfm = submap_tsfms[sid]
+
+            # 3. 执行空间变换 (增加安全检查)
+            if not np.allclose(tsfm.numpy(), np.eye(4), atol=1e-4):
+                # 【核心修复】：只对 Tensor 类型执行 .cuda()，忽略 int/float 等元数据
+                gp_cuda = {
+                    k: (v.cuda() if isinstance(v, torch.Tensor) else v)
+                    for k, v in gp.items()
+                }
+
+                # 执行刚体变换 (内部只处理 _xyz, _rotation, _normal)
+                gp_corrected = rigid_transform_2dgs(gp_cuda, tsfm.numpy())
+
+                # 变换完立即踢回 CPU
+                gp = {
+                    k: (v.cpu() if isinstance(v, torch.Tensor) else v)
+                    for k, v in gp_corrected.items()
+                }
+                del gp_cuda, gp_corrected
+
+            # 4. 存入流式累加器（仅存内容，确保 detach）
+            for key in final_params.keys():
+                if key in gp and isinstance(gp[key], torch.Tensor):
+                    final_params[key].append(gp[key].detach().cpu())
+
+            if "_normal" in gp and isinstance(gp["_normal"], torch.Tensor):
                 has_normal = True
-                if "_normal" not in merged_params: merged_params["_normal"] = []
-                merged_params["_normal"].append(gp["_normal"].detach().cpu())
+                if "_normal" not in final_params: final_params["_normal"] = []
+                final_params["_normal"].append(gp["_normal"].detach().cpu())
 
-            # 手动销毁当前循环的字典，及时腾出显存
+            # 5. 🎯 核心：立即销毁临时对象
             del gp, ckpt
+            # 强制垃圾回收
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()  # 合并阶段显存也很珍贵，随手清理
 
-        if len(merged_params["_xyz"]) > 0:
+        # 🟢 第三步：一次性拼接并推向 GPU
+        Log("==> 所有子图已离线变换完毕，正在构建全局高斯模型... <==")
+        if len(final_params["_xyz"]) > 0:
             import torch.nn as nn
-            # 彻底重建全局高斯模型，在 CPU 上拼接 (cat) 后，最后统一 .cuda() 送回显存
-            self.gaussians._xyz = nn.Parameter(torch.cat(merged_params["_xyz"], dim=0).cuda())
-            self.gaussians._features_dc = nn.Parameter(torch.cat(merged_params["_features_dc"], dim=0).cuda())
-            self.gaussians._features_rest = nn.Parameter(torch.cat(merged_params["_features_rest"], dim=0).cuda())
-            self.gaussians._scaling = nn.Parameter(torch.cat(merged_params["_scaling"], dim=0).cuda())
-            self.gaussians._rotation = nn.Parameter(torch.cat(merged_params["_rotation"], dim=0).cuda())
-            self.gaussians._opacity = nn.Parameter(torch.cat(merged_params["_opacity"], dim=0).cuda())
+            # 在 CPU 上完成最后的拼接，最后统一 .cuda()
+            self.gaussians._xyz = nn.Parameter(torch.cat(final_params["_xyz"], dim=0).cuda())
+            self.gaussians._features_dc = nn.Parameter(torch.cat(final_params["_features_dc"], dim=0).cuda())
+            self.gaussians._features_rest = nn.Parameter(torch.cat(final_params["_features_rest"], dim=0).cuda())
+            self.gaussians._scaling = nn.Parameter(torch.cat(final_params["_scaling"], dim=0).cuda())
+            self.gaussians._rotation = nn.Parameter(torch.cat(final_params["_rotation"], dim=0).cuda())
+            self.gaussians._opacity = nn.Parameter(torch.cat(final_params["_opacity"], dim=0).cuda())
             if has_normal:
-                self.gaussians._normal = nn.Parameter(torch.cat(merged_params["_normal"], dim=0).cuda())
+                self.gaussians._normal = nn.Parameter(torch.cat(final_params["_normal"], dim=0).cuda())
 
-            self.gaussians.active_sh_degree = self.gaussians.max_sh_degree
+            # 清空累加器，释放巨大的 CPU 内存
+            final_params.clear()
+            import gc
+            gc.collect()
 
-            # =======================================================
-            # 【终极修复】：同步扩充所有的辅助张量，防止 IndexError
-            # =======================================================
+            # 初始化辅助张量
             total_points = self.gaussians._xyz.shape[0]
             self.gaussians.max_radii2D = torch.zeros((total_points,), device="cuda")
             self.gaussians.xyz_gradient_accum = torch.zeros((total_points, 1), device="cuda")
             self.gaussians.denom = torch.zeros((total_points, 1), device="cuda")
-            self.gaussians.unique_kfIDs = torch.zeros((total_points,), device="cuda", dtype=torch.int32)
-            self.gaussians.n_obs = torch.zeros((total_points,), device="cuda", dtype=torch.int32)
+
 
             # =======================================================
             # 对前端相机的 4x4 矩阵进行逆向修正
             # =======================================================
+            # =======================================================
+            # 对前端相机的 4x4 矩阵进行逆向修正 (拉扯轨迹)
+            # =======================================================
             Log("==> 开始拉扯前端相机轨迹... <==")
-            for frame_id, cam in self.frontend.cameras.items():
+            for frame_id, cam in tqdm(self.frontend.cameras.items(), desc="Correcting Trajectory"):
                 sid = frame_to_submap.get(frame_id, 0)
-                tsfm_tensor = submap_tsfms.get(sid, torch.eye(4).cuda())
 
-                if torch.allclose(tsfm_tensor, torch.eye(4).cuda(), atol=1e-4):
+                # 从字典获取 CPU 上的修正矩阵
+                tsfm_tensor = submap_tsfms.get(sid, torch.eye(4))
+
+                # 1. 【修复核心】：确保比较时设备一致
+                # 如果修正矩阵非常接近单位阵，直接跳过
+                if torch.allclose(tsfm_tensor, torch.eye(4), atol=1e-4):
                     continue
 
-                inv_tsfm = torch.linalg.inv(tsfm_tensor)
+                # 2. 将修正矩阵送入 GPU 并计算逆矩阵
+                # 注意：cam.device 获取相机当前所在设备（通常是 cuda:0）
+                target_device = cam.T.device
+                tsfm_gpu = tsfm_tensor.to(target_device)
+                inv_tsfm = torch.linalg.inv(tsfm_gpu)
 
-                # 既然 cam.T 已经是 4x4 W2C 矩阵，直接矩阵相乘！
-                cam.T = cam.T @ inv_tsfm
+                # 3. 执行修正：cam.T = cam.T @ inv_tsfm
+                # 注意：cam.T 通常是 W2C 矩阵，PGO 修正的是 C2W 的偏置，
+                # 这里的数学逻辑需与你 rigid_transform_2dgs 内部逻辑对称
+                with torch.no_grad():
+                    cam.T = cam.T @ inv_tsfm
 
             Log(f"==> 拼接完成！全局高斯点总数: {self.gaussians._xyz.shape[0]} <==")
 

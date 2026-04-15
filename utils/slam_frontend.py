@@ -540,6 +540,12 @@ class FrontEnd(mp.Process):
                 if self.reset: #系统重置标志为 True，说明需要重新初始化 SLAM 系统
                     self.initialize(cur_frame_idx, viewpoint) #系统的冷启动，前端将第一帧关键帧信息发送给后端建立初始地图，重置标志为 False表明初始化已完成
                     self.current_window.append(cur_frame_idx) #将当前帧作为第一个关键帧加入滑动窗口（current_window为list）
+                    # =========================================================
+                    # 📍 前端显存探针：放在当前帧处理完，马上要进入下一帧之前
+                    # =========================================================
+                    print(f"[FrontEnd] 帧 {cur_frame_idx} 处理完毕 | "
+                          f"分配显存: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB, "
+                          f"保留显存: {torch.cuda.memory_reserved() / 1024 ** 3:.2f} GB")
                     cur_frame_idx += 1 # 直接进入下一帧
                     continue #跳过后续的所有逻辑（如 Tracking），直接回到 while True 开头。
 

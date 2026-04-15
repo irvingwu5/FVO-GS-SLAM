@@ -61,7 +61,7 @@ class LoopClosureProcess(mp.Process):
         # 【升级 1】：取消固定的 sim_threshold，新增动态阈值字典
         self.submap_features = {}  # 保存每个子图的多帧特征矩阵 [N, D]
         self.submap_thresholds = {}  # 保存每个子图的内部动态阈值 [N]
-        self.min_similarity_ratio = 0.1  # 自相似度 Top-K 比例 (例如前 10%)
+        self.min_similarity_ratio = 0.5  # 自相似度 Top-K 比例 (例如前 10%)
 
         self.min_interval = self.config.get("LoopClosure", {}).get("min_interval", 3)
         self.voxel_size = self.config.get("LoopClosure", {}).get("voxel_size", 0.05)
@@ -85,37 +85,41 @@ class LoopClosureProcess(mp.Process):
 
     # 【升级 2】：支持批量提取 Submap 内所有关键帧的特征，并计算动态阈值
     def extract_submap_features_and_threshold(self, img_paths):
-        """
-        提取多帧 NetVLAD 描述子，并计算用于闭环检测的动态自相似度阈值
-        """
         feats = []
         for img_path in img_paths:
-            img_tensor = torch.load(img_path).to(self.device)  # [3, H, W]
-            img_tensor = self.img_transform(img_tensor).unsqueeze(0)
+            # 1. 强制在 CPU 加载图像，避免加载瞬间的显存抖动
+            img_tensor = torch.load(img_path, map_location="cpu")  # [3, H, W]
+
+            # 2. 仅在推理时送入 GPU，并立即 detach 转回 CPU
+            img_input = self.img_transform(img_tensor).unsqueeze(0).to(self.device)
             with torch.no_grad():
-                feat = self.feature_extractor(img_tensor).squeeze()
+                feat = self.feature_extractor(img_input).squeeze().detach().cpu()
             feats.append(feat)
 
-        # 将列表拼接成矩阵 [N_kf, D]，并保存在 CPU 避免显存泄漏
-        submap_desc = torch.stack(feats).cpu()
+            # 3. 显式清理 GPU 上的临时图像张量
+            del img_input
 
-        # 计算内部自相似度矩阵 [N_kf, N_kf]
-        self_sim = torch.einsum("id,jd->ij", submap_desc, submap_desc)
+        # 4. 在 CPU 上进行矩阵运算（N 较小时 CPU 足够快，且不占显存）
+        submap_desc = torch.stack(feats)  # 此时已在 CPU 上
+        self_sim = torch.mm(submap_desc, submap_desc.T)
 
-        # 寻找第 K 大的相似度作为该帧的及格线 (K 至少为 1)
         k = max(int(len(submap_desc) * self.min_similarity_ratio), 1)
         score_min, _ = self_sim.topk(k, dim=1)
-
-        # 取 top-k 的最后一个元素作为阈值向量 [N_kf]
         dynamic_thresholds = score_min[:, -1]
 
+        # 确保返回的是 CPU 张量
         return submap_desc, dynamic_thresholds
 
     def extract_pcd_from_2dgs_ckpt(self, ckpt_path):
+        # 确保完全不经过 GPU
         submap_ckpt = torch.load(ckpt_path, map_location="cpu")
-        gaussian_params = submap_ckpt["gaussian_params"]
-        xyz = gaussian_params['_xyz'].numpy()
-        rot_q = gaussian_params['_rotation']
+        gp = submap_ckpt["gaussian_params"]
+
+        # 转换为 numpy，numpy 存储在内存（RAM）而非显存
+        xyz = gp['_xyz'].numpy()
+        rot_q = gp['_rotation']
+
+        # 在 CPU 上计算法线
         rot_mat = roma.unitquat_to_rotmat(rot_q).numpy()
         normals = rot_mat[:, :, 2]
 
@@ -123,6 +127,9 @@ class LoopClosureProcess(mp.Process):
         pcd.points = o3d.utility.Vector3dVector(xyz)
         pcd.normals = o3d.utility.Vector3dVector(normals)
         pcd = pcd.voxel_down_sample(voxel_size=self.voxel_size)
+
+        # 显式清理大型字典
+        del submap_ckpt, gp
         return pcd
 
     # 【升级 3】：纯视觉粗筛，彻底移除硬距离阈值拦截
@@ -131,34 +138,35 @@ class LoopClosureProcess(mp.Process):
         if query_id not in self.submap_features:
             return matched_ids
 
-        query_desc = self.submap_features[query_id]
-        query_thresh = self.submap_thresholds[query_id]
+        # 仅将当前 Query 描述子送入 GPU 一次
+        query_desc = self.submap_features[query_id].to(self.device)
+        query_thresh = self.submap_thresholds[query_id].to(self.device)
         query_centroid = self.submap_centroids[query_id]
 
         for db_id, db_desc in self.submap_features.items():
-            # =========================================================
-            # 【终极修复 1】：严格的时间箭头！坚决禁止“未来匹配过去”
-            # 把 abs() 去掉，只允许当前的 query 去找比自己小 min_interval 的 db
-            # =========================================================
             if db_id <= query_id - self.min_interval:
+                # 瞬时加载 DB 描述子
+                db_desc_cuda = db_desc.to(self.device)
 
-                # 计算跨子图的所有帧相似度矩阵 [N_q, N_db]
-                cross_sim = torch.einsum("id,jd->ij", query_desc, db_desc)
-
+                # 使用矩阵乘法替代 einsum，通常更快
+                cross_sim = torch.mm(query_desc, db_desc_cuda.T)
                 matches = torch.argwhere(cross_sim > query_thresh.unsqueeze(1))
 
                 if len(matches) > 0:
                     max_sim = cross_sim.max().item()
-
                     db_centroid = self.submap_centroids[db_id]
                     dist = np.linalg.norm(query_centroid - db_centroid)
 
-                    Log(f"[*] 🚀 视觉粗筛命中 (NetVLAD)! 子图 {query_id} -> {db_id} "
-                        f"(最高相似度: {max_sim:.3f}, 当前漂移距离: {dist:.2f}m, 命中帧对数: {len(matches)})")
-                    Log(f"    ↳ 已送入 ICP 进行 3D 几何精核...")
-
+                    Log(f"[*] 🚀 视觉粗筛命中: 子图 {query_id} -> {db_id} (相似度: {max_sim:.3f})")
                     matched_ids.append(db_id)
 
+                # 立即释放 DB 描述子的显存
+                del db_desc_cuda
+
+        # 释放 Query 显存
+        del query_desc, query_thresh
+        # 闭环检测后强制回收，防止显存阶梯增长
+        torch.cuda.empty_cache()
         return matched_ids
 
     # 【升级 4】：基于 2DGS 法线的 PointToPlane ICP 几何精核
@@ -213,53 +221,85 @@ class LoopClosureProcess(mp.Process):
             return np.identity(4), np.identity(6), False
 
     def construct_and_optimize_pose_graph(self):
-        def mat2pose(mat):
-            pos = mat[:3, 3].copy()
-            rot_mat = mat[:3, :3].copy()
-            rot_quat = Rotation.from_matrix(rot_mat).as_quat()
-            return PoseSE3(pos, rot_quat)
+        import open3d as o3d
 
-        vertices = []
-        edges = []
+        # 1. 初始化 Open3D 位姿图
+        pose_graph = o3d.pipelines.registration.PoseGraph()
         n_submaps = max(self.submap_records.keys()) + 1
 
+        # 2. 添加节点 (Nodes)
+        # 初始假设所有子图都在原点（或当前的初步位姿），PGO 会优化它们
         for i in range(n_submaps):
-            vertices.append(Vertex(i, PoseSE3(np.zeros(3), [0., 0., 0., 1.])))
+            pose_graph.nodes.append(
+                o3d.pipelines.registration.PoseGraphNode(np.identity(4))
+            )
 
-        # ==============================================================
-        # 【升级 6】：调低里程计边刚度 (500.0 -> 50.0)，让闭环拉伸真正生效
-        # 搭配上面 ICP 算出的权重 (最大 10.0)，50.0 是一个恰到好处的弹簧比例
-        # ==============================================================
-        info_odom = np.identity(6) * 50.0
+        # 3. 添加里程计边 (Odometry Edges) - 标记为 uncertain=False
+        # 这些边是我们高度信任的，通常不会被剪枝
+        info_odom = np.identity(6) * 50.0  # 刚度较强
         for i in range(1, n_submaps):
             source_id = i
             target_id = i - 1
-            edges.append(EdgeOdometry([target_id, source_id], info_odom, mat2pose(np.identity(4))))
+            pose_graph.edges.append(
+                o3d.pipelines.registration.PoseGraphEdge(
+                    source_id, target_id,
+                    np.identity(4),  # 相邻子图间的初始相对变换
+                    info_odom,
+                    uncertain=False
+                )
+            )
 
+        # 4. 添加回环边 (Loop Closure Edges) - 标记为 uncertain=True
+        # 这是剪枝机制生效的对象
         loop_found = False
         for source_id in range(1, n_submaps):
             matches = self.detect_closure(source_id)
             for target_id in matches:
                 trans, info_loop, success = self.compute_relative_transform(source_id, target_id)
                 if success:
-                    edges.append(EdgeOdometry([target_id, source_id], info_loop, mat2pose(trans)))
+                    pose_graph.edges.append(
+                        o3d.pipelines.registration.PoseGraphEdge(
+                            source_id, target_id,
+                            trans,
+                            info_loop,
+                            uncertain=True  # 🎯 关键：标记为不确定边，允许被剪枝
+                        )
+                    )
                     loop_found = True
 
         if not loop_found:
             return []
 
-        Log("检测到有效闭环，启动纯 Python-GraphSLAM 全局优化...")
-        graph = Graph(edges, vertices)
-        graph.optimize(tol=1e-4, max_iter=100)
+        Log(f"检测到有效闭环，启动 Open3D 全局优化 (带边剪枝机制)...")
 
+        # 5. 🎯 配置优化选项 (实现 LoopSplat 机制)
+        # 从 config 读取阈值，如果没有，建议设置在 0.1 ~ 5.0 之间
+        prune_threshold = self.config.get("LoopClosure", {}).get("pgo_edge_prune_thres", 1.0)
+
+        option = o3d.pipelines.registration.GlobalOptimizationOption(
+            max_correspondence_distance=self.voxel_size * 1.5,
+            edge_prune_threshold=prune_threshold,  # 🎯 机制核心：残差超过此值的 uncertain 边将被剔除
+            reference_node=0
+        )
+
+        # 6. 执行优化
+        o3d.pipelines.registration.global_optimization(
+            pose_graph,
+            o3d.pipelines.registration.GlobalOptimizationLevenbergMarquardt(),
+            o3d.pipelines.registration.GlobalOptimizationConvergenceCriteria(),
+            option
+        )
+
+        # 7. 提取优化后的结果
         correction_list = []
-        T_0_inv = np.linalg.inv(graph._vertices[0].pose.to_matrix())
+        # 以第一个节点为参考坐标系，计算相对修正
+        T_0_inv = np.linalg.inv(pose_graph.nodes[0].pose)
 
-        for v in graph._vertices:
-            opt_trans = v.pose.to_matrix()
+        for i in range(len(pose_graph.nodes)):
+            opt_trans = pose_graph.nodes[i].pose
             final_trans = T_0_inv @ opt_trans
             correction_list.append({
-                'submap_id': v.id,
+                'submap_id': i,
                 'correct_tsfm': final_trans
             })
 

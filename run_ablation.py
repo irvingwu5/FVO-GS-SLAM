@@ -8,7 +8,7 @@ from copy import deepcopy
 # 配置区域
 # =========================================================================
 # 要执行的 YAML 配置文件路径 (你可以根据需要改成 fr3_office.yaml)
-CONFIG_FILE_PATH = "./configs/rgbd/replica/room0.yaml"
+#CONFIG_FILE_PATH = "./configs/rgbd/replica/room0.yaml"
 # 日志保存目录
 LOG_DIR = "./ablation_logs"
 # GPU 设置 (默认使用 GPU 1)
@@ -23,8 +23,7 @@ ABLATION_EXPERIMENTS = {
         "use_loop_closure": False,
         "use_fdn": False,
         "use_fft_mask": False,
-        "use_error_mask": False,
-        "use_global_ba": False
+        "use_error_mask": False
     },
     "ExpC_Plus_Submap": {
         "use_color_refinement": True,
@@ -32,8 +31,7 @@ ABLATION_EXPERIMENTS = {
         "use_loop_closure": False,
         "use_fdn": False,
         "use_fft_mask": False,
-        "use_error_mask": False,
-        "use_global_ba": False
+        "use_error_mask": False
     },
     "ExpD_Plus_LoopClosure": {
         "use_color_refinement": True,
@@ -41,8 +39,7 @@ ABLATION_EXPERIMENTS = {
         "use_loop_closure": True,
         "use_fdn": False,
         "use_fft_mask": False,
-        "use_error_mask": False,
-        "use_global_ba": False
+        "use_error_mask": False
     },
     "ExpE_Plus_FDN": {
         "use_color_refinement": True,
@@ -50,8 +47,7 @@ ABLATION_EXPERIMENTS = {
         "use_loop_closure": True,
         "use_fdn": True,
         "use_fft_mask": False,
-        "use_error_mask": False,
-        "use_global_ba": False
+        "use_error_mask": False
     },
     "ExpF_Plus_FFTMask": {
         "use_color_refinement": True,
@@ -59,8 +55,7 @@ ABLATION_EXPERIMENTS = {
         "use_loop_closure": True,
         "use_fdn": True,
         "use_fft_mask": True,
-        "use_error_mask": False,
-        "use_global_ba": False
+        "use_error_mask": False
     },
     "ExpG_Full_System": {
         "use_color_refinement": True,
@@ -68,8 +63,7 @@ ABLATION_EXPERIMENTS = {
         "use_loop_closure": True,
         "use_fdn": True,
         "use_fft_mask": True,
-        "use_error_mask": True,
-        "use_global_ba": False
+        "use_error_mask": True
     }
 }
 

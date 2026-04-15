@@ -716,6 +716,12 @@ class BackEnd(mp.Process):
 
                     self.iteration_count = 0
                     torch.cuda.empty_cache()
+                    # =========================================================
+                    # 📍 后端显存探针：放在清空显存缓存 (empty_cache) 之后
+                    # =========================================================
+                    print(f"[BackEnd] 触发切图与清理完成！当前子图 ID: {completed_submap_id} | "
+                          f"清理后分配显存: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB, "
+                          f"清理后保留显存: {torch.cuda.memory_reserved() / 1024 ** 3:.2f} GB")
                     Log(f"==> Submap {completed_submap_id} frozen and VRAM cleared. Ready for next submap. <==")
                 else:
                     raise Exception("Unprocessed data", data)

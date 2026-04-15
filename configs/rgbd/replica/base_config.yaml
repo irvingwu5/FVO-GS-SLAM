@@ -69,6 +69,7 @@ LoopClosure:
   enable: True
   min_interval: 2        # 触发闭环的最小子图间隔
   voxel_size: 0.02
+  pgo_edge_prune_thres: 0.25  # 建议初始值
 
 opt_params:
   iterations: 30000
