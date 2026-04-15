@@ -375,68 +375,35 @@ class SLAM:
             )
 
             # -------------------------------------------------------------
-            # 阶段 B：离线联合优化 (Global BA & Color Refinement)
+            # 阶段 B：离线联合优化 (严格遵守 MonoGS 原版 Color Refinement 逻辑)
             # -------------------------------------------------------------
-            if self.use_global_ba or self.use_color_refinement:
-                Log(f"==> 开始离线优化 | Global BA: {self.use_global_ba} | Color Refine: {self.use_color_refinement} <==")
+            if self.use_color_refinement:
+                Log(f"==> 开始离线优化 | Color Refinement: {self.use_color_refinement} <==")
 
                 valid_cameras = list(self.frontend.cameras.values())
 
                 if len(valid_cameras) > 0:
-                    if self.use_color_refinement:
-                        self.gaussians.training_setup(self.opt_params)
+                    # 1. 重新初始化 Gaussian 的优化器 (使用标准参数，不再做任何学习率魔改)
+                    self.gaussians.training_setup(self.opt_params)
 
-                        total_points = self.gaussians._xyz.shape[0]
-                        self.gaussians.max_radii2D = torch.zeros((total_points,), device="cuda")
-                        self.gaussians.xyz_gradient_accum = torch.zeros((total_points, 1), device="cuda")
-                        self.gaussians.denom = torch.zeros((total_points, 1), device="cuda")
-                        self.gaussians.unique_kfIDs = torch.zeros((total_points,), device="cuda", dtype=torch.int32)
-                        self.gaussians.n_obs = torch.zeros((total_points,), device="cuda", dtype=torch.int32)
+                    # 2. 清空相关的状态张量
+                    total_points = self.gaussians._xyz.shape[0]
+                    self.gaussians.max_radii2D = torch.zeros((total_points,), device="cuda")
 
-                        self.gaussians._xyz.requires_grad = True
-                        self.gaussians._scaling.requires_grad = True
-                        self.gaussians._rotation.requires_grad = True
-                        if hasattr(self.gaussians, '_normal'):
-                            self.gaussians._normal.requires_grad = True
-
-                        for param_group in self.gaussians.optimizer.param_groups:
-                            if param_group["name"] in ["xyz", "rotation", "scaling", "normal"]:
-                                param_group["lr"] = param_group["lr"] * 0.2
-
-                    if self.use_global_ba:
-                        for cam in valid_cameras:
-                            if getattr(cam, 'cam_rot_delta', None) is None:
-                                cam.cam_rot_delta = torch.nn.Parameter(
-                                    torch.zeros(3, requires_grad=True, device="cuda"))
-                            if getattr(cam, 'cam_trans_delta', None) is None:
-                                cam.cam_trans_delta = torch.nn.Parameter(
-                                    torch.zeros(3, requires_grad=True, device="cuda"))
-                            if getattr(cam, 'exposure_a', None) is None:
-                                cam.exposure_a = torch.nn.Parameter(
-                                    torch.tensor([0.0], requires_grad=True, device="cuda"))
-                            if getattr(cam, 'exposure_b', None) is None:
-                                cam.exposure_b = torch.nn.Parameter(
-                                    torch.tensor([0.0], requires_grad=True, device="cuda"))
-
-                            cam_opt_params = [
-                                {"params": [cam.cam_rot_delta],
-                                 "lr": self.config["Training"]["lr"]["cam_rot_delta"] * 0.2},
-                                {"params": [cam.cam_trans_delta],
-                                 "lr": self.config["Training"]["lr"]["cam_trans_delta"] * 0.2},
-                                {"params": [cam.exposure_a], "lr": 0.01},
-                                {"params": [cam.exposure_b], "lr": 0.01}
-                            ]
-                            cam.optimizer = torch.optim.Adam(cam_opt_params)
-
+                    # 3. 原版 MonoGS 设定
                     iteration_total = 26000
+
+                    # (保留你原本的图片缓存机制，防止读取全量高清图导致 CPU/GPU OOM)
                     cpu_image_cache = {}
                     MAX_CACHE_SIZE = 800
 
-                    pbar = tqdm(total=iteration_total, desc="Offline Optimization")
+                    pbar = tqdm(total=iteration_total, desc="Offline Color Refinement")
 
                     for iteration in range(1, iteration_total + 1):
+                        # 随机抽取一个有效的相机视角
                         viewpoint_cam = random.choice(valid_cameras)
 
+                        # 读取 GT 图像 (带缓存逻辑)
                         if viewpoint_cam.uid in cpu_image_cache:
                             gt_image_raw = cpu_image_cache[viewpoint_cam.uid]
                         else:
@@ -448,6 +415,7 @@ class SLAM:
 
                         gt_image = gt_image_raw.cuda(non_blocking=True)
 
+                        # 渲染当前视角
                         render_pkg = render(
                             viewpoint_cam, self.gaussians, self.pipeline_params, self.background, surf=False
                         )
@@ -455,6 +423,7 @@ class SLAM:
                         visibility_filter = render_pkg["visibility_filter"]
                         radii = render_pkg["radii"]
 
+                        # 计算损失 (严格对齐 MonoGS 原版 Loss)
                         Ll1 = l1_loss(image, gt_image)
                         loss = (1.0 - self.opt_params.lambda_dssim) * Ll1 + self.opt_params.lambda_dssim * (
                                 1.0 - ssim(image.unsqueeze(0), gt_image.unsqueeze(0)))
@@ -462,58 +431,43 @@ class SLAM:
                         loss.backward()
 
                         with torch.no_grad():
-                            if self.use_color_refinement:
-                                self.gaussians.max_radii2D[visibility_filter] = torch.max(
-                                    self.gaussians.max_radii2D[visibility_filter], radii[visibility_filter]
-                                )
-                                self.gaussians.optimizer.step()
-                                self.gaussians.optimizer.zero_grad(set_to_none=True)
-                                self.gaussians.update_learning_rate(iteration)
+                            # 记录最大半径
+                            self.gaussians.max_radii2D[visibility_filter] = torch.max(
+                                self.gaussians.max_radii2D[visibility_filter], radii[visibility_filter]
+                            )
+                            # 原汁原味的步进与清零
+                            self.gaussians.optimizer.step()
+                            self.gaussians.optimizer.zero_grad(set_to_none=True)
 
-                            if self.use_global_ba:
-                                viewpoint_cam.optimizer.step()
-                                viewpoint_cam.optimizer.zero_grad(set_to_none=True)
-                                update_pose(viewpoint_cam)
+                            # 原汁原味的学习率更新 (会同步更新 xyz 等属性的学习率衰减)
+                            self.gaussians.update_learning_rate(iteration)
 
-                                if iteration % 100 == 0:
-                                    lr_factor = (0.01 ** (1.0 / (iteration_total / 100)))
-                                    for cam in valid_cameras:
-                                        for param_group in cam.optimizer.param_groups:
-                                            param_group['lr'] *= lr_factor
-
+                        # 释放显存
                         del gt_image
                         pbar.update(1)
 
+                    # 循环结束，清理缓存
                     del cpu_image_cache
                     import gc
                     gc.collect()
 
                     pbar.close()
-                    Log("==> 离线联合优化完成！ <==")
+                    Log("==> Map refinement done <==")
 
                     # -------------------------------------------------------------
                     # 阶段 C：评估精修后的最终状态
                     # -------------------------------------------------------------
-                    if self.use_global_ba:
-                        Log("Evaluating FINAL ATE (Camera Poses Adjusted)...")
-                        final_ATE = eval_ate(
-                            self.frontend.cameras,
-                            self.frontend.kf_indices,
-                            self.save_dir,
-                            0,
-                            final=True,
-                            monocular=self.monocular,
-                        )
-                    else:
-                        final_ATE = current_ATE  # 若没开 BA，则 ATE 不变
-
-                    Log("Rendering FINAL Map Quality...")
+                    Log("Rendering FINAL Map Quality (After Color Refinement)...")
                     rendering_result_after = eval_rendering(
                         self.frontend.cameras, self.gaussians, self.dataset, self.save_dir,
                         self.pipeline_params, self.background, kf_indices=kf_indices,
                         iteration="global_merged_after_opt",
                     )
 
+                    # 因为没有 BA，相机位姿未变，直接复用 current_ATE
+                    final_ATE = current_ATE
+
+                    # 将精修后的指标加入 wandb 表格
                     metrics_table.add_data(
                         "After_Offline_Opt",
                         rendering_result_after["mean_psnr"],
@@ -522,16 +476,15 @@ class SLAM:
                         rendering_result_after.get("mean_depth_l1", 0.0),
                         final_ATE, FPS,
                     )
-                    save_gaussians(self.gaussians, self.save_dir, "final_merged_after_opt", final=True)
 
                 else:
                     Log("[Warning] 没有找到有效的相机帧，跳过离线优化。")
             else:
-                Log("==> [Ablation] 离线优化模块 (Global BA / Color Refinement) 均已关闭！ <==")
+                Log("==> [Ablation] 离线优化模块 (Color Refinement) 已关闭！ <==")
                 Log("==> 结果将以拼接后的初始状态直接保存。 <==")
                 save_gaussians(self.gaussians, self.save_dir, "final_merged_no_opt", final=True)
 
-            # 最终统一写入 wandb
+                # 最终统一写入 wandb (这里会包含 Before 和 After 两行数据做对比)
             wandb.log({"Metrics": metrics_table})
 
             # 保存巅峰之作
