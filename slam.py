@@ -1,6 +1,5 @@
 import os
 import sys
-import time
 from argparse import ArgumentParser
 from datetime import datetime
 import numpy as np
@@ -29,7 +28,6 @@ from utils.loop_closure import LoopClosureProcess
 # ========================================================
 # 引入刚体变换引擎
 from utils.loop_closure import rigid_transform_2dgs
-from utils.pose_utils import update_pose
 import glob
 import threading
 import subprocess
@@ -57,7 +55,7 @@ class GPUMemoryMonitor:
                     self.peak_memory = current_mem
 
                 # 新增：让守护进程每隔 2 秒播报一次当前物理显存
-                print(f"[Monitor] 物理显存监控: {current_mem} MB / 24576 MB")
+                #print(f"[Monitor] 物理显存监控: {current_mem} MB / 24576 MB")
             except Exception:
                 pass
             time.sleep(2.0)  # 放慢采样率到 2 秒，避免终端被日志淹没
@@ -448,7 +446,7 @@ class SLAM:
                         if viewpoint_cam.uid in cpu_image_cache:
                             gt_image_raw = cpu_image_cache[viewpoint_cam.uid]
                         else:
-                            gt_image_raw, _, _, _, _ = self.dataset[viewpoint_cam.uid]
+                            gt_image_raw, _, _ = self.dataset[viewpoint_cam.uid]
                             if len(cpu_image_cache) >= MAX_CACHE_SIZE:
                                 del_key = random.choice(list(cpu_image_cache.keys()))
                                 del cpu_image_cache[del_key]

@@ -1,7 +1,7 @@
 ## SLAM parameters
 Results:
   save_results: True
-  save_dir: "ablation_results"
+  save_dir: "tum_results"
   save_trj: True
   save_trj_kf_intv: 5
   use_gui: True
@@ -15,7 +15,6 @@ Dataset:
   pcd_downsample_init: 32
   adaptive_pointsize: True
   point_size: 0.01
-  use_label: False
 
 Training:
   #Initialization
@@ -71,11 +70,8 @@ opt_params:
   scaling_lr: 0.001
   rotation_lr: 0.001
   percent_dense: 0.01
-  lambda_surf_normal: 0.01
   lambda_sensor_normal: 0.001
-  lambda_plane: 15.0
   lambda_dssim: 0.2
-  lambda_dist: 100.0
   densification_interval: 100
   opacity_reset_interval: 3000 #3000->6000
   densify_from_iter: 500
@@ -104,5 +100,4 @@ Ablation:
   use_fdn: True              # (5) 是否开启有限差分法线监督及相关 Loss 衰减
   use_fft_mask: True         # (6) 是否开启 FFT 高低频掩膜指导采样与初始尺度设定
   use_error_mask: True        # (6) 是否开启渲染误差掩膜指导动态补点
-  use_global_ba: True         # (7) 是否开启全局 BA 优化（如果开启，则迭代次数 opt_params.iterations 代表全局 BA 的迭代次数；如果关闭，则代表每个子图的局部优化迭代次数）
   use_color_refinement: True   # (8) 是否开启颜色优化（如果开启，则在每次优化迭代中同时优化颜色相关参数；如果关闭，则只优化几何相关参数，颜色参数保持不变）

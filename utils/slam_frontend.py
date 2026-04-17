@@ -543,9 +543,9 @@ class FrontEnd(mp.Process):
                     # =========================================================
                     # 📍 前端显存探针：放在当前帧处理完，马上要进入下一帧之前
                     # =========================================================
-                    print(f"[FrontEnd] 帧 {cur_frame_idx} 处理完毕 | "
-                          f"分配显存: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB, "
-                          f"保留显存: {torch.cuda.memory_reserved() / 1024 ** 3:.2f} GB")
+                    # print(f"[FrontEnd] 帧 {cur_frame_idx} 处理完毕 | "
+                    #       f"分配显存: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB, "
+                    #       f"保留显存: {torch.cuda.memory_reserved() / 1024 ** 3:.2f} GB")
                     cur_frame_idx += 1 # 直接进入下一帧
                     continue #跳过后续的所有逻辑（如 Tracking），直接回到 while True 开头。
 

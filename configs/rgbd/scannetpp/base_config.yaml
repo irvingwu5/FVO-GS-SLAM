@@ -1,6 +1,6 @@
 Results:
   save_results: True
-  save_dir: "replica_results"
+  save_dir: "scannetpp_results"
   save_trj: True
   save_trj_kf_intv: 20 #20->40
   use_gui: True
@@ -13,20 +13,20 @@ Dataset:
   pcd_downsample_init: 32 #初始阶段下采样因子
   adaptive_pointsize: True #点大小乘中值深度得到场景中点的实际大小，限制最小为0.05
   point_size: 0.05 # 影响scales的初始化
-  type: 'replica'
+  type: 'scannetpp'
   Calibration:
-    fx: 600.0
-    fy: 600.0
-    cx: 599.5
-    cy: 339.5
+    fx: 190.3925
+    fy: 190.3925
+    cx: 127.1969
+    cy: 96.4810
     k1: 0.0
     k2: 0.0
     p1: 0.0
     p2: 0.0
     k3: 0.0
-    width: 1200
-    height: 680
-    depth_scale: 6553.5
+    width: 256
+    height: 192
+    depth_scale: 1000.0
     distorted: False
 
 
@@ -95,7 +95,7 @@ model_params:
   resolution: -1
   white_background: False
   data_device: "cuda"
-  
+
 pipeline_params:
   convert_SHs_python: False
   compute_cov3D_python: False
@@ -105,7 +105,7 @@ pipeline_params:
   # for bounded scene, use median depth, i.e., depth_ratio = 1;
   # for unbounded scene, use expected depth, i.e., depth_ration = 0, to reduce disk anliasing.
 Ablation:
-  use_submap: True          # (2) 是否开启子图切图策略 (关闭时退化为全局单地图)
+  use_submap: True           # (2) 是否开启子图切图策略 (关闭时退化为全局单地图)
   use_loop_closure: True     # (3)&(4) 是否开启回环检测与全局 PGO 修正
   use_fdn: True              # (5) 是否开启有限差分法线监督及相关 Loss 衰减
   use_fft_mask: True         # (6) 是否开启 FFT 高低频掩膜指导采样与初始尺度设定

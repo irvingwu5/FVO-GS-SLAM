@@ -167,7 +167,7 @@ def eval_rendering(
     # =========================================================
     for idx in range(0, end_idx, interval):
         frame = frames[idx]
-        gt_image, gt_depth, _, _, _ = dataset[idx]
+        gt_image, gt_depth, _ = dataset[idx]
 
         # 统一执行一次渲染，绝不浪费算力
         render_pkg = render(frame, gaussians, pipe, background)

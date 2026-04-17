@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import trimesh
 from PIL import Image
-
+import json
 from gaussian_splatting.utils.graphics_utils import focal2fov
 
 try:
@@ -17,13 +17,10 @@ except Exception:
 
 
 class ReplicaParser:
-    def __init__(self, input_folder, has_label=False):
+    def __init__(self, input_folder):
         self.input_folder = input_folder
         self.color_paths = sorted(glob.glob(f"{self.input_folder}/image/*.jpg"))
         self.depth_paths = sorted(glob.glob(f"{self.input_folder}/depth/*.png"))
-        if has_label:
-            self.label_paths = sorted(glob.glob(f"{self.input_folder}/plane/*label.txt")) # 添加标签文件路径
-            self.plane_params = sorted(glob.glob(f"{self.input_folder}/plane/*data.txt")) # 添加平面参数文件路径
         self.n_img = len(self.color_paths)
         self.load_poses(f"{self.input_folder}/traj.txt")
 
@@ -41,9 +38,7 @@ class ReplicaParser:
             frame = {
                 "file_path": self.color_paths[i],
                 "depth_path": self.depth_paths[i],
-                "label_path": self.label_paths[i] if hasattr(self, 'label_paths') else None,
-                "plane_eq_path": self.plane_params[i] if hasattr(self, 'plane_params') else None,
-                "transform_matrix": pose.tolist(),
+                "transform_matrix": pose.tolist()
             }
 
             frames.append(frame)
@@ -51,9 +46,9 @@ class ReplicaParser:
 
 
 class TUMParser:
-    def __init__(self, input_folder, has_label=False):
+    def __init__(self, input_folder):
         self.input_folder = input_folder
-        self.load_poses(self.input_folder, frame_rate=32, has_label=has_label)
+        self.load_poses(self.input_folder, frame_rate=32)
         self.n_img = len(self.color_paths)
 
     def parse_list(self, filepath, skiprows=0):
@@ -79,7 +74,7 @@ class TUMParser:
 
         return associations # list of tuples [(16,0,351),(),……,()]，每个元组包含图像索引、深度图索引、位姿索引
 
-    def load_poses(self, datapath, frame_rate=-1, has_label=False):
+    def load_poses(self, datapath, frame_rate=-1):
         if os.path.isfile(os.path.join(datapath, "groundtruth.txt")): # 检测是否存在groundtruth.txt文件
             pose_list = os.path.join(datapath, "groundtruth.txt") # 文件绝对路径，文件内容包含时间戳、平移、四元数
         elif os.path.isfile(os.path.join(datapath, "pose.txt")):
@@ -87,20 +82,17 @@ class TUMParser:
 
         image_list = os.path.join(datapath, "rgb.txt") # 文件绝对路径，文件内容包含时间戳及其相对应图像相对路径
         depth_list = os.path.join(datapath, "depth.txt")
-        if has_label:
-            label_list = os.path.join(datapath, "plane_label.txt") # 平面标签文件绝对路径，文件内容包含时间戳及其相对应标签文件相对路径
-            plane_eq_list = os.path.join(datapath, "plane_eq.txt") # 平面参数文件绝对路径，文件内容包含时间戳及其相对应平面参数文件相对路径
+
         # image、depth、gtpose的时间戳可能不完全对应，需要进行关联
         image_data = self.parse_list(image_list) #(613,2) 第一列时间戳，第二列时间戳对应的图像相对路径
         depth_data = self.parse_list(depth_list) #(595,2) 第一列时间戳，第二列时间戳对应的深度图相对路径
         pose_data = self.parse_list(pose_list, skiprows=1) #字符串类型numpy数组(2335,8) 第一列时间戳，第二到第四列平移，第五到第八列四元数
         pose_vecs = pose_data[:, 0:].astype(np.float64) #转换为浮点型numpy数组
-        label_data = self.parse_list(label_list) if has_label is True else None #(613,2) 第一列时间戳，第二列时间戳对应的标签文件相对路径
-        plane_eq_data = self.parse_list(plane_eq_list) if has_label is True else None #(613,2) 第一列时间戳，第二列时间戳对应的平面参数文件相对路径
+
         tstamp_image = image_data[:, 0].astype(np.float64) # 第0列图片时间戳(613,)
         tstamp_depth = depth_data[:, 0].astype(np.float64) # 第0列深度图时间戳(595,)
         tstamp_pose = pose_data[:, 0].astype(np.float64) # 第0列pose时间戳(2335,)
-        #tstamp_label = label_data[:, 0].astype(np.float64) if is_add_label_flag is True else None # 第0列标签时间戳(613,),与图像时间戳一致不需要单独关联
+
 
         associations = self.associate_frames(tstamp_image, tstamp_depth, tstamp_pose) # list of tuples [(16,0,351),(),……,()]，每个元组包含图像索引、深度图索引、位姿索引
         # 对已关联的帧做下采样（thinning / subsampling）：从原始的连续帧序列中只保留部分帧，使相邻保留帧的时间间隔不小于阈值 1/frame_rate 秒
@@ -112,15 +104,13 @@ class TUMParser:
             if t1 - t0 > 1.0 / frame_rate:
                 indicies += [i]
 
-        self.color_paths, self.poses, self.depth_paths, self.frames, self.label_paths, self.plane_eq_paths = [], [], [], [], [], []
+        self.color_paths, self.poses, self.depth_paths, self.frames = [], [], [], []
 
         for ix in indicies: # 遍历被保留的关联项索引列表
             (i, j, k) = associations[ix] # 获取图像索引i、深度图索引j、位姿索引k
             self.color_paths += [os.path.join(datapath, image_data[i, 1])] # 行索引i 时间戳(列索引0)、相对路径(列索引1)，最终保存的是图像文件的绝对路径
             self.depth_paths += [os.path.join(datapath, depth_data[j, 1])]
-            if has_label:
-                self.label_paths += [os.path.join(datapath, label_data[i, 1])] # 行索引i 时间戳(列索引0)、相对路径(列索引1)，最终保存的是标签文件的绝对路径
-                self.plane_eq_paths += [os.path.join(datapath, plane_eq_data[i, 1])] # 行索引i 时间戳(列索引0)、相对路径(列索引1)，最终保存的是平面参数文件的绝对路径
+
             quat = pose_vecs[k][4:] # 行索引k 时间戳(列索引0)、平移(列索引1-3)、四元数(列索引4-7)，(4,)
             trans = pose_vecs[k][1:4] # (3,)
             T = trimesh.transformations.quaternion_matrix(np.roll(quat, 1)) # 四元数转为(4,4)变换矩阵填充3*3旋转矩阵部分，注意np.roll(quat,1)将四元数循环右移一位从(x,y,z,w)变为(w,x,y,z)
@@ -130,12 +120,73 @@ class TUMParser:
             frame = {
                 "file_path": str(os.path.join(datapath, image_data[i, 1])), # 挑选出来的rgb的绝对路径
                 "depth_path": str(os.path.join(datapath, depth_data[j, 1])), # 挑选出来的depth的绝对路径
-                "label_path": str(os.path.join(datapath, label_data[i, 1])) if has_label is True else None, # 挑选出来的label的绝对路径
-                "plane_eq_path": str(os.path.join(datapath, plane_eq_data[i, 1])) if has_label is True else None, # 挑选出来的plane_param的绝对路径
-                "transform_matrix": (np.linalg.inv(T)).tolist(), # 对应的相机位姿矩阵c2w
+                "transform_matrix": (np.linalg.inv(T)).tolist()# 对应的相机位姿矩阵c2w
             }
 
             self.frames.append(frame)
+
+
+class ScannetppParser:
+    def __init__(self, input_folder, frame_rate=-1):
+        self.input_folder = input_folder
+        self.color_paths = []
+        self.depth_paths = []
+        self.poses = []
+        self.intrinsics = []
+
+        self.load_poses(input_folder, frame_rate=frame_rate)
+        self.n_img = len(self.color_paths)
+
+    def load_poses(self, path, frame_rate=-1):
+        pose_intrinsic_imu_json_path = os.path.join(path, "pose_intrinsic_imu.json")
+        with open(pose_intrinsic_imu_json_path, "r") as f:
+            # iPhone 的 json 结构外层可能不是直接以 frame_name 为 key，具体需参考原始 json
+            # 假设其格式类似于 { "frame_00000": {"aligned_poses": [...], "intrinsic": [...], "timestamp": ...} }
+            data = json.load(f)
+
+        # RGB 图像位于 rgb 文件夹下
+        all_color_paths = sorted(glob.glob(os.path.join(self.input_folder, "rgb", "*.jpg")))
+        interval_threshold = 1.0 / frame_rate if frame_rate > 0 else 0.0
+        last_timestamp = -float('inf') #更新为当前被保留帧的时间戳，初始值为负无穷，确保第一个帧一定被保留
+
+        for color_path in all_color_paths:
+            filename = os.path.basename(color_path)
+            frame_name, _ = os.path.splitext(filename)
+
+            if frame_name not in data:
+                continue
+
+            frame_data = data[frame_name]
+
+            # 使用 aligned_poses 确保与 Ground Truth Mesh 对齐
+            if "aligned_pose" not in frame_data:
+                continue
+
+            timestamp = frame_data.get("timestamp", 0.0)
+
+            if timestamp - last_timestamp >= interval_threshold:
+                # 读取 c2w 位姿
+                T_c2w = np.array(frame_data["aligned_pose"], dtype=np.float32).reshape(4, 4)
+
+                # 你的系统默认读取 w2c，所以要求逆
+                T_w2c = np.linalg.inv(T_c2w)
+
+                # 读取 3x3 RGB 内参
+                K = np.array(frame_data["intrinsic"], dtype=np.float32).reshape(3, 3)
+
+                # 深度图路径
+                depth_path = os.path.join(self.input_folder, "depth", f"{frame_name}.png")
+
+                # 确保深度图确实存在
+                if not os.path.exists(depth_path):
+                    continue
+
+                self.color_paths.append(color_path)
+                self.depth_paths.append(depth_path)
+                self.poses.append(T_w2c)
+                self.intrinsics.append(K)
+
+                last_timestamp = timestamp
 
 
 class EuRoCParser:
@@ -260,8 +311,6 @@ class MonocularDataset(BaseDataset):
         # depth parameters
         self.has_depth = True if "depth_scale" in calibration.keys() else False
         self.depth_scale = calibration["depth_scale"] if self.has_depth else None
-        # wheter to use label
-        self.has_label = bool(config["Dataset"].get("use_label", False))
 
         # Default scene scale
         nerf_normalization_radius = 5
@@ -271,63 +320,6 @@ class MonocularDataset(BaseDataset):
                 "translation": np.zeros(3),
             },
         }
-
-    def parse_label_from_file(self, label_path):
-        with open(label_path, "r") as f:
-            N = int(f.readline().strip()) # 读取文件的第一行，获取平面数量
-            label_data = np.loadtxt(f,dtype=int) # 从第二行开始读取标签数据，存储为整数类型的numpy数组,大小与图片分辨率相同，每个像素点的值表示该像素所属的平面标签
-        nonplanepxl_mask = (label_data == N) #RGBD plane detection中，非平面像素的标签值为N，创建一个布尔掩码数组，标记哪些像素不属于任何平面
-        label_info = {
-            "num_planes": N,
-            "label_data": label_data,
-            "nonplanepxl_mask": nonplanepxl_mask
-        }
-        return label_info
-
-    def parse_plane_param_from_file(self, path):
-        # 读取 TXT 数据
-        try:
-            data = np.loadtxt(path, dtype=np.float32)
-        except Exception as e:
-            print(f"Error loading plane parameters: {e}")
-            return None
-
-        # 处理空文件情况
-        if data.size == 0:
-            return None
-
-        # 处理只有一行数据（单个平面）的情况，确保是二维数组 (1, N)
-        if data.ndim == 1:
-            data = data[None, :]
-
-        # ------------------ 提取关键信息 ------------------
-        # Columns 2-4: Color (R, G, B) -> Indices 2, 3, 4
-        #plane_colors = data[:, 2:5].astype(np.uint8)
-
-        # Columns 5-7: Normal (nx, ny, nz) -> Indices 5, 6, 7
-        plane_normals = data[:, 5:8]
-
-        # Columns 8-10: Center (cx, cy, cz) -> Indices 8, 9, 10
-        plane_centers = data[:, 8:11]
-
-        # ------------------ 计算平面参数 ------------------
-        # 平面方程: ax + by + cz + d = 0
-        # 其中 (a, b, c) 是法向量 normal
-        # 由于中心点 (cx, cy, cz) 在平面上，代入方程：
-        # n . center + d = 0  =>  d = - (n . center)
-        plane_d = -np.sum(plane_normals * plane_centers, axis=1, keepdims=True)
-
-        # 组合成 (N, 4) 的数组，每行对应 [a, b, c, d]
-        plane_params = np.hstack([plane_normals, plane_d])
-
-        # 组织并返回数据字典
-        plane_info = {
-            "normals": plane_normals,  # (N, 3) float32
-            "centers": plane_centers,  # (N, 3) float32
-            "plane_equation": plane_params  # (N, 4) float32 [a,b,c,d]
-        }
-
-        return plane_info
 
     def __getitem__(self, idx):
         color_path = self.color_paths[idx]
@@ -351,12 +343,7 @@ class MonocularDataset(BaseDataset):
         )
         pose = torch.from_numpy(pose).to(device=self.device)
 
-        if self.has_label:
-            label_path = self.label_paths[idx]
-            label_info = self.parse_label_from_file(label_path)
-            plane_param_path = self.plane_params[idx]
-            plane_param_info = self.parse_plane_param_from_file(plane_param_path)
-        return image, depth, pose, label_info if self.has_label else None, plane_param_info if self.has_label else None
+        return image, depth, pose
 
 
 class StereoDataset(BaseDataset):
@@ -478,26 +465,92 @@ class TUMDataset(MonocularDataset):
     def __init__(self, args, path, config):
         super().__init__(args, path, config)
         dataset_path = config["Dataset"]["dataset_path"]
-        parser = TUMParser(dataset_path, self.has_label)
+        parser = TUMParser(dataset_path)
         self.num_imgs = parser.n_img
         self.color_paths = parser.color_paths
         self.depth_paths = parser.depth_paths
         self.poses = parser.poses
-        self.label_paths = parser.label_paths if self.has_label else None
-        self.plane_params = parser.plane_eq_paths if self.has_label else None  # 存储平面参数文件路径
 
 
+class ScannetPPDataset(MonocularDataset):
+    def __init__(self, args, path, config):
+        # 初始化调用基类
+        super().__init__(args, path, config)
+        dataset_path = config["Dataset"]["dataset_path"]
+        frame_rate = config["Dataset"].get("frame_rate", 32)
+
+        parser = ScannetppParser(dataset_path, frame_rate=frame_rate)
+
+        self.num_imgs = parser.n_img
+        self.color_paths = parser.color_paths
+        self.depth_paths = parser.depth_paths
+        self.poses = parser.poses
+        self.intrinsics = parser.intrinsics
+
+        # ScanNet++ iPhone Depth 是 16位 PNG, 单位是毫米 (mm)
+        self.depth_scale = 1000.0
+
+    def __getitem__(self, idx):
+        color_path = self.color_paths[idx]
+        depth_path = self.depth_paths[idx]
+        pose = self.poses[idx]
+
+        # 1. 读取离线降采样好的 RGB 图像 (256x192)
+        image = np.array(Image.open(color_path))
+
+        # 2. 读取深度图 (256x192)
+        # 极度重要：读取 16-bit 图像必须加 cv2.IMREAD_UNCHANGED
+        depth_raw = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+        depth = depth_raw.astype(np.float32) / self.depth_scale
+
+        image = (
+            torch.from_numpy(image / 255.0)
+            .clamp(0.0, 1.0)
+            .permute(2, 0, 1)  # (C, H, W)
+            .to(device=self.device, dtype=self.dtype)
+        )
+
+        # 3. 动态内参自适应缩放 (核心逻辑)
+        # 原始 JSON 中的内参是基于 1920x1440 的，我们需要按当前图像尺寸将其缩放下来
+        original_w, original_h = 1920, 1440
+        current_h, current_w = depth_raw.shape  # 192, 256
+
+        scale_x = current_w / original_w
+        scale_y = current_h / original_h
+
+        K_original = self.intrinsics[idx].copy()
+        K_new = K_original.copy()
+
+        # 缩放焦距和光心
+        K_new[0, 0] *= scale_x  # fx
+        K_new[1, 1] *= scale_y  # fy
+        K_new[0, 2] *= scale_x  # cx
+        K_new[1, 2] *= scale_y  # cy
+
+        fx, fy = K_new[0, 0], K_new[1, 1]
+        cx, cy = K_new[0, 2], K_new[1, 2]
+
+        pose = torch.from_numpy(pose).to(device=self.device)
+
+        # 4. 组装返回的内参字典
+        intrinsic_dict = {
+            "K": K_new,
+            "fx": fx,
+            "fy": fy,
+            "cx": cx,
+            "cy": cy
+        }
+
+        return image, depth, pose, intrinsic_dict
 
 class ReplicaDataset(MonocularDataset):
     def __init__(self, args, path, config):
         super().__init__(args, path, config)
         dataset_path = config["Dataset"]["dataset_path"]
-        parser = ReplicaParser(dataset_path, self.has_label)
+        parser = ReplicaParser(dataset_path)
         self.num_imgs = parser.n_img
         self.color_paths = parser.color_paths
         self.depth_paths = parser.depth_paths
-        self.label_paths = parser.label_paths if self.has_label else None # 存储标签文件路径
-        self.plane_params = parser.plane_params if self.has_label else None # 存储平面参数文件路径
         self.poses = parser.poses
 
 
@@ -614,5 +667,7 @@ def load_dataset(args, path, config):
         return EurocDataset(args, path, config)
     elif config["Dataset"]["type"] == "realsense":
         return RealsenseDataset(args, path, config)
+    elif config["Dataset"]["type"] == "scannetpp":
+        return ScannetPPDataset(args, path, config)
     else:
         raise ValueError("Unknown dataset type")

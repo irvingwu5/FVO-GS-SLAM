@@ -1,7 +1,7 @@
 import torch
 from torch import nn
-
-from gaussian_splatting.utils.graphics_utils import getProjectionMatrix2, getWorld2View2
+import numpy as np
+from gaussian_splatting.utils.graphics_utils import getProjectionMatrix2, getWorld2View2, focal2fov
 from utils.slam_utils import image_gradient, image_gradient_mask
 import torch.nn.functional as F
 from utils.normal_utils import intrins_to_intrins_inv, get_cam_coords, d2n_tblr
@@ -13,6 +13,7 @@ class Camera(nn.Module):
         color,
         depth,
         gt_T,
+        dynamic_intrinsic,
         projection_matrix,
         fx,
         fy,
@@ -22,9 +23,7 @@ class Camera(nn.Module):
         fovy,
         image_height,
         image_width,
-        device="cuda:0",
-        label_info=None,
-        plane_param_info=None,
+        device="cuda:0"
     ):
         super(Camera, self).__init__()
         self.uid = uid
@@ -51,8 +50,6 @@ class Camera(nn.Module):
         self.FoVy = fovy
         self.image_height = image_height
         self.image_width = image_width
-        self.label_info = label_info # dict:3{num_planes int,label_data(ndarray(H,W)),nonplanepxl_mask(ndarray(H,W))}
-        self.plane_param_info = plane_param_info
 
         self.cam_rot_delta = nn.Parameter(
             torch.zeros(3, requires_grad=True, device=device)
@@ -67,33 +64,83 @@ class Camera(nn.Module):
         self.exposure_b = nn.Parameter(
             torch.tensor([0.0], requires_grad=True, device=device)
         )
-
+        # 兼容处理：如果未提供动态内参，则根据传入的静态参数构造一个 3x3 矩阵
+        # 防止下游 SLAM 跟踪线程调用 self.dynamic_intrinsic 时引发 NoneType 错误
+        if dynamic_intrinsic is not None:
+            self.dynamic_intrinsic = dynamic_intrinsic.clone().detach().to(device=device, dtype=torch.float32)
+        else:
+            self.dynamic_intrinsic = torch.tensor(
+                [[fx, 0, cx], [0, fy, cy], [0, 0, 1.0]],
+                device=device,
+                dtype=torch.float32
+            )
         self.projection_matrix = projection_matrix.to(device=device)
 
         intrins = torch.tensor([[fx, 0, cx], [0, fy, cy], [0, 0, 1.0]])
-        self.intrins_inv = intrins_to_intrins_inv(intrins).float().unsqueeze(0).to(0)
+        self.intrins_inv = intrins_to_intrins_inv(intrins).float().unsqueeze(0).to(device)
 
-    #Tensor(3,H,W)、ndarray(H,W)、Tensor(4,4)、dict:3{num_planes int,label_data(ndarray(H,W)),nonplanepxl_mask(ndarray(H,W))},plane_param_info dict:3{plane_normals ndarray(num_planes,3),plane_center ndarray(num_planes,3), plane_equations ndarray(num_planes,4)}
+
     @staticmethod
     def init_from_dataset(dataset, idx, projection_matrix):
-        gt_color, gt_depth, gt_pose, label_info, plane_param_info = dataset[idx]
+        # 动态解析从 Dataset 中获取的元组
+        data = dataset[idx]
+        if len(data) == 3:
+            gt_color, gt_depth, gt_pose = data
+            intrinsic_dict = None
+        elif len(data) == 4:
+            gt_color, gt_depth, gt_pose, intrinsic_dict = data
+        else:
+            raise ValueError(f"Dataset returned {len(data)} items, expected 3 or 4.")
+
+        # 默认使用数据集对象上的静态全局内参
+        fx = dataset.fx
+        fy = dataset.fy
+        cx = dataset.cx
+        cy = dataset.cy
+        fovx = dataset.fovx
+        fovy = dataset.fovy
+        proj_mat = projection_matrix
+        dynamic_intrinsic_tensor = None
+
+        # 如果存在逐帧动态内参，则覆盖静态参数，并重新计算投影矩阵
+        if intrinsic_dict is not None:
+            fx = intrinsic_dict["fx"]
+            fy = intrinsic_dict["fy"]
+            cx = intrinsic_dict["cx"]
+            cy = intrinsic_dict["cy"]
+
+            # 使用新的焦距重新计算视场角 (Field of View)
+            fovx = focal2fov(fx, dataset.width)
+            fovy = focal2fov(fy, dataset.height)
+
+            # 根据当前帧的新内参，动态生成用于高斯渲染的投影矩阵
+            proj_mat = getProjectionMatrix2(
+                znear=0.01, zfar=100.0, fx=fx, fy=fy, cx=cx, cy=cy, W=dataset.width, H=dataset.height
+            ).transpose(0, 1).to(dataset.device)
+
+            # 解析 3x3 K 矩阵
+            K = intrinsic_dict["K"]
+            if isinstance(K, np.ndarray):
+                dynamic_intrinsic_tensor = torch.from_numpy(K)
+            else:
+                dynamic_intrinsic_tensor = torch.tensor(K)
+
         return Camera(
-            idx,
-            gt_color,
-            gt_depth,
-            gt_pose,
-            projection_matrix,
-            dataset.fx,
-            dataset.fy,
-            dataset.cx,
-            dataset.cy,
-            dataset.fovx,
-            dataset.fovy,
-            dataset.height,
-            dataset.width,
-            device=dataset.device,
-            label_info=label_info,
-            plane_param_info=plane_param_info,
+            uid=idx,
+            color=gt_color,
+            depth=gt_depth,
+            gt_T=gt_pose,
+            dynamic_intrinsic=dynamic_intrinsic_tensor,
+            projection_matrix=proj_mat,
+            fx=fx,
+            fy=fy,
+            cx=cx,
+            cy=cy,
+            fovx=fovx,
+            fovy=fovy,
+            image_height=dataset.height,
+            image_width=dataset.width,
+            device=dataset.device
         )
 
     @staticmethod
@@ -101,8 +148,23 @@ class Camera(nn.Module):
         projection_matrix = getProjectionMatrix2(
             znear=0.01, zfar=100.0, fx=fx, fy=fy, cx=cx, cy=cy, W=W, H=H
         ).transpose(0, 1)
+
+        # 使用明确的关键字传参，避免位置错乱
         return Camera(
-            uid, None, None, T, projection_matrix, fx, fy, cx, cy, FoVx, FoVy, H, W
+            uid=uid,
+            color=None,
+            depth=None,
+            gt_T=T,
+            dynamic_intrinsic=None,  # <--- 必须在这里补上 None
+            projection_matrix=projection_matrix,
+            fx=fx,
+            fy=fy,
+            cx=cx,
+            cy=cy,
+            fovx=FoVx,
+            fovy=FoVy,
+            image_height=H,
+            image_width=W
         )
 
     @property

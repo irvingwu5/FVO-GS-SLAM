@@ -2,13 +2,13 @@ import yaml
 import subprocess
 import os
 import time
-from copy import deepcopy
 
 # =========================================================================
 # 配置区域
 # =========================================================================
 # 要执行的 YAML 配置文件路径 (你可以根据需要改成 fr3_office.yaml)
-#CONFIG_FILE_PATH = "./configs/rgbd/replica/room0.yaml"
+CONFIG_FILE_PATH = "./configs/rgbd/replica/room0.yaml"
+#CONFIG_FILE_PATH = "./configs/rgbd/tum/fr2_xyz.yaml"
 # 日志保存目录
 LOG_DIR = "./ablation_logs"
 # GPU 设置 (默认使用 GPU 1)

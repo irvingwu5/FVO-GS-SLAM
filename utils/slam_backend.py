@@ -11,10 +11,7 @@ from gaussian_splatting.utils.loss_utils import l1_loss, ssim
 from utils.logging_utils import Log
 from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
-from utils.slam_utils import (get_loss_mapping,get_loss_mapping_plane_constraint,
-                              get_depth_dist_loss,get_normal_consistency_loss,
-                              _save_normal_pair, _save_rendered_rgb,_save_gt_normal,save_normal_as_quiver,
-                              build_combined_normal_gt,build_plane_normal_gt,check_normal_dir)
+from utils.slam_utils import (get_loss_mapping,_save_normal_pair, _save_rendered_rgb,_save_gt_normal,check_normal_dir)
 import torch.nn.functional as F
 # 它主要负责全局地图构建（Mapping）和光束法平差（Bundle Adjustment）
 # BackEnd 的核心设计模式是维护全局一致性。前端只关心“当前在哪里”，而后端关心“整个地图长什么样以及历史轨迹是否准确”。
