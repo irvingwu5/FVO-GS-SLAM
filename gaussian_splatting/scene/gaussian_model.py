@@ -468,6 +468,46 @@ class GaussianModel:
 
         return params_dict
 
+    def reset_for_new_submap(self):
+        """
+        彻底重置高斯模型，为新子图做准备。
+        这是真正的子图策略的关键：释放所有显存占用。
+        """
+        # 1. 清空所有高斯参数
+        self._xyz = torch.empty(0, device="cuda")
+        self._features_dc = torch.empty(0, device="cuda")
+        self._features_rest = torch.empty(0, device="cuda")
+        self._scaling = torch.empty(0, device="cuda")
+        self._rotation = torch.empty(0, device="cuda")
+        self._opacity = torch.empty(0, device="cuda")
+
+        # 2. 清空辅助张量
+        self.max_radii2D = torch.empty(0, device="cuda")
+        self.xyz_gradient_accum = torch.empty(0, device="cuda")
+        self.denom = torch.empty(0, device="cuda")
+        self.unique_kfIDs = torch.empty(0).int()
+        self.n_obs = torch.empty(0).int()
+
+        # 3. 删除优化器及其状态（这是关键！）
+        if self.optimizer is not None:
+            # 清空优化器状态字典中的所有张量
+            for state in self.optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        del v
+
+            del self.optimizer
+            self.optimizer = None
+
+        # 4. 重置活跃球谐阶数
+        self.active_sh_degree = 0
+
+        # 5. 强制释放 GPU 缓存
+        torch.cuda.empty_cache()
+
+        print(f"[GaussianModel] 子图重置完成。当前显存分配: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
+
+
     def restore_from_params(self, params_dict, training_args=None):
         """
         从字典中恢复高斯子图的所有参数。

@@ -57,6 +57,10 @@ class FrontEnd(mp.Process):
         # 【新增：消融实验开关】
         self.use_fft_mask = self.config.get("Ablation", {}).get("use_fft_mask", True)
         self.use_error_mask = self.config.get("Ablation", {}).get("use_error_mask", True)
+        # 【新增】：读取位姿连续性检查参数
+        self.pose_jump_check_enabled = self.config.get("Submap", {}).get("pose_jump_check_enabled", True)
+        self.max_trans_jump = self.config.get("Submap", {}).get("max_trans_jump", 1.0)
+        self.max_rot_jump = self.config.get("Submap", {}).get("max_rot_jump", 45.0)
 
     def set_hyperparams(self):
         self.save_dir = self.config["Results"]["save_dir"] # 结果保存路径
@@ -205,6 +209,10 @@ class FrontEnd(mp.Process):
     '''
     def tracking(self, cur_frame_idx, viewpoint):
         prev = self.cameras[cur_frame_idx - self.use_every_n_frames] # 上一帧位姿
+        # 【新增】：检查位姿连续性
+        # if not self.validate_pose_continuity(prev.T, prev.T):
+        #     Log(f"[WARNING] 跳过第 {cur_frame_idx} 帧，因为检测到位姿跳变")
+        #     return False  # 返回 False 表示 tracking 失败
         viewpoint.T = prev.T
         # 优化参数与优化器构建
         opt_params = []
@@ -274,6 +282,45 @@ class FrontEnd(mp.Process):
         #用最后一次渲染的 depth/opacity 计算并保存 self.median_depth（供关键帧判断等使用）
         self.median_depth = get_median_depth(depth, opacity)
         return render_pkg #返回最后一次的 render_pkg
+
+    def validate_pose_continuity(self, prev_pose, curr_pose):
+        """
+        检查位姿是否发生跳变
+        【作用】：防止子图切分时位姿跳变导致的 tracking 错误
+
+        Args:
+            prev_pose: 前一帧位姿 (4x4 变换矩阵)
+            curr_pose: 当前帧位姿 (4x4 变换矩阵)
+
+        Returns:
+            True: 位姿连续，无跳变
+            False: 检测到位姿跳变
+        """
+        if not self.pose_jump_check_enabled:
+            return True
+
+        try:
+            # 计算平移差
+            trans_diff = np.linalg.norm(curr_pose[:3, 3] - prev_pose[:3, 3])
+            if trans_diff > self.max_trans_jump:
+                Log(f"[WARNING] 检测到平移跳变: {trans_diff:.3f}m (阈值: {self.max_trans_jump}m)")
+                return False
+
+            # 计算旋转差（角度）
+            R_diff = prev_pose[:3, :3].T @ curr_pose[:3, :3]
+            # 使用迹计算旋转角度
+            trace = np.clip(np.trace(R_diff), -1, 3)
+            angle_diff = np.arccos((trace - 1) / 2) * 180 / np.pi
+
+            if angle_diff > self.max_rot_jump:
+                Log(f"[WARNING] 检测到旋转跳变: {angle_diff:.1f}° (阈值: {self.max_rot_jump}°)")
+                return False
+
+            return True
+
+        except Exception as e:
+            Log(f"[ERROR] 位姿连续性检查异常: {e}")
+            return True  # 异常时默认认为连续
     '''
     -------------------关键帧判断---------------------
     作用: 判断当前帧是否提供了足够的新信息（或跟踪是否变得不稳定），从而需要将其作为新的关键帧。
@@ -436,37 +483,49 @@ class FrontEnd(mp.Process):
             torch.cuda.empty_cache()
 
     def exceeds_motion_thresholds(self, current_c2w, anchor_c2w):
-        # =========================================================
-        # 【消融控制】：如果子图开关关闭，永远返回 False，退化为单地图
-        # =========================================================
+        """
+        判断是否需要切分新子图。
+        关键：保存切图时的位姿，确保新子图的位姿连续性。
+        """
         if not self.use_submap:
             return False
-        """
-        判断当前位姿与子图起始位姿之间的相对运动是否超过阈值。
-        注意：MonoGS 中 curr_frame.T 通常是 World to Camera (W2C) 变换。
-        我们需要将其转为 Camera to World (C2W) 以便计算物理平移。
-        """
+
         if anchor_c2w is None:
             return False
 
-        # 计算相对变换矩阵 delta_T = inv(Anchor) @ Current
-        # 这里的输入假设已经是 C2W 矩阵
+        # 计算相对变换矩阵
         delta_T = torch.linalg.inv(anchor_c2w) @ current_c2w
 
         # 1. 计算平移距离
         translation = torch.norm(delta_T[0:3, 3]).item()
 
-        # 2. 计算旋转角度 (基于旋转矩阵求迹)
-        # trace(R) = 1 + 2*cos(theta) -> theta = arccos((trace(R) - 1) / 2)
+        # 2. 计算旋转角度
         R = delta_T[0:3, 0:3]
         trace = torch.trace(R)
-        # 限制在 [-1, 1] 防止数值误差导致 acos 报错
         cos_theta = torch.clamp((trace - 1.0) / 2.0, -1.0, 1.0)
         angle_rad = torch.acos(cos_theta).item()
         angle_deg = angle_rad * 180.0 / np.pi
 
         if translation > self.submap_trans_thre or angle_deg > self.submap_rot_thre:
-            Log(f"触发切图! 平移: {translation:.2f}m, 旋转: {angle_deg:.2f}°")
+            Log(f"[Submap Cut] Translation: {translation:.3f}m (threshold: {self.submap_trans_thre}m), "
+                f"Rotation: {angle_deg:.1f}° (threshold: {self.submap_rot_thre}°)")
+
+            # 【新增】：保存切图时的位姿信息
+            submap_cut_info = {
+                "submap_id": self.current_submap_id,
+                "cut_frame_id": len(self.cameras),  # 当前帧 ID
+                "cut_pose_c2w": current_c2w.cpu().numpy(),  # 切图时的位姿
+                "translation": translation,
+                "rotation_deg": angle_deg
+            }
+
+            # 保存到文件供后续参考
+            cut_info_path = os.path.join(
+                self.config["Results"]["save_dir"],
+                f"submap_cut_{self.current_submap_id:06d}.npy"
+            )
+            np.save(cut_info_path, submap_cut_info)
+
             return True
 
         return False

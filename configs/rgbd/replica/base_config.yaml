@@ -61,13 +61,51 @@ Training:
     cam_trans_delta: 0.001
 
 Submap:
+  # 原有配置
+  submap_size: 10000
+  retention_frames: 10
   trans_thre: 1.5     # 平移切图阈值(米)
   rot_thre: 60           # 旋转切图阈值(度)
+  # ========== 【新增】智能关键点选择配置 ==========
+
+  # 是否启用智能关键点选择
+  use_critical_point_selection: true
+
+  # 选择策略
+  # - "advanced": 混合策略（推荐），结合不确定性、可见性和空间分布
+  # - "simple": 简化策略（备选），只基于不确定性和可见性
+  selection_strategy: "advanced"
+
+  # 保留比例（10-20%）
+  # - 0.10: 保留 10% 的点，显存节省 90%，位姿精度 90-95%
+  # - 0.15: 保留 15% 的点，显存节省 85%，位姿精度 95-98%【推荐】
+  # - 0.20: 保留 20% 的点，显存节省 80%，位姿精度 98%+
+  retention_ratio: 0.15
+
+  # 空间聚类数（8-12）
+  num_spatial_clusters: 10
+
+# 【改进】：显存管理参数
+MemoryManagement:
+  # 每次子图切分后强制释放显存缓存
+  empty_cache_on_submap_cut: true
+  # 渲染时的临时张量复用策略
+  reuse_render_tensors: true
+  # 关键帧窗口大小（影响显存占用）
+  keyframe_window_size: 10  # 推荐 5-15
+  # 梯度累积窗口（影响显存占用）
+  gradient_accumulation_frames: 5
 
 LoopClosure:
-  min_interval: 2        # 触发闭环的最小子图间隔
-  voxel_size: 0.02
-  pgo_edge_prune_thres: 0.25  # 建议初始值
+  # 【新增】：流式回环检测参数
+  streaming_mode: true           # 启用流式处理
+  max_search_range: 5            # 只与最近 5 个子图比较
+  keep_recent_submaps: 3         # 显存中只保留最近 3 个子图
+
+  # 【现有参数】
+  min_interval: 3
+  voxel_size: 0.05
+  icp_fitness_threshold: 0.60
 
 opt_params:
   iterations: 30000

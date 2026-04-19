@@ -272,8 +272,10 @@ class SLAM:
             submap_tsfms[sid] = torch.from_numpy(correct_tsfm).float()  # 保持在 CPU
             del ckpt  # 立即释放
 
+        import gc  # 【新增】：在循环前导入，而不是每次都导入
+
         # 🟢 第二步：流式读取、变换、存入 CPU 累加器
-        for ckpt_path in tqdm(ckpt_files, desc="Streaming Submap Concatenation"):
+        for idx, ckpt_path in enumerate(tqdm(ckpt_files, desc="Streaming Submap Concatenation")):
             sid = int(os.path.basename(ckpt_path).split('.')[0])
 
             # 1. 读入一个子图到内存 (CPU)
@@ -313,28 +315,87 @@ class SLAM:
 
             # 5. 🎯 核心：立即销毁临时对象
             del gp, ckpt
-            # 强制垃圾回收
-            import gc
-            gc.collect()
-            torch.cuda.empty_cache()  # 合并阶段显存也很珍贵，随手清理
 
-        # 🟢 第三步：一次性拼接并推向 GPU
+            # 【优化】：每处理 5 个子图清理一次
+            if (idx + 1) % 5 == 0:
+                gc.collect()
+                torch.cuda.empty_cache()
+
+        # 🟢 第三步：流式拼接并推向 GPU（改进版）
         Log("==> 所有子图已离线变换完毕，正在构建全局高斯模型... <==")
         if len(final_params["_xyz"]) > 0:
             import torch.nn as nn
-            # 在 CPU 上完成最后的拼接，最后统一 .cuda()
-            self.gaussians._xyz = nn.Parameter(torch.cat(final_params["_xyz"], dim=0).cuda())
-            self.gaussians._features_dc = nn.Parameter(torch.cat(final_params["_features_dc"], dim=0).cuda())
-            self.gaussians._features_rest = nn.Parameter(torch.cat(final_params["_features_rest"], dim=0).cuda())
-            self.gaussians._scaling = nn.Parameter(torch.cat(final_params["_scaling"], dim=0).cuda())
-            self.gaussians._rotation = nn.Parameter(torch.cat(final_params["_rotation"], dim=0).cuda())
-            self.gaussians._opacity = nn.Parameter(torch.cat(final_params["_opacity"], dim=0).cuda())
-            if has_normal:
-                self.gaussians._normal = nn.Parameter(torch.cat(final_params["_normal"], dim=0).cuda())
 
-            # 清空累加器，释放巨大的 CPU 内存
+            # 【优化】：在 CPU 上先拼接，然后分批推到 GPU
+            Log("Concatenating submap parameters on CPU...")
+            # 在拼接前进行形状检查和修复
+            features_dc_list = []
+            for feat in final_params["_features_dc"]:
+                if feat.dim() == 3 and feat.shape[1] == 1:
+                    # 形状是 [N, 1, 3]，需要 squeeze 到 [N, 3]
+                    features_dc_list.append(feat.squeeze(1))
+                else:
+                    # 形状已经是 [N, 3]，直接使用
+                    features_dc_list.append(feat)
+            # 在 CPU 上完成拼接
+            cpu_xyz = torch.cat(final_params["_xyz"], dim=0)
+            cpu_features_dc = torch.cat(final_params["_features_dc"], dim=0)
+            cpu_features_rest = torch.cat(final_params["_features_rest"], dim=0)
+            cpu_scaling = torch.cat(final_params["_scaling"], dim=0)
+            cpu_rotation = torch.cat(final_params["_rotation"], dim=0)
+            cpu_opacity = torch.cat(final_params["_opacity"], dim=0)
+
+            # 【新增】：清空 final_params，立即释放 CPU 内存
             final_params.clear()
             import gc
+            gc.collect()
+
+            # 【优化】：分批推到 GPU（如果点数过多）
+            total_points = cpu_xyz.shape[0]
+            batch_size = 1000000  # 每批 100 万个点
+
+            if total_points > batch_size:
+                Log(f"Large point cloud detected ({total_points} points), using batch transfer...")
+
+                # 初始化参数（空张量）
+                self.gaussians._xyz = nn.Parameter(torch.zeros((total_points, 3), device="cuda"))
+                self.gaussians._features_dc = nn.Parameter(torch.zeros((total_points, 3), device="cuda"))
+                self.gaussians._features_rest = nn.Parameter(torch.zeros((total_points, 15), device="cuda"))
+                self.gaussians._scaling = nn.Parameter(torch.zeros((total_points, 3), device="cuda"))
+                self.gaussians._rotation = nn.Parameter(torch.zeros((total_points, 4), device="cuda"))
+                self.gaussians._opacity = nn.Parameter(torch.zeros((total_points, 1), device="cuda"))
+
+                # 分批传输
+                for i in range(0, total_points, batch_size):
+                    end_idx = min(i + batch_size, total_points)
+                    Log(f"Transferring batch {i // batch_size + 1}/{(total_points + batch_size - 1) // batch_size}...")
+
+                    self.gaussians._xyz.data[i:end_idx] = cpu_xyz[i:end_idx].cuda()
+                    self.gaussians._features_dc.data[i:end_idx] = cpu_features_dc[i:end_idx].cuda()
+                    self.gaussians._features_rest.data[i:end_idx] = cpu_features_rest[i:end_idx].cuda()
+                    self.gaussians._scaling.data[i:end_idx] = cpu_scaling[i:end_idx].cuda()
+                    self.gaussians._rotation.data[i:end_idx] = cpu_rotation[i:end_idx].cuda()
+                    self.gaussians._opacity.data[i:end_idx] = cpu_opacity[i:end_idx].cuda()
+
+                    torch.cuda.empty_cache()
+            else:
+                # 点数较少，直接一次性推到 GPU
+                self.gaussians._xyz = nn.Parameter(cpu_xyz.cuda())
+                self.gaussians._features_dc = nn.Parameter(cpu_features_dc.cuda())
+                self.gaussians._features_rest = nn.Parameter(cpu_features_rest.cuda())
+                self.gaussians._scaling = nn.Parameter(cpu_scaling.cuda())
+                self.gaussians._rotation = nn.Parameter(cpu_rotation.cuda())
+                self.gaussians._opacity = nn.Parameter(cpu_opacity.cuda())
+
+            # 【新增】：处理法线
+            if has_normal:
+                cpu_normal = torch.cat(final_params["_normal"], dim=0)
+                self.gaussians._normal = nn.Parameter(cpu_normal.cuda())
+
+            # 【新增】：释放 CPU 内存
+            del cpu_xyz, cpu_features_dc, cpu_features_rest, cpu_scaling, cpu_rotation, cpu_opacity
+            if has_normal:
+                del cpu_normal
             gc.collect()
 
             # 初始化辅助张量
@@ -481,8 +542,15 @@ class SLAM:
                             # 原汁原味的学习率更新 (会同步更新 xyz 等属性的学习率衰减)
                             self.gaussians.update_learning_rate(iteration)
 
-                        # 释放显存
+                        # 【新增】：显式释放 render_pkg（防止显存泄漏）
+                        del render_pkg, image, visibility_filter, radii
+
+                        # 【新增】：释放 GT 图像
                         del gt_image
+
+                        # 【新增】：每 100 次迭代强制清理显存
+                        if iteration % 100 == 0:
+                            torch.cuda.empty_cache()
                         pbar.update(1)
 
                     # 循环结束，清理缓存
