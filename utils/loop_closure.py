@@ -10,11 +10,6 @@ import torchvision.transforms as T
 import torchvision.models as models
 import torch.nn as nn
 import torch.nn.functional as F
-from scipy.spatial.transform import Rotation
-from graphslam.graph import Graph
-from graphslam.vertex import Vertex
-from graphslam.edge.edge_odometry import EdgeOdometry
-from graphslam.pose.se3 import PoseSE3
 from torch.nn.parameter import Parameter
 
 
@@ -118,15 +113,6 @@ def load_cosplace_model(backbone: str = "ResNet18",
       1. 从本地 .pth 文件加载（优先）
       2. 从 GitHub Releases 直链自动下载并缓存到本地
       3. 通过 torch.hub 加载（备用）
-
-    参数:
-        backbone: 骨干网络名称，如 "ResNet18"
-        fc_output_dim: 输出特征维度，如 512
-        weight_path: 本地权重文件路径（可选）。如果提供且文件存在，则直接加载。
-        device: 设备，如 "cuda" 或 "cpu"
-
-    返回:
-        加载好权重的 CosPlace 模型（eval 模式）
     """
     model = CosPlaceNetwork(backbone, fc_output_dim)
 
@@ -142,7 +128,6 @@ def load_cosplace_model(backbone: str = "ResNet18",
     url = COSPLACE_WEIGHT_URL.format(backbone=backbone, fc_output_dim=fc_output_dim)
     Log(f"[LoopClosure] 本地权重未找到，从 GitHub 下载: {url}")
     try:
-        # torch.hub.load_state_dict_from_url 会自动缓存到 ~/.cache/torch/hub/checkpoints/
         state_dict = torch.hub.load_state_dict_from_url(url, map_location="cpu")
         model.load_state_dict(state_dict)
         Log("[LoopClosure] CosPlace 权重下载并加载完成。")
@@ -274,19 +259,13 @@ class LoopClosureProcess(mp.Process):
         """
         feats = []
         for img_path in img_paths:
-            # 1. 强制在 CPU 加载图像，避免加载瞬间的显存抖动
             img_tensor = torch.load(img_path, map_location="cpu")  # [3, H, W]
-
-            # 2. 仅在推理时送入 GPU，并立即 detach 转回 CPU
             img_input = self.img_transform(img_tensor).unsqueeze(0).to(self.device)
             with torch.no_grad():
                 feat = self.feature_extractor(img_input).squeeze().detach().cpu()
             feats.append(feat)
-
-            # 3. 显式清理 GPU 上的临时图像张量
             del img_input
 
-        # 4. 在 CPU 上进行矩阵运算（N 较小时 CPU 足够快，且不占显存）
         submap_desc = torch.stack(feats)  # [N, D]，已在 CPU 上
         self_sim = torch.mm(submap_desc, submap_desc.T)
 
@@ -448,75 +427,89 @@ class LoopClosureProcess(mp.Process):
     def construct_and_optimize_pose_graph(self):
         """
         构建并优化位姿图（PGO）。
-        适配真正独立子图策略：里程计边使用前端传递的真实相对位姿。
+        适配真正独立子图策略：
+          - 里程计边：从 ckpt 中读取前端传递的真实 relative_pose
+          - 回环边：通过 CosPlace 视觉粗筛 + ICP 几何精核检测
         """
-        import open3d as o3d
+        all_submap_ids = sorted(self.submap_records.keys())
+        if len(all_submap_ids) < 2:
+            Log(f"[LoopClosure] 子图数量不足 ({len(all_submap_ids)})，跳过 PGO")
+            return []
 
         max_search_range = self.config.get("LoopClosure", {}).get("max_search_range", 5)
 
-        all_submap_ids = sorted(self.submap_records.keys())
-        if len(all_submap_ids) == 0:
-            return []
-
+        # 确定参与 PGO 优化的子图范围
         if len(all_submap_ids) > max_search_range:
             recent_submap_ids = all_submap_ids[-max_search_range:]
-            search_submap_ids = all_submap_ids
         else:
             recent_submap_ids = all_submap_ids
-            search_submap_ids = all_submap_ids
 
-        # 初始化位姿图
-        pose_graph = o3d.pipelines.registration.PoseGraph()
-
-        # 创建 ID 映射：全局 ID → 本地 ID
+        # 创建 ID 映射：全局子图 ID → PGO 节点的本地索引
         id_mapping = {gid: lid for lid, gid in enumerate(recent_submap_ids)}
 
-        # 添加节点
+        # ==========================================
+        # 1. 初始化位姿图
+        # ==========================================
+        pose_graph = o3d.pipelines.registration.PoseGraph()
+
+        # 添加节点（每个子图一个节点，初始位姿为单位阵）
         for i, submap_id in enumerate(recent_submap_ids):
             pose_graph.nodes.append(
                 o3d.pipelines.registration.PoseGraphNode(np.identity(4))
             )
 
-        # 添加里程计边：使用前端传递的真实相对位姿
+        # ==========================================
+        # 2. 添加里程计边 (Odometry Edges)
+        #    使用前端传递的真实 relative_pose
+        # ==========================================
         info_odom = np.identity(6) * 100.0  # 里程计边刚度较强
         for i in range(1, len(recent_submap_ids)):
-            source_id = recent_submap_ids[i]
-            target_id = recent_submap_ids[i - 1]
+            sid_curr = recent_submap_ids[i]
+            sid_prev = recent_submap_ids[i - 1]
 
-            # 从 ckpt 中读取 source_id 子图的 relative_pose
-            ckpt_path = self.submap_records.get(source_id)
+            # 从 ckpt 中读取 sid_curr 子图相对于上一个子图的真实相对位姿
+            ckpt_path = self.submap_records.get(sid_curr)
+            relative_pose = np.identity(4)
             if ckpt_path and os.path.exists(ckpt_path):
-                ckpt = torch.load(ckpt_path, map_location="cpu")
-                relative_pose = ckpt.get("relative_pose", np.identity(4))
-                del ckpt
-            else:
-                relative_pose = np.identity(4)
+                try:
+                    ckpt = torch.load(ckpt_path, map_location="cpu")
+                    relative_pose = ckpt.get("relative_pose", np.identity(4))
+                    if isinstance(relative_pose, torch.Tensor):
+                        relative_pose = relative_pose.numpy()
+                    del ckpt
+                except Exception as e:
+                    Log(f"[LoopClosure] 读取子图 {sid_curr} 的 relative_pose 失败: {e}")
 
             pose_graph.edges.append(
                 o3d.pipelines.registration.PoseGraphEdge(
-                    i, i - 1,
+                    i - 1, i,
                     relative_pose,
                     info_odom,
                     uncertain=False
                 )
             )
 
-        # 添加回环边
+        # ==========================================
+        # 3. 检测回环并添加回环边 (Loop Closure Edges)
+        #    CosPlace 视觉粗筛 + ICP 几何精核
+        # ==========================================
         loop_found = False
-        for source_id in search_submap_ids:
-            if source_id not in id_mapping:
+        # 对所有子图进行回环检测（不仅限于最近的子图）
+        for query_id in all_submap_ids:
+            if query_id not in id_mapping:
+                # query_id 不在当前 PGO 优化范围内，跳过
                 continue
 
-            matches = self.detect_closure(source_id)
-            for target_id in matches:
+            matched_ids = self.detect_closure(query_id)
+            for target_id in matched_ids:
                 if target_id not in id_mapping:
                     continue
 
-                trans, info_loop, success = self.compute_relative_transform(source_id, target_id)
+                trans, info_loop, success = self.compute_relative_transform(query_id, target_id)
                 if success:
                     pose_graph.edges.append(
                         o3d.pipelines.registration.PoseGraphEdge(
-                            id_mapping[source_id],
+                            id_mapping[query_id],
                             id_mapping[target_id],
                             trans,
                             info_loop,
@@ -524,6 +517,7 @@ class LoopClosureProcess(mp.Process):
                         )
                     )
                     loop_found = True
+                    Log(f"[LoopClosure] 添加回环边: 子图 {query_id} <-> {target_id}")
 
         if not loop_found:
             Log(f"[LoopClosure] 未检测到有效闭环")
@@ -531,9 +525,11 @@ class LoopClosureProcess(mp.Process):
             torch.cuda.empty_cache()
             return []
 
-        Log(f"检测到有效闭环，启动 Open3D 全局优化 (最近 {len(recent_submap_ids)} 个子图)...")
+        # ==========================================
+        # 4. 执行全局位姿图优化
+        # ==========================================
+        Log(f"[LoopClosure] 检测到有效闭环，启动 Open3D 全局优化 ({len(recent_submap_ids)} 个子图)...")
 
-        # 配置优化选项
         prune_threshold = self.config.get("LoopClosure", {}).get("pgo_edge_prune_thres", 1.0)
         option = o3d.pipelines.registration.GlobalOptimizationOption(
             max_correspondence_distance=self.voxel_size * 1.5,
@@ -541,7 +537,6 @@ class LoopClosureProcess(mp.Process):
             reference_node=0
         )
 
-        # 执行优化
         o3d.pipelines.registration.global_optimization(
             pose_graph,
             o3d.pipelines.registration.GlobalOptimizationLevenbergMarquardt(),
@@ -549,12 +544,16 @@ class LoopClosureProcess(mp.Process):
             option
         )
 
-        # 提取优化后的结果
+        # ==========================================
+        # 5. 提取优化后的修正矩阵
+        # ==========================================
         correction_list = []
+        # 第 0 个节点是参考节点，其优化后位姿可能不是严格的单位阵
         T_0_inv = np.linalg.inv(pose_graph.nodes[0].pose)
 
         for i, submap_id in enumerate(recent_submap_ids):
             opt_trans = pose_graph.nodes[i].pose
+            # 相对于参考节点的修正量
             final_trans = T_0_inv @ opt_trans
             correction_list.append({
                 'submap_id': submap_id,
@@ -595,6 +594,7 @@ class LoopClosureProcess(mp.Process):
             submap_id = correction['submap_id']
             correct_tsfm = correction['correct_tsfm']
 
+            # 跳过接近单位阵的修正（无需写盘）
             if np.allclose(correct_tsfm, np.eye(4), atol=1e-4):
                 continue
 
@@ -602,7 +602,7 @@ class LoopClosureProcess(mp.Process):
             if not ckpt_path or not os.path.exists(ckpt_path):
                 continue
 
-            Log(f"记录子图 {submap_id} 的 PGO 修正矩阵...")
+            Log(f"[LoopClosure] 记录子图 {submap_id} 的 PGO 修正矩阵...")
             submap_ckpt = torch.load(ckpt_path, map_location="cpu")
             submap_ckpt["correct_tsfm"] = correct_tsfm
             torch.save(submap_ckpt, ckpt_path)

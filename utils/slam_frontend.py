@@ -418,6 +418,11 @@ class FrontEnd(mp.Process):
     def request_init(self, cur_frame_idx, viewpoint, depth_map):
         msg = ["init", cur_frame_idx, viewpoint, depth_map]
         self.backend_queue.put(msg)
+        # 在 self.requested_init = True 之前添加：
+        with torch.no_grad():
+            # 将种子帧的位姿重置为单位阵，使其成为新子图的原点
+            viewpoint.T = torch.eye(4, device=self.device)
+            self.cameras[cur_frame_idx].T = torch.eye(4, device=self.device)
         self.requested_init = True
     '''
     -------------------后端同步与通信模块---------------------
@@ -586,34 +591,30 @@ class FrontEnd(mp.Process):
                         # ====================================================
                         # 【真正独立子图模式】：种子帧初始化
                         # ====================================================
-                        # 计算当前子图相对于上一个子图的相对位姿
-                        # current_c2w 是新子图的起点在旧子图坐标系下的位姿
+                        # 1. 计算并发送相对位姿
                         relative_pose = current_c2w.clone().cpu().numpy()
-                        # 1. 发送切图信号给后端，附带相对位姿
                         self.backend_queue.put(["new_submap", self.current_submap_id, relative_pose])
 
-                        # 2. 更新前端子图 ID 和锚点
+                        # 2. 更新前端子图 ID
                         self.current_submap_id += 1
-                        self.submap_anchor_pose = current_c2w.clone()
 
                         # 3. 彻底清空前端状态
                         self.current_window = []
                         self.occ_aware_visibility = {}
-                        self.initialized = False  # 标记为未初始化，触发窗口填充加速逻辑
+                        self.initialized = False
 
-                        # 4. 用当前帧作为种子帧，生成初始深度图
+                        # 4. 【核心修复】：重置种子帧的位姿为单位阵（新子图的原点）
+                        viewpoint.T = torch.eye(4, device=viewpoint.T.device)
+                        self.submap_anchor_pose = torch.eye(4, device=viewpoint.T.device)
+
+                        # 5. 用重置后的位姿生成初始深度图
                         depth_map = self.add_new_keyframe(cur_frame_idx, init=True)
 
-                        # 5. 向后端发送 "init" 请求（与系统冷启动完全相同的流程）
-                        #    后端收到后会：清空所有旧高斯点 → 从深度图生成新点 → 执行初始化优化 → 回传给前端
+                        # 6. 向后端发送 "init" 请求
                         self.request_init(cur_frame_idx, viewpoint, depth_map)
 
-                        # 6. 将当前帧加入新的滑动窗口
+                        # 7. 将当前帧加入新的滑动窗口
                         self.current_window.append(cur_frame_idx)
-
-                        # 7. 前端阻塞等待后端完成初始化
-                        #    （request_init 已设置 self.requested_init = True）
-                        #    主循环顶部的 if self.requested_init: continue 会自动阻塞
 
                         cur_frame_idx += 1
                         continue

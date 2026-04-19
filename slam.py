@@ -404,36 +404,38 @@ class SLAM:
             self.gaussians.xyz_gradient_accum = torch.zeros((total_points, 1), device="cuda")
             self.gaussians.denom = torch.zeros((total_points, 1), device="cuda")
 
-
-            # =======================================================
-            # 对前端相机的 4x4 矩阵进行逆向修正
-            # =======================================================
             # =======================================================
             # 对前端相机的 4x4 矩阵进行逆向修正 (拉扯轨迹)
             # =======================================================
             Log("==> 开始拉扯前端相机轨迹... <==")
+
+            # 1. 计算每个子图到世界坐标系的绝对变换矩阵
+            # submap_tsfms 存储的是 PGO 修正后的 C2W 矩阵
+            global_submap_poses = {0: torch.eye(4)}
+            for sid in sorted(submap_tsfms.keys()):
+                if sid == 0:
+                    global_submap_poses[sid] = submap_tsfms[sid]
+                else:
+                    # 假设 relative_pose 已经包含在 PGO 优化结果中
+                    global_submap_poses[sid] = submap_tsfms[sid]
+
             for frame_id, cam in tqdm(self.frontend.cameras.items(), desc="Correcting Trajectory"):
                 sid = frame_to_submap.get(frame_id, 0)
 
-                # 从字典获取 CPU 上的修正矩阵
-                tsfm_tensor = submap_tsfms.get(sid, torch.eye(4))
+                # 获取该子图到世界坐标系的 C2W 变换矩阵
+                submap_c2w = global_submap_poses.get(sid, torch.eye(4)).to(cam.T.device)
 
-                # 1. 【修复核心】：确保比较时设备一致
-                # 如果修正矩阵非常接近单位阵，直接跳过
-                if torch.allclose(tsfm_tensor, torch.eye(4), atol=1e-4):
-                    continue
+                # 【核心修复】：正确的刚体变换顺序
+                # cam.T 是局部坐标系下的 W2C 矩阵
+                # 局部 C2W = inv(cam.T)
+                local_c2w = torch.linalg.inv(cam.T)
 
-                # 2. 将修正矩阵送入 GPU 并计算逆矩阵
-                # 注意：cam.device 获取相机当前所在设备（通常是 cuda:0）
-                target_device = cam.T.device
-                tsfm_gpu = tsfm_tensor.to(target_device)
-                inv_tsfm = torch.linalg.inv(tsfm_gpu)
+                # 全局 C2W = 子图原点的全局 C2W @ 局部 C2W
+                global_c2w = submap_c2w @ local_c2w
 
-                # 3. 执行修正：cam.T = cam.T @ inv_tsfm
-                # 注意：cam.T 通常是 W2C 矩阵，PGO 修正的是 C2W 的偏置，
-                # 这里的数学逻辑需与你 rigid_transform_2dgs 内部逻辑对称
+                # 最终更新为全局 W2C
                 with torch.no_grad():
-                    cam.T = cam.T @ inv_tsfm
+                    cam.T = torch.linalg.inv(global_c2w)
 
             Log(f"==> 拼接完成！全局高斯点总数: {self.gaussians._xyz.shape[0]} <==")
 
@@ -628,8 +630,8 @@ if __name__ == "__main__":
         Log("Following config will be overriden")
         Log("\tsave_results=True")
         config["Results"]["save_results"] = True
-        Log("\tuse_gui=False")
-        config["Results"]["use_gui"] = False
+        Log("\tuse_gui=True")
+        config["Results"]["use_gui"] = True
         Log("\teval_rendering=True")
         config["Results"]["eval_rendering"] = True
         Log("\tuse_wandb=False")

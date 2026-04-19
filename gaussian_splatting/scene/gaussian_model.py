@@ -277,7 +277,7 @@ class GaussianModel:
 
         # 对低频区域（例如白墙）的点进行尺度放大，倍率设为 2.5 (可在此处微调 2.0~3.0)
         # 这能让少量稀疏的 2D 盘覆盖住大面积空白，且配合法线 FDN 约束变得极度平滑
-        scale_multiplier[~is_high_freq_tensor] = 2.5
+        scale_multiplier[~is_high_freq_tensor] = 1.2
 
         # 因为 base_scales 在对数域，依据对数乘法原理：log(A * B) = log(A) + log(B)
         scales = base_scales + torch.log(scale_multiplier.unsqueeze(-1))
@@ -296,7 +296,7 @@ class GaussianModel:
 
         # 生成的张量的每个元素都为0.1经过逆sigmoid变换得到真实不透明度 [0,1]->inv_sig->[-inf,inf]
         opacities = inverse_sigmoid(
-            0.5
+            0.1
             * torch.ones(
                 (fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"
             )

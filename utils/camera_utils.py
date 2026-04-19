@@ -180,10 +180,11 @@ class Camera(nn.Module):
             )
         ).squeeze(0)
 
+    # 修改为：
     @property
     def camera_center(self):
-        #return self.world_view_transform.inverse()[3, :3]
-        return self.world_view_transform # TODO: Need to invert for high order SHs by inverse_t(self.world_view_transform).
+        # 正确计算相机在世界坐标系下的 3D 中心点
+        return self.world_view_transform.inverse()[3, :3]
 
     # def update_RT(self, R, t):
     #     self.R = R.to(device=self.device) #接收新的旋转矩阵 R 和平移向量 t，并将它们更新到当前相机对象的属性中。

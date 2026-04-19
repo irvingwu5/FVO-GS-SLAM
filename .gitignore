@@ -15,5 +15,5 @@ datasets
 ablation_results
 runtime_results
 wandb
-./weights
+weights
 result*
