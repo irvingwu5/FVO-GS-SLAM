@@ -586,9 +586,11 @@ class FrontEnd(mp.Process):
                         # ====================================================
                         # 【真正独立子图模式】：种子帧初始化
                         # ====================================================
-
-                        # 1. 发送切图信号给后端（保存旧子图、发送给回环检测）
-                        self.backend_queue.put(["new_submap", self.current_submap_id])
+                        # 计算当前子图相对于上一个子图的相对位姿
+                        # current_c2w 是新子图的起点在旧子图坐标系下的位姿
+                        relative_pose = current_c2w.clone().cpu().numpy()
+                        # 1. 发送切图信号给后端，附带相对位姿
+                        self.backend_queue.put(["new_submap", self.current_submap_id, relative_pose])
 
                         # 2. 更新前端子图 ID 和锚点
                         self.current_submap_id += 1

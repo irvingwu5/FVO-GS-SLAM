@@ -883,192 +883,114 @@ class BackEnd(mp.Process):
                 elif data[0] == "new_submap":
 
                     completed_submap_id = data[1]
+                    # 接收前端传来的相对位姿（如果是第一个子图，可能没有这个参数，默认为单位阵）
+                    relative_pose = data[2] if len(data) > 2 else np.eye(4)
 
                     self.current_submap_id = completed_submap_id + 1
-
                     Log(f"==> Backend received new_submap signal. Freezing submap {completed_submap_id}...")
 
                     save_dir = self.config["Results"]["save_dir"]
-
                     submaps_dir = os.path.join(save_dir, "submaps")
-
                     os.makedirs(submaps_dir, exist_ok=True)
-
                     # ========== 步骤 1：保存当前子图的全部高斯参数到磁盘 ==========
-
                     gaussian_params = self.gaussians.capture_dict()
-
                     submap_keyframes = sorted(list(self.viewpoints.keys()))
-
                     ckpt_data = {
-
                         "gaussian_params": gaussian_params,
-
                         "submap_keyframes": submap_keyframes,
-
-                        "correct_tsfm": np.eye(4)
-
+                        "correct_tsfm": np.eye(4),
+                        "relative_pose": relative_pose  # <--- 新增：保存相对位姿
                     }
 
                     ckpt_path = os.path.join(submaps_dir, f"{completed_submap_id:06d}.ckpt")
-
                     torch.save(ckpt_data, ckpt_path)
-
                     Log(f"✓ Submap {completed_submap_id} parameters saved to {ckpt_path}")
 
                     # ========== 步骤 2：保存关键帧图像（用于回环检测） ==========
-
                     kf_image_paths = []
-
                     if len(submap_keyframes) > 0:
-
                         for kf_idx in submap_keyframes:
                             kf_image = self.viewpoints[kf_idx].original_image.cpu()
-
                             img_path = os.path.join(submaps_dir, f"{completed_submap_id:06d}_img_{kf_idx}.pt")
-
                             torch.save(kf_image, img_path)
-
                             kf_image_paths.append(img_path)
 
                     if hasattr(self, 'loop_queue') and self.loop_queue is not None and len(kf_image_paths) > 0:
                         self.loop_queue.put(["submap_saved", completed_submap_id, ckpt_path, kf_image_paths])
-
                         Log(f"✓ Submap {completed_submap_id} sent to loop closure")
 
                     # ========== 步骤 3：根据模式选择清理策略 ==========
 
                     if self.true_independent_submap:
-
                         # ====================================================
-
                         # 【真正独立子图模式】：彻底清空所有状态
-
                         # ====================================================
-
                         # 3a. 清空所有高斯点
-
                         self.gaussians.prune_points(self.gaussians.unique_kfIDs >= 0)
-
                         Log("✓ Pruned ALL Gaussian points for true independent submap")
-
                         # 3b. 清空所有关键帧和优化器状态
-
                         self.viewpoints.clear()
-
                         self.current_window = []
-
                         self.occ_aware_visibility = {}
-
                         self.keyframe_optimizers = None
-
                         # 3c. 重新初始化高斯优化器（清空旧的动量和学习率状态）
-
                         self.gaussians.training_setup(self.opt_params)
-
                         # 3d. 彻底释放显存
-
                         torch.cuda.empty_cache()
-
                         Log("✓ Backend state fully reset. Waiting for seed frame init...")
-
                         # 注意：此模式下不调用 push_to_frontend()！
-
                         # 因为前端发送的是 "init" 请求，后端将在 "init" 分支中
-
                         # 执行 initialize_map() 并通过 push_to_frontend("init") 回传。
-
-
                     else:
-
                         # ====================================================
-
                         # 【流式子图模式】：保留部分旧点和关键帧（原有逻辑）
-
                         # ====================================================
-
                         retained_kfs = sorted(list(self.viewpoints.keys()))[-self.window_size:]
-
                         target_device = self.gaussians.unique_kfIDs.device
-
                         kf_mask = torch.zeros(len(self.gaussians._xyz), dtype=torch.bool, device=target_device)
 
                         for kf_id in retained_kfs:
                             kf_mask = kf_mask | (self.gaussians.unique_kfIDs == kf_id)
 
                         if self.use_critical_point_selection and kf_mask.sum() > 0:
-
                             try:
-
                                 kf_indices_gpu = torch.where(kf_mask)[0]
-
                                 xyz_subset = self.gaussians._xyz[kf_indices_gpu].detach().cpu().numpy()
-
                                 scaling_subset = self.gaussians._scaling[kf_indices_gpu].detach().cpu().numpy()
-
                                 opacity_subset = self.gaussians._opacity[
                                     kf_indices_gpu].detach().cpu().numpy().squeeze()
-
                                 uncertainty = np.mean(scaling_subset, axis=1)
-
                                 u_min, u_max = uncertainty.min(), uncertainty.max()
-
                                 uncertainty_norm = (uncertainty - u_min) / (u_max - u_min + 1e-6)
-
                                 o_min, o_max = opacity_subset.min(), opacity_subset.max()
-
                                 visibility_norm = (opacity_subset - o_min) / (o_max - o_min + 1e-6)
-
                                 value_score = (1 - uncertainty_norm) * visibility_norm
-
                                 num_retain = max(100, int(len(xyz_subset) * self.retention_ratio))
-
                                 top_local_indices = np.argsort(value_score)[-num_retain:]
-
                                 top_global_indices = kf_indices_gpu[
                                     torch.from_numpy(top_local_indices).to(target_device)]
-
-                                keep_mask = torch.zeros(len(self.gaussians._xyz), dtype=torch.bool,
-                                                        device=target_device)
-
+                                keep_mask = torch.zeros(len(self.gaussians._xyz), dtype=torch.bool,device=target_device)
                                 keep_mask[top_global_indices] = True
 
                                 Log(f"[Submap Cut] 智能选择：从 {len(retained_kfs)} 个关键帧的 "
-
                                     f"{kf_mask.sum().item()} 个点中保留 {keep_mask.sum().item()} 个")
 
                             except Exception as e:
-
                                 Log(f"[Error] 智能选择失败: {e}，降级为仅保留关键帧归属点")
-
                                 keep_mask = kf_mask
-
                         else:
-
                             keep_mask = kf_mask
-
                         old_mask = ~keep_mask
-
                         self.gaussians.prune_points(old_mask.cuda())
-
                         Log(f"✓ Pruned {old_mask.sum().item()} old Gaussian points")
-
                         self.gaussians.training_setup(self.opt_params)
-
                         retained_viewpoints = {kf: self.viewpoints[kf] for kf in retained_kfs if kf in self.viewpoints}
-
                         self.viewpoints.clear()
-
                         self.viewpoints.update(retained_viewpoints)
-
                         self.current_window = list(retained_kfs)
-
                         new_occ = {k: v for k, v in self.occ_aware_visibility.items() if k in retained_kfs}
-
                         self.occ_aware_visibility = new_occ
-
                         self.keyframe_optimizers = None
-
                         Log(f"✓ Retained {len(retained_kfs)} keyframes for next submap")
 
                         if self.empty_cache_on_submap_cut:
