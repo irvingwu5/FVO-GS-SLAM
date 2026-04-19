@@ -50,6 +50,7 @@ class FrontEnd(mp.Process):
         self.submap_trans_thre = self.config["Submap"]["trans_thre"]
         self.submap_rot_thre = self.config["Submap"]["rot_thre"]
         self.frame_to_submap = {}  # <--- 新增这行：记录每帧属于哪个子图
+        self.true_independent_submap = self.config.get("Submap", {}).get("true_independent_submap", False)
         # ============================================
         self.fft_filter = None  # <--- 新增这行：频域滤波器实例
         # 【新增：读取消融实验开关，兼容旧版配置防止报错】
@@ -57,10 +58,7 @@ class FrontEnd(mp.Process):
         # 【新增：消融实验开关】
         self.use_fft_mask = self.config.get("Ablation", {}).get("use_fft_mask", True)
         self.use_error_mask = self.config.get("Ablation", {}).get("use_error_mask", True)
-        # 【新增】：读取位姿连续性检查参数
-        self.pose_jump_check_enabled = self.config.get("Submap", {}).get("pose_jump_check_enabled", True)
-        self.max_trans_jump = self.config.get("Submap", {}).get("max_trans_jump", 1.0)
-        self.max_rot_jump = self.config.get("Submap", {}).get("max_rot_jump", 45.0)
+
 
     def set_hyperparams(self):
         self.save_dir = self.config["Results"]["save_dir"] # 结果保存路径
@@ -209,10 +207,6 @@ class FrontEnd(mp.Process):
     '''
     def tracking(self, cur_frame_idx, viewpoint):
         prev = self.cameras[cur_frame_idx - self.use_every_n_frames] # 上一帧位姿
-        # 【新增】：检查位姿连续性
-        # if not self.validate_pose_continuity(prev.T, prev.T):
-        #     Log(f"[WARNING] 跳过第 {cur_frame_idx} 帧，因为检测到位姿跳变")
-        #     return False  # 返回 False 表示 tracking 失败
         viewpoint.T = prev.T
         # 优化参数与优化器构建
         opt_params = []
@@ -283,44 +277,7 @@ class FrontEnd(mp.Process):
         self.median_depth = get_median_depth(depth, opacity)
         return render_pkg #返回最后一次的 render_pkg
 
-    def validate_pose_continuity(self, prev_pose, curr_pose):
-        """
-        检查位姿是否发生跳变
-        【作用】：防止子图切分时位姿跳变导致的 tracking 错误
 
-        Args:
-            prev_pose: 前一帧位姿 (4x4 变换矩阵)
-            curr_pose: 当前帧位姿 (4x4 变换矩阵)
-
-        Returns:
-            True: 位姿连续，无跳变
-            False: 检测到位姿跳变
-        """
-        if not self.pose_jump_check_enabled:
-            return True
-
-        try:
-            # 计算平移差
-            trans_diff = np.linalg.norm(curr_pose[:3, 3] - prev_pose[:3, 3])
-            if trans_diff > self.max_trans_jump:
-                Log(f"[WARNING] 检测到平移跳变: {trans_diff:.3f}m (阈值: {self.max_trans_jump}m)")
-                return False
-
-            # 计算旋转差（角度）
-            R_diff = prev_pose[:3, :3].T @ curr_pose[:3, :3]
-            # 使用迹计算旋转角度
-            trace = np.clip(np.trace(R_diff), -1, 3)
-            angle_diff = np.arccos((trace - 1) / 2) * 180 / np.pi
-
-            if angle_diff > self.max_rot_jump:
-                Log(f"[WARNING] 检测到旋转跳变: {angle_diff:.1f}° (阈值: {self.max_rot_jump}°)")
-                return False
-
-            return True
-
-        except Exception as e:
-            Log(f"[ERROR] 位姿连续性检查异常: {e}")
-            return True  # 异常时默认认为连续
     '''
     -------------------关键帧判断---------------------
     作用: 判断当前帧是否提供了足够的新信息（或跟踪是否变得不稳定），从而需要将其作为新的关键帧。
@@ -621,21 +578,52 @@ class FrontEnd(mp.Process):
                 if self.submap_anchor_pose is None:
                     self.submap_anchor_pose = current_c2w.clone()
 
+                # ========== 子图切换逻辑 ==========
                 if self.exceeds_motion_thresholds(current_c2w, self.submap_anchor_pose):
                     Log(f"==> 启动新子图 (ID: {self.current_submap_id + 1}) <==")
 
-                    # 1. 仅发送切图信号给后端
-                    self.backend_queue.put(["new_submap", self.current_submap_id])
+                    if self.true_independent_submap:
+                        # ====================================================
+                        # 【真正独立子图模式】：种子帧初始化
+                        # ====================================================
 
-                    # 2. 更新前端锚点，继续平滑 Tracking
-                    self.current_submap_id += 1
-                    self.submap_anchor_pose = current_c2w.clone()
+                        # 1. 发送切图信号给后端（保存旧子图、发送给回环检测）
+                        self.backend_queue.put(["new_submap", self.current_submap_id])
 
-                    # 【核心修复】：彻底删除坐标系强制转换！
-                    # 保持全局坐标系连续 Tracking，不清理 current_window，
-                    # 彻底消除轨迹指数级爆炸和失忆问题。
+                        # 2. 更新前端子图 ID 和锚点
+                        self.current_submap_id += 1
+                        self.submap_anchor_pose = current_c2w.clone()
 
-                    continue  # 跳过本次 is_keyframe 判断，平滑进入下一帧
+                        # 3. 彻底清空前端状态
+                        self.current_window = []
+                        self.occ_aware_visibility = {}
+                        self.initialized = False  # 标记为未初始化，触发窗口填充加速逻辑
+
+                        # 4. 用当前帧作为种子帧，生成初始深度图
+                        depth_map = self.add_new_keyframe(cur_frame_idx, init=True)
+
+                        # 5. 向后端发送 "init" 请求（与系统冷启动完全相同的流程）
+                        #    后端收到后会：清空所有旧高斯点 → 从深度图生成新点 → 执行初始化优化 → 回传给前端
+                        self.request_init(cur_frame_idx, viewpoint, depth_map)
+
+                        # 6. 将当前帧加入新的滑动窗口
+                        self.current_window.append(cur_frame_idx)
+
+                        # 7. 前端阻塞等待后端完成初始化
+                        #    （request_init 已设置 self.requested_init = True）
+                        #    主循环顶部的 if self.requested_init: continue 会自动阻塞
+
+                        cur_frame_idx += 1
+                        continue
+
+                    else:
+                        # ====================================================
+                        # 【流式子图模式】：保留部分旧点（原有逻辑）
+                        # ====================================================
+                        self.backend_queue.put(["new_submap", self.current_submap_id])
+                        self.current_submap_id += 1
+                        self.submap_anchor_pose = current_c2w.clone()
+                        continue
                 # ============================================
 
                 # 窗口维护作用: 维护一个固定大小的滑动窗口（current_window），用于限制优化规模

@@ -61,28 +61,16 @@ Training:
     cam_trans_delta: 0.001
 
 Submap:
-  # 原有配置
-  submap_size: 10000
-  retention_frames: 10
-  trans_thre: 1.5     # 平移切图阈值(米)
-  rot_thre: 60           # 旋转切图阈值(度)
-  # ========== 【新增】智能关键点选择配置 ==========
-
-  # 是否启用智能关键点选择
+  trans_thre: 1.5
+  rot_thre: 60
+  # ========== 新增：真正独立子图模式 ==========
+  true_independent_submap: true   # true=彻底清空旧地图，false=保留部分旧点（流式）
+  seed_init_iters: 500            # 种子帧初始化的优化迭代次数（建议 300-800）
+  # ===========================================
+  # 以下参数仅在 true_independent_submap: false 时生效
   use_critical_point_selection: true
-
-  # 选择策略
-  # - "advanced": 混合策略（推荐），结合不确定性、可见性和空间分布
-  # - "simple": 简化策略（备选），只基于不确定性和可见性
-  selection_strategy: "advanced"
-
-  # 保留比例（10-20%）
-  # - 0.10: 保留 10% 的点，显存节省 90%，位姿精度 90-95%
-  # - 0.15: 保留 15% 的点，显存节省 85%，位姿精度 95-98%【推荐】
-  # - 0.20: 保留 20% 的点，显存节省 80%，位姿精度 98%+
-  retention_ratio: 0.15
-
-  # 空间聚类数（8-12）
+  selection_strategy: simple
+  retention_ratio: 0.30
   num_spatial_clusters: 10
 
 # 【改进】：显存管理参数
