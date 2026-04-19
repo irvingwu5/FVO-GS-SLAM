@@ -466,7 +466,8 @@ class SLAM:
                 final=True,
                 monocular=self.monocular,
                 frame_to_submap=frame_to_submap,
-                submap_anchor_poses=submap_anchor_poses
+                submap_anchor_poses=submap_anchor_poses,
+                cameras_already_global=True  # ← 新增这一个参数
             )
 
             Log("Rendering Current Map Quality...")

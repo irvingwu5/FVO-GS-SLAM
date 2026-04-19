@@ -78,20 +78,17 @@ def inverse_t(T):
 
 def update_pose(camera, converged_threshold=1e-4):
     tau = torch.cat([camera.cam_trans_delta, camera.cam_rot_delta], axis=0)
-
-    # T_w2c = torch.eye(4, device=tau.device)
     T_w2c = camera.T
-    # T_w2c[0:3, 0:3] = camera.R
-    # T_w2c[0:3, 3] = camera.T
-    #
-    # new_w2c = SE3_exp(tau) @ T_w2c
-    #
-    # new_R = new_w2c[0:3, 0:3]
-    # new_T = new_w2c[0:3, 3]
-    #
-    # converged = tau.norm() < converged_threshold
-    # camera.update_RT(new_R, new_T)
-    new_w2c = lietorch.SE3.exp(tau).matrix() @ T_w2c
+
+    # 将 W2C 转为 C2W
+    T_c2w = torch.linalg.inv(T_w2c)
+
+    # 在 C2W 上左乘增量（全局坐标系扰动）
+    new_c2w = lietorch.SE3.exp(tau).matrix() @ T_c2w
+
+    # 转回 W2C
+    new_w2c = torch.linalg.inv(new_c2w)
+
     converged = (tau ** 2).sum() < (converged_threshold ** 2)
     camera.T = new_w2c
 

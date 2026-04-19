@@ -65,12 +65,67 @@ def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
     return ape_stat
 
 
-def eval_ate(frames, kf_ids, save_dir, iterations, final=False, monocular=False, frame_to_submap=None,
-             submap_anchor_poses=None):
+def _load_submap_correct_tsfms(save_dir):
+    """
+    从磁盘加载所有子图的 PGO 修正矩阵 correct_tsfm。
+
+    Args:
+        save_dir: 结果保存根目录，其下应有 submaps/ 子目录存放 *.ckpt 文件。
+
+    Returns:
+        dict: {submap_id (int): correct_tsfm (np.ndarray, 4x4)}
+              如果 submaps 目录不存在或为空，返回空字典。
+    """
+    import glob
+    submaps_dir = os.path.join(save_dir, "submaps")
+    correct_tsfms = {}
+    if not os.path.isdir(submaps_dir):
+        return correct_tsfms
+    for ckpt_path in sorted(glob.glob(os.path.join(submaps_dir, "*.ckpt"))):
+        sid = int(os.path.basename(ckpt_path).split('.')[0])
+        try:
+            ckpt = torch.load(ckpt_path, map_location="cpu")
+            tsfm = ckpt.get("correct_tsfm", np.eye(4))
+            if isinstance(tsfm, torch.Tensor):
+                tsfm = tsfm.numpy()
+            correct_tsfms[sid] = np.array(tsfm, dtype=np.float64)
+            del ckpt
+        except Exception as e:
+            Log(f"[eval_ate] 读取子图 {sid} 的 correct_tsfm 失败: {e}")
+            correct_tsfms[sid] = np.eye(4)
+    return correct_tsfms
+
+
+def eval_ate(frames, kf_ids, save_dir, iterations, final=False, monocular=False,
+             frame_to_submap=None, submap_anchor_poses=None,
+             cameras_already_global=False):
+    """
+    评估绝对轨迹误差 (ATE)。
+
+    新增参数:
+        cameras_already_global (bool):
+            如果为 True，表示 frames 中的 cam.T 已经被上游（如 slam.py 的
+            轨迹拉扯步骤）修正为全局坐标系下的 W2C 矩阵，此时直接使用
+            inv(cam.T) 作为全局 C2W，不再叠加 anchor 和 correct_tsfm，
+            避免重复变换。
+
+            如果为 False（默认），表示 cam.T 仍然是子图局部坐标系下的 W2C，
+            需要依次叠加：
+              1. submap_anchor_poses[sid]  —— 开环锚点（前端累积的全局 C2W）
+              2. correct_tsfm[sid]         —— PGO 闭环修正矩阵
+            来还原全局 C2W。
+    """
     trj_data = dict()
     latest_frame_idx = kf_ids[-1] + 2 if final else kf_ids[-1] + 1
     trj_id, trj_est, trj_gt = [], [], []
     trj_est_np, trj_gt_np = [], []
+
+    # ------------------------------------------------------------------
+    # 如果需要在线拼接（cameras_already_global=False），预加载 PGO 修正矩阵
+    # ------------------------------------------------------------------
+    correct_tsfms = {}
+    if not cameras_already_global and frame_to_submap is not None:
+        correct_tsfms = _load_submap_correct_tsfms(save_dir)
 
     for kf_id in kf_ids:
         kf = frames[kf_id]
@@ -78,19 +133,38 @@ def eval_ate(frames, kf_ids, save_dir, iterations, final=False, monocular=False,
         # 1. 获取局部坐标系下的 C2W 矩阵
         local_c2w = np.linalg.inv(kf.T.cpu().numpy())
 
-        # 2. 如果提供了子图锚点信息，则将局部 C2W 转换回全局 C2W
-        # 2. 如果提供了子图锚点信息，则将局部 C2W 转换回全局 C2W
-        if frame_to_submap is not None and submap_anchor_poses is not None:
+        # 2. 根据模式决定是否需要拼接全局位姿
+        if cameras_already_global:
+            # -------------------------------------------------------
+            # 模式 A：cam.T 已经是全局 W2C（slam.py 终局评估阶段）
+            # 直接使用 inv(cam.T) 即可，不做任何额外变换
+            # -------------------------------------------------------
+            pose_est = local_c2w
+
+        elif frame_to_submap is not None and submap_anchor_poses is not None:
+            # -------------------------------------------------------
+            # 模式 B：cam.T 仍是子图局部 W2C（前端在线评估阶段）
+            # 需要叠加 anchor + PGO correct_tsfm
+            # -------------------------------------------------------
             sid = frame_to_submap.get(kf_id, 0)
             if sid in submap_anchor_poses:
-                # ★★★ 修改这里：直接获取 NumPy 数组，去掉 .cpu().numpy() ★★★
                 anchor_c2w = submap_anchor_poses[sid]
-                # 全局 C2W = 锚点全局 C2W @ 局部 C2W
-                global_c2w = anchor_c2w @ local_c2w
+                if isinstance(anchor_c2w, torch.Tensor):
+                    anchor_c2w = anchor_c2w.cpu().numpy()
+                anchor_c2w = np.array(anchor_c2w, dtype=np.float64)
+
+                # 获取 PGO 修正矩阵（如果存在）
+                ct = correct_tsfms.get(sid, np.eye(4))
+
+                # 全局 C2W = correct_tsfm @ anchor_c2w @ local_c2w
+                global_c2w = ct @ anchor_c2w @ local_c2w
                 pose_est = global_c2w
             else:
                 pose_est = local_c2w
         else:
+            # -------------------------------------------------------
+            # 模式 C：无子图信息（单子图 / 未启用子图策略）
+            # -------------------------------------------------------
             pose_est = local_c2w
 
         pose_gt = np.linalg.inv(kf.T_gt.cpu().numpy())
@@ -124,6 +198,7 @@ def eval_ate(frames, kf_ids, save_dir, iterations, final=False, monocular=False,
     )
     wandb.log({"frame_idx": latest_frame_idx, "ate": ate})
     return ate
+
 
 '''
 计算psnr、ssim、lpips用的是非关键帧，即NVS

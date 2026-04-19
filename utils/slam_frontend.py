@@ -622,10 +622,12 @@ class FrontEnd(mp.Process):
                         self.occ_aware_visibility = {}
                         self.initialized = False
 
-                        # 【修复】：清空所有相机的优化增量，防止梯度残留
+                        # slam_frontend.py 626行修改为：
                         for cam in self.cameras.values():
-                            cam.cam_rot_delta.data.fill_(0)
-                            cam.cam_trans_delta.data.fill_(0)
+                            if cam.cam_rot_delta is not None:
+                                cam.cam_rot_delta.data.fill_(0)
+                            if cam.cam_trans_delta is not None:
+                                cam.cam_trans_delta.data.fill_(0)
 
                         # 4. 【核心修复】：重置种子帧的位姿为单位阵（新子图的原点）
                         viewpoint.T = torch.eye(4, device=viewpoint.T.device)
