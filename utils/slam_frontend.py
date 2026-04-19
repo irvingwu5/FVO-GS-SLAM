@@ -46,11 +46,15 @@ class FrontEnd(mp.Process):
 
         # ========== 新增：子图策略状态变量 ==========
         self.current_submap_id = 0
-        self.submap_anchor_pose = None  # 记录当前子图第一帧的位姿 (World to Camera)
+        self.submap_anchor_poses = {0: np.eye(4)}  # 子图 0 的锚点就是全局原点
+        self.cumulative_anchor_c2w = np.eye(4)  # 当前累积的全局锚点位姿
         self.submap_trans_thre = self.config["Submap"]["trans_thre"]
         self.submap_rot_thre = self.config["Submap"]["rot_thre"]
         self.frame_to_submap = {}  # <--- 新增这行：记录每帧属于哪个子图
         self.true_independent_submap = self.config.get("Submap", {}).get("true_independent_submap", False)
+        # ★★★ 新增这一行，修复 AttributeError ★★★
+        self.submap_anchor_pose = None
+        # ============================================
         # ============================================
         self.fft_filter = None  # <--- 新增这行：频域滤波器实例
         # 【新增：读取消融实验开关，兼容旧版配置防止报错】
@@ -206,8 +210,13 @@ class FrontEnd(mp.Process):
     逻辑: 基于当前帧与上一关键帧的相对位移（kf_translation）、视锥体重叠度（kf_overlap）以及可见性掩码来综合判断
     '''
     def tracking(self, cur_frame_idx, viewpoint):
-        prev = self.cameras[cur_frame_idx - self.use_every_n_frames] # 上一帧位姿
-        viewpoint.T = prev.T
+        # 【修复】：如果是子图的第一帧，不要继承上一帧的位姿
+        if getattr(self, 'is_first_frame_of_submap', False):
+            viewpoint.T = torch.eye(4, device=viewpoint.T.device)
+            self.is_first_frame_of_submap = False
+        else:
+            prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
+            viewpoint.T = prev.T.clone()  # 使用 clone 避免引用污染
         # 优化参数与优化器构建
         opt_params = []
         opt_params.append(
@@ -531,8 +540,9 @@ class FrontEnd(mp.Process):
             if self.frontend_queue.empty(): # 前端队列为空（第一次执行为空），执行前端 SLAM 主循环的核心逻辑
                 tic.record()
                 if cur_frame_idx >= len(self.dataset): #所有帧处理完毕，保存结果并退出循环
-                    # ========== 新增：退出前将从属关系存入硬盘 ==========
+                    # ========== 新增：退出前将从属关系和锚点位姿存入硬盘 ==========
                     torch.save(self.frame_to_submap, os.path.join(self.save_dir, "frame_to_submap.pt"))
+                    torch.save(self.submap_anchor_poses, os.path.join(self.save_dir, "submap_anchor_poses.pt"))
                     # ====================================================
                     break
                 # 当调用前端initialize函数时，会将 self.requested_init 设为 True，并向后端发送初始化请求。只有当后端完成初始化并通过队列发回 init 消息时（第 534-536 行），前端才会将此标志重置为 False
@@ -591,8 +601,17 @@ class FrontEnd(mp.Process):
                         # ====================================================
                         # 【真正独立子图模式】：种子帧初始化
                         # ====================================================
-                        # 1. 计算并发送相对位姿
+                        # 计算当前子图相对于上一个子图的相对位姿
+                        # current_c2w 是新子图的起点在旧子图坐标系下的位姿
                         relative_pose = current_c2w.clone().cpu().numpy()
+
+                        # ★★★ 新增：更新全局锚点位姿链 ★★★
+                        # 新子图的全局锚点 = 旧子图的全局锚点 × 当前帧在旧子图中的局部位姿
+                        self.cumulative_anchor_c2w = self.cumulative_anchor_c2w @ relative_pose
+                        new_submap_id = self.current_submap_id + 1
+                        self.submap_anchor_poses[new_submap_id] = self.cumulative_anchor_c2w.copy()
+
+                        # 1. 发送切图信号给后端，附带相对位姿
                         self.backend_queue.put(["new_submap", self.current_submap_id, relative_pose])
 
                         # 2. 更新前端子图 ID
@@ -603,9 +622,18 @@ class FrontEnd(mp.Process):
                         self.occ_aware_visibility = {}
                         self.initialized = False
 
+                        # 【修复】：清空所有相机的优化增量，防止梯度残留
+                        for cam in self.cameras.values():
+                            cam.cam_rot_delta.data.fill_(0)
+                            cam.cam_trans_delta.data.fill_(0)
+
                         # 4. 【核心修复】：重置种子帧的位姿为单位阵（新子图的原点）
                         viewpoint.T = torch.eye(4, device=viewpoint.T.device)
                         self.submap_anchor_pose = torch.eye(4, device=viewpoint.T.device)
+
+                        # 【修复】：强制断开与上一帧的 tracking 联系
+                        # 临时修改 use_every_n_frames 逻辑，或者在 tracking 中加入判断
+                        self.is_first_frame_of_submap = True
 
                         # 5. 用重置后的位姿生成初始深度图
                         depth_map = self.add_new_keyframe(cur_frame_idx, init=True)
@@ -735,6 +763,8 @@ class FrontEnd(mp.Process):
                         self.save_dir,
                         cur_frame_idx,
                         monocular=self.monocular,
+                        frame_to_submap=self.frame_to_submap if self.true_independent_submap else None,
+                        submap_anchor_poses=self.submap_anchor_poses if self.true_independent_submap else None,
                     )
                 toc.record()
                 torch.cuda.synchronize()

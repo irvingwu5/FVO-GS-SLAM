@@ -254,8 +254,13 @@ class SLAM:
         }
         has_normal = False
 
-        # 读取从属关系映射
-        frame_to_submap = torch.load(os.path.join(self.save_dir, "frame_to_submap.pt"))
+        # 加载锚点位姿
+        frame_to_submap = torch.load(os.path.join(save_dir, "frame_to_submap.pt"))
+        submap_anchor_poses_path = os.path.join(save_dir, "submap_anchor_poses.pt")
+        if os.path.exists(submap_anchor_poses_path):
+            submap_anchor_poses = torch.load(submap_anchor_poses_path)
+        else:
+            submap_anchor_poses = None
         submap_tsfms = {}
 
         # 🟢 第一步：仅读取 PGO 修正矩阵（体积极小）
@@ -287,16 +292,17 @@ class SLAM:
 
             # 3. 执行空间变换 (增加安全检查)
             if not np.allclose(tsfm.numpy(), np.eye(4), atol=1e-4):
-                # 【核心修复】：只对 Tensor 类型执行 .cuda()，忽略 int/float 等元数据
+                # 将 tsfm 转换为 GPU tensor
+                tsfm_cuda = tsfm.cuda()
+
                 gp_cuda = {
                     k: (v.cuda() if isinstance(v, torch.Tensor) else v)
                     for k, v in gp.items()
                 }
 
-                # 执行刚体变换 (内部只处理 _xyz, _rotation, _normal)
-                gp_corrected = rigid_transform_2dgs(gp_cuda, tsfm.numpy())
+                # 执行刚体变换
+                gp_corrected = rigid_transform_2dgs(gp_cuda, tsfm_cuda.cpu().numpy())  # 确保 rigid_transform_2dgs 内部处理正确
 
-                # 变换完立即踢回 CPU
                 gp = {
                     k: (v.cpu() if isinstance(v, torch.Tensor) else v)
                     for k, v in gp_corrected.items()
@@ -431,7 +437,8 @@ class SLAM:
                 local_c2w = torch.linalg.inv(cam.T)
 
                 # 全局 C2W = 子图原点的全局 C2W @ 局部 C2W
-                global_c2w = submap_c2w @ local_c2w
+                # 注意：submap_c2w 必须是 float32 类型
+                global_c2w = submap_c2w.to(torch.float32) @ local_c2w.to(torch.float32)
 
                 # 最终更新为全局 W2C
                 with torch.no_grad():
@@ -458,6 +465,8 @@ class SLAM:
                 0,
                 final=True,
                 monocular=self.monocular,
+                frame_to_submap=frame_to_submap,
+                submap_anchor_poses=submap_anchor_poses
             )
 
             Log("Rendering Current Map Quality...")
@@ -630,8 +639,8 @@ if __name__ == "__main__":
         Log("Following config will be overriden")
         Log("\tsave_results=True")
         config["Results"]["save_results"] = True
-        Log("\tuse_gui=True")
-        config["Results"]["use_gui"] = True
+        Log("\tuse_gui=False")
+        config["Results"]["use_gui"] = False
         Log("\teval_rendering=True")
         config["Results"]["eval_rendering"] = True
         Log("\tuse_wandb=False")

@@ -174,19 +174,23 @@ def rigid_transform_2dgs(gaussian_params, tsfm_matrix):
 
     # 1. 变换中心点 (xyz)
     xyz = gaussian_params['_xyz']
-    gaussian_params['_xyz'] = (R @ xyz.T).T + t
+    gaussian_params['_xyz'] = (xyz @ R.T) + t  # 【修复】：正确的点云旋转公式 (N,3) @ (3,3) + (3,)
 
     # 2. 变换二维高斯的朝向
     if '_rotation' in gaussian_params:
         rotation_q = gaussian_params['_rotation']
-        rotation_q_roma = rotation_q[:, [1, 2, 3, 0]]
+        rotation_q_roma = rotation_q[:, [1, 2, 3, 0]]  # xyzw
         cur_rot_mat = roma.unitquat_to_rotmat(rotation_q_roma)
-        new_rot_mat = R.unsqueeze(0) @ cur_rot_mat
+
+        # 【修复】：批量矩阵乘法，R 是 (3,3)，cur_rot_mat 是 (N,3,3)
+        new_rot_mat = torch.einsum('ij,njk->nik', R, cur_rot_mat)
+
         new_rotation_q_roma = roma.rotmat_to_unitquat(new_rot_mat).squeeze()
-        new_rotation_q = new_rotation_q_roma[:, [3, 0, 1, 2]]
+        new_rotation_q = new_rotation_q_roma[:, [3, 0, 1, 2]]  # wxyz
         gaussian_params['_rotation'] = new_rotation_q
 
         if '_normal' in gaussian_params:
+            # 法线是旋转矩阵的 Z 轴（第三列）
             gaussian_params['_normal'] = new_rot_mat[:, :, 2]
 
     return gaussian_params

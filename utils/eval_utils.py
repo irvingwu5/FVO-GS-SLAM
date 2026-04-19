@@ -65,23 +65,34 @@ def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
     return ape_stat
 
 
-def eval_ate(frames, kf_ids, save_dir, iterations, final=False, monocular=False):
+def eval_ate(frames, kf_ids, save_dir, iterations, final=False, monocular=False, frame_to_submap=None,
+             submap_anchor_poses=None):
     trj_data = dict()
     latest_frame_idx = kf_ids[-1] + 2 if final else kf_ids[-1] + 1
     trj_id, trj_est, trj_gt = [], [], []
     trj_est_np, trj_gt_np = [], []
 
-    def gen_pose_matrix(R, T):
-        pose = np.eye(4)
-        pose[0:3, 0:3] = R.cpu().numpy()
-        pose[0:3, 3] = T.cpu().numpy()
-        return pose
-
     for kf_id in kf_ids:
         kf = frames[kf_id]
-        # pose_est = np.linalg.inv(gen_pose_matrix(kf.R, kf.T))
-        # pose_gt = np.linalg.inv(gen_pose_matrix(kf.R_gt, kf.T_gt))
-        pose_est = np.linalg.inv(kf.T.cpu().numpy())
+
+        # 1. 获取局部坐标系下的 C2W 矩阵
+        local_c2w = np.linalg.inv(kf.T.cpu().numpy())
+
+        # 2. 如果提供了子图锚点信息，则将局部 C2W 转换回全局 C2W
+        # 2. 如果提供了子图锚点信息，则将局部 C2W 转换回全局 C2W
+        if frame_to_submap is not None and submap_anchor_poses is not None:
+            sid = frame_to_submap.get(kf_id, 0)
+            if sid in submap_anchor_poses:
+                # ★★★ 修改这里：直接获取 NumPy 数组，去掉 .cpu().numpy() ★★★
+                anchor_c2w = submap_anchor_poses[sid]
+                # 全局 C2W = 锚点全局 C2W @ 局部 C2W
+                global_c2w = anchor_c2w @ local_c2w
+                pose_est = global_c2w
+            else:
+                pose_est = local_c2w
+        else:
+            pose_est = local_c2w
+
         pose_gt = np.linalg.inv(kf.T_gt.cpu().numpy())
 
         trj_id.append(frames[kf_id].uid)
@@ -100,7 +111,7 @@ def eval_ate(frames, kf_ids, save_dir, iterations, final=False, monocular=False)
 
     label_evo = "final" if final else "{:04}".format(iterations)
     with open(
-        os.path.join(plot_dir, f"trj_{label_evo}.json"), "w", encoding="utf-8"
+            os.path.join(plot_dir, f"trj_{label_evo}.json"), "w", encoding="utf-8"
     ) as f:
         json.dump(trj_data, f, indent=4)
 
