@@ -287,21 +287,26 @@ class SLAM:
             ckpt = torch.load(ckpt_path, map_location="cpu")
             gp = ckpt["gaussian_params"]
 
-            # 2. 获取对应的 PGO 修正矩阵
-            tsfm = submap_tsfms[sid]
+            # 2. 获取对应的完整变换矩阵 = correct_tsfm @ anchor_c2w
+            ct = submap_tsfms[sid].numpy()
+            anchor = np.eye(4)
+            if submap_anchor_poses is not None and sid in submap_anchor_poses:
+                anchor = submap_anchor_poses[sid]
+                if isinstance(anchor, torch.Tensor):
+                    anchor = anchor.cpu().numpy()
+                anchor = np.array(anchor, dtype=np.float64)
+
+            full_tsfm = ct @ anchor  # 完整的全局变换
 
             # 3. 执行空间变换 (增加安全检查)
-            if not np.allclose(tsfm.numpy(), np.eye(4), atol=1e-4):
-                # 将 tsfm 转换为 GPU tensor
-                tsfm_cuda = tsfm.cuda()
-
+            if not np.allclose(full_tsfm, np.eye(4), atol=1e-4):
                 gp_cuda = {
                     k: (v.cuda() if isinstance(v, torch.Tensor) else v)
                     for k, v in gp.items()
                 }
 
-                # 执行刚体变换
-                gp_corrected = rigid_transform_2dgs(gp_cuda, tsfm_cuda.cpu().numpy())  # 确保 rigid_transform_2dgs 内部处理正确
+                # 执行刚体变换 (传入完整的全局变换矩阵)
+                gp_corrected = rigid_transform_2dgs(gp_cuda, full_tsfm)
 
                 gp = {
                     k: (v.cpu() if isinstance(v, torch.Tensor) else v)
@@ -415,32 +420,25 @@ class SLAM:
             # =======================================================
             Log("==> 开始拉扯前端相机轨迹... <==")
 
-            # 1. 计算每个子图到世界坐标系的绝对变换矩阵
-            # submap_tsfms 存储的是 PGO 修正后的 C2W 矩阵
-            global_submap_poses = {0: torch.eye(4)}
-            for sid in sorted(submap_tsfms.keys()):
-                if sid == 0:
-                    global_submap_poses[sid] = submap_tsfms[sid]
-                else:
-                    # 假设 relative_pose 已经包含在 PGO 优化结果中
-                    global_submap_poses[sid] = submap_tsfms[sid]
-
             for frame_id, cam in tqdm(self.frontend.cameras.items(), desc="Correcting Trajectory"):
                 sid = frame_to_submap.get(frame_id, 0)
 
-                # 获取该子图到世界坐标系的 C2W 变换矩阵
-                submap_c2w = global_submap_poses.get(sid, torch.eye(4)).to(cam.T.device)
+                # 1. 获取该子图的开环锚点位姿
+                anchor_c2w = np.eye(4)
+                if submap_anchor_poses is not None and sid in submap_anchor_poses:
+                    anchor_c2w = submap_anchor_poses[sid]
+                    if isinstance(anchor_c2w, torch.Tensor):
+                        anchor_c2w = anchor_c2w.cpu().numpy()
+                anchor_c2w = torch.from_numpy(np.array(anchor_c2w, dtype=np.float32)).to(cam.T.device)
 
-                # 【核心修复】：正确的刚体变换顺序
-                # cam.T 是局部坐标系下的 W2C 矩阵
-                # 局部 C2W = inv(cam.T)
+                # 2. 获取 PGO 修正矩阵
+                correct_tsfm = submap_tsfms.get(sid, torch.eye(4)).to(cam.T.device).float()
+
+                # 3. 计算全局 C2W
                 local_c2w = torch.linalg.inv(cam.T)
+                global_c2w = correct_tsfm @ anchor_c2w @ local_c2w
 
-                # 全局 C2W = 子图原点的全局 C2W @ 局部 C2W
-                # 注意：submap_c2w 必须是 float32 类型
-                global_c2w = submap_c2w.to(torch.float32) @ local_c2w.to(torch.float32)
-
-                # 最终更新为全局 W2C
+                # 4. 更新为全局 W2C
                 with torch.no_grad():
                     cam.T = torch.linalg.inv(global_c2w)
 

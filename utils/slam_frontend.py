@@ -427,11 +427,13 @@ class FrontEnd(mp.Process):
     def request_init(self, cur_frame_idx, viewpoint, depth_map):
         msg = ["init", cur_frame_idx, viewpoint, depth_map]
         self.backend_queue.put(msg)
-        # 在 self.requested_init = True 之前添加：
-        with torch.no_grad():
-            # 将种子帧的位姿重置为单位阵，使其成为新子图的原点
-            viewpoint.T = torch.eye(4, device=self.device)
-            self.cameras[cur_frame_idx].T = torch.eye(4, device=self.device)
+        # 【核心修复】：只有在非第0个子图（即切图后）时，才将种子帧重置为单位阵
+        # 第0个子图的第0帧必须保持其 GT 位姿，作为全局坐标系的基准
+        if self.current_submap_id > 0:
+            with torch.no_grad():
+                # 将种子帧的位姿重置为单位阵，使其成为新子图的局部原点
+                viewpoint.T = torch.eye(4, device=self.device)
+                self.cameras[cur_frame_idx].T = torch.eye(4, device=self.device)
         self.requested_init = True
     '''
     -------------------后端同步与通信模块---------------------

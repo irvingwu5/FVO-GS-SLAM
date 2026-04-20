@@ -784,7 +784,7 @@ class BackEnd(mp.Process):
                     cur_frame_idx = data[1]
                     viewpoint = data[2]
                     depth_map = data[3]
-                    if self.true_independent_submap and len(self.gaussians._xyz) == 0:
+                    if self.true_independent_submap and len(self.gaussians._xyz) == 0 and self.current_submap_id > 0:
                         # 子图切换后的初始化：状态已在 new_submap 中清空，无需再 reset
                         Log("Initializing new submap from seed frame (state already clean)")
                         self.iteration_count = 0

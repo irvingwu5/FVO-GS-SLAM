@@ -53,7 +53,7 @@ Submap:
   trans_thre: 1.5
   rot_thre: 60
   # ========== 新增：真正独立子图模式 ==========
-  true_independent_submap: true   # true=彻底清空旧地图，false=保留部分旧点（流式）
+  true_independent_submap: True   # true=彻底清空旧地图，false=保留部分旧点（流式）
   seed_init_iters: 500            # 种子帧初始化的优化迭代次数（建议 300-800）
   # ===========================================
   # 以下参数仅在 true_independent_submap: false 时生效
