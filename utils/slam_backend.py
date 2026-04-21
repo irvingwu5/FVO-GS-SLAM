@@ -586,7 +586,8 @@ class BackEnd(mp.Process):
                     frames_to_optimize = self.config["Training"]["pose_window"]
                     for cam_idx in range(min(frames_to_optimize, len(current_window))):
                         viewpoint = viewpoint_stack[cam_idx]
-                        if viewpoint.uid == 0:
+                        if getattr(viewpoint, "fixed_pose", False):
+                            viewpoint.reset_pose_deltas()
                             continue
                         update_pose(viewpoint)
                 else:
@@ -773,6 +774,8 @@ class BackEnd(mp.Process):
                         self.reset()
 
                     self.viewpoints[cur_frame_idx] = viewpoint
+                    if getattr(viewpoint, "fixed_pose", False):
+                        viewpoint.reset_pose_deltas()
                     #扩展地图: 调用 add_next_kf (即 gaussians.extend_from_pcd_seq)，利用新关键帧的深度图在未知区域初始化新的高斯点。
                     self.add_next_kf(
                         cur_frame_idx, viewpoint, depth_map=depth_map, init=True
@@ -810,10 +813,8 @@ class BackEnd(mp.Process):
                         else:
                             iter_per_kf = self.mapping_itr_num
                     for cam_idx in range(len(self.current_window)):
-                        if self.current_window[cam_idx] == 0:
-                            continue
                         viewpoint = self.viewpoints[current_window[cam_idx]]
-                        if cam_idx < frames_to_optimize:
+                        if cam_idx < frames_to_optimize and not getattr(viewpoint, "fixed_pose", False):
                             opt_params.append(
                                 {
                                     "params": [viewpoint.cam_rot_delta],

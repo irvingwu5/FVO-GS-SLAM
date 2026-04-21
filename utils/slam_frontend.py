@@ -200,6 +200,10 @@ class FrontEnd(mp.Process):
         # Initialise the frame at the ground truth pose 将当前相机的位姿（R 和 T）强制更新为上述的真值
         #viewpoint.update_RT(viewpoint.R_gt, viewpoint.T_gt) #系统在初始化第一帧时，并不进行位姿估计，而是直接读取数据集提供的真实位姿
         viewpoint.T = viewpoint.T_gt #把第一帧真实位姿直接赋值给当前帧的估计位姿，确保系统从正确的状态开始
+        viewpoint.fixed_pose = True
+        viewpoint.reset_pose_deltas()
+        viewpoint.cam_rot_delta.requires_grad_(False)
+        viewpoint.cam_trans_delta.requires_grad_(False)
 
         self.kf_indices = []
         depth_map = self.add_new_keyframe(cur_frame_idx, init=True) #生成初始深度图（忽略无效区域）
@@ -212,29 +216,37 @@ class FrontEnd(mp.Process):
     逻辑: 基于当前帧与上一关键帧的相对位移（kf_translation）、视锥体重叠度（kf_overlap）以及可见性掩码来综合判断
     '''
     def tracking(self, cur_frame_idx, viewpoint):
-        # 【修复】：如果是子图的第一帧，不要继承上一帧的位姿
+        # 【修复】：如果是子图的第一帧，不要继承上一帧的位姿，且后续始终固定该帧位姿
         if self.is_first_frame_of_submap:
             viewpoint.T = torch.eye(4, device=viewpoint.T.device)
+            viewpoint.fixed_pose = True
+            viewpoint.reset_pose_deltas()
+            viewpoint.cam_rot_delta.requires_grad_(False)
+            viewpoint.cam_trans_delta.requires_grad_(False)
             self.is_first_frame_of_submap = False
         else:
             prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
             viewpoint.T = prev.T.clone()  # 使用 clone 避免引用污染
+            viewpoint.fixed_pose = False
+            viewpoint.cam_rot_delta.requires_grad_(True)
+            viewpoint.cam_trans_delta.requires_grad_(True)
         # 优化参数与优化器构建
         opt_params = []
-        opt_params.append(
-            {
-                "params": [viewpoint.cam_rot_delta],
-                "lr": self.config["Training"]["lr"]["cam_rot_delta"],
-                "name": "rot_{}".format(viewpoint.uid),
-            }
-        )
-        opt_params.append(
-            {
-                "params": [viewpoint.cam_trans_delta],
-                "lr": self.config["Training"]["lr"]["cam_trans_delta"],
-                "name": "trans_{}".format(viewpoint.uid),
-            }
-        )
+        if not viewpoint.fixed_pose:
+            opt_params.append(
+                {
+                    "params": [viewpoint.cam_rot_delta],
+                    "lr": self.config["Training"]["lr"]["cam_rot_delta"],
+                    "name": "rot_{}".format(viewpoint.uid),
+                }
+            )
+            opt_params.append(
+                {
+                    "params": [viewpoint.cam_trans_delta],
+                    "lr": self.config["Training"]["lr"]["cam_trans_delta"],
+                    "name": "trans_{}".format(viewpoint.uid),
+                }
+            )
         opt_params.append(
             {
                 "params": [viewpoint.exposure_a],
@@ -270,7 +282,11 @@ class FrontEnd(mp.Process):
 
             with torch.no_grad():
                 pose_optimizer.step() # 执行 pose_optimizer.step() 更新参数
-                converged = update_pose(viewpoint) # update_pose 将增量应用到实际位姿，返回是否收敛（converged）
+                if viewpoint.fixed_pose:
+                    viewpoint.reset_pose_deltas()
+                    converged = True
+                else:
+                    converged = update_pose(viewpoint) # update_pose 将增量应用到实际位姿，返回是否收敛（converged）
             # 每 10 次迭代把当前视点与 GT 图发到可视化队列（q_main2vis），用于前端显示
             if tracking_itr % 10 == 0:
                 self.q_main2vis.put(
@@ -633,8 +649,12 @@ class FrontEnd(mp.Process):
                             if cam.cam_trans_delta is not None:
                                 cam.cam_trans_delta.data.fill_(0)
 
-                        # 4. 【核心修复】：重置种子帧的位姿为单位阵（新子图的原点）
+                        # 4. 【核心修复】：重置种子帧的位姿为单位阵（新子图的原点），并永久冻结其位姿
                         viewpoint.T = torch.eye(4, device=viewpoint.T.device)
+                        viewpoint.fixed_pose = True
+                        viewpoint.reset_pose_deltas()
+                        viewpoint.cam_rot_delta.requires_grad_(False)
+                        viewpoint.cam_trans_delta.requires_grad_(False)
                         self.submap_anchor_pose = torch.eye(4, device=viewpoint.T.device)
 
                         # 【修复】：强制断开与上一帧的 tracking 联系

@@ -57,6 +57,9 @@ class Camera(nn.Module):
         self.cam_trans_delta = nn.Parameter(
             torch.zeros(3, requires_grad=True, device=device)
         )
+        # 是否将该帧作为子图局部坐标系原点并固定其位姿。
+        # 对于这类帧，只允许优化高斯与曝光，不允许通过相机增量更新位姿。
+        self.fixed_pose = False
 
         self.exposure_a = nn.Parameter(
             torch.tensor([0.0], requires_grad=True, device=device)
@@ -167,6 +170,12 @@ class Camera(nn.Module):
             image_width=W
         )
 
+    def reset_pose_deltas(self):
+        if self.cam_rot_delta is not None:
+            self.cam_rot_delta.data.zero_()
+        if self.cam_trans_delta is not None:
+            self.cam_trans_delta.data.zero_()
+
     @property
     def world_view_transform(self):
         # return getWorld2View2(self.R, self.T).transpose(0, 1)
@@ -260,6 +269,7 @@ class Camera(nn.Module):
         self.original_image = None
         self.depth = None
         self.grad_mask = None
+        self.fixed_pose = False
 
         self.cam_rot_delta = None
         self.cam_trans_delta = None
