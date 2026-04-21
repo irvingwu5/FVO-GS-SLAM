@@ -55,6 +55,7 @@ class FrontEnd(mp.Process):
         self.true_independent_submap = self.config.get("Submap", {}).get("true_independent_submap", False)
         # ★★★ 新增这一行，修复 AttributeError ★★★
         self.submap_anchor_pose = None #运动监控锚点
+        self.cut_refine_iters = self.config.get("Submap", {}).get("cut_refine_iters", 0)
         # ============================================
         # ============================================
         self.fft_filter = None  # <--- 新增这行：频域滤波器实例
@@ -75,6 +76,7 @@ class FrontEnd(mp.Process):
         self.kf_interval = self.config["Training"]["kf_interval"] # 关键帧最小间隔防止过于频繁插入关键帧
         self.window_size = self.config["Training"]["window_size"] # 滑动窗口大小，限制同时优化的关键帧数量，当关键帧数量超过此值时，会根据重叠度等策略移除旧的关键帧
         self.single_thread = self.config["Training"]["single_thread"] # 如果为 True，前端在请求关键帧或初始化后会主动等待（sleep），直到后端处理完成，表现为串行执行；否则前端和后端并行工作。
+
 
     def compute_error_mask(self, render_pkg, viewpoint):
         """
@@ -305,6 +307,54 @@ class FrontEnd(mp.Process):
         self.median_depth = get_median_depth(depth, opacity)
         return render_pkg #返回最后一次的 render_pkg
 
+
+    def refine_cut_frame_pose(self, viewpoint, extra_iters=30, lr_scale=0.25):
+        """
+        在真正切图前，对 cut frame 再额外做一小段 pose refine，
+        减小 handoff 噪声被直接写进 relative_pose / anchor 链。
+        """
+        old_fixed = viewpoint.fixed_pose
+        viewpoint.fixed_pose = False
+        viewpoint.cam_rot_delta.requires_grad_(True)
+        viewpoint.cam_trans_delta.requires_grad_(True)
+
+        opt_params = [
+            {
+                "params": [viewpoint.cam_rot_delta],
+                "lr": self.config["Training"]["lr"]["cam_rot_delta"] * lr_scale,
+                "name": f"cut_refine_rot_{viewpoint.uid}",
+            },
+            {
+                "params": [viewpoint.cam_trans_delta],
+                "lr": self.config["Training"]["lr"]["cam_trans_delta"] * lr_scale,
+                "name": f"cut_refine_trans_{viewpoint.uid}",
+            },
+        ]
+        pose_optimizer = torch.optim.Adam(opt_params)
+
+        for _ in range(extra_iters):
+            render_pkg = render(
+                viewpoint, self.gaussians, self.pipeline_params, self.background, surf=False
+            )
+            image, depth, opacity = (
+                render_pkg["render"],
+                render_pkg["depth"],
+                render_pkg["opacity"],
+            )
+
+            pose_optimizer.zero_grad()
+            loss_tracking = get_loss_tracking(
+                self.config, image, depth, opacity, viewpoint
+            )
+            loss_tracking.backward()
+
+            with torch.no_grad():
+                pose_optimizer.step()
+                converged = update_pose(viewpoint)
+                if converged:
+                    break
+
+        viewpoint.fixed_pose = old_fixed
 
     '''
     -------------------关键帧判断---------------------
@@ -620,6 +670,10 @@ class FrontEnd(mp.Process):
                     Log(f"==> 启动新子图 (ID: {self.current_submap_id + 1}) <==")
 
                     if self.true_independent_submap:
+                        cut_refine_iters = self.config.get("Submap", {}).get("cut_refine_iters", 0)
+                        if cut_refine_iters > 0:
+                            self.refine_cut_frame_pose(viewpoint, extra_iters=cut_refine_iters, lr_scale=0.25)
+                            current_c2w = torch.linalg.inv(viewpoint.T)
                         # ====================================================
                         # 【真正独立子图模式】：种子帧初始化
                         # ====================================================

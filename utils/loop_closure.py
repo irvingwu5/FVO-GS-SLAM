@@ -410,11 +410,7 @@ class LoopClosureProcess(mp.Process):
             source_pcd = self.submap_pcds[source_id]
             target_pcd = self.submap_pcds[target_id]
 
-            # --------------------------------------------------
-            # 1) 用当前全局位姿估计构造 source->target 的初值
-            # pose 是 local->global
-            # source->target = inv(T_target_global) @ T_source_global
-            # --------------------------------------------------
+            # source -> target 的先验
             init_guess = (
                     np.linalg.inv(current_pose_guesses[target_id]) @
                     current_pose_guesses[source_id]
@@ -459,21 +455,18 @@ class LoopClosureProcess(mp.Process):
 
             transformation = np.array(icp_result.transformation, dtype=np.float64)
 
-            # --------------------------------------------------
-            # 2) 加一层“与当前全局先验是否一致”的校验
-            # --------------------------------------------------
+            # 与先验做一致性校验
             delta = transformation @ np.linalg.inv(init_guess)
             delta_t = np.linalg.norm(delta[:3, 3])
             delta_r = self._rotation_error_deg(transformation, init_guess)
 
-            max_loop_delta_t = self.config.get("LoopClosure", {}).get("max_loop_delta_translation", 0.50)
-            max_loop_delta_r = self.config.get("LoopClosure", {}).get("max_loop_delta_rotation_deg", 25.0)
+            max_loop_delta_t = self.config.get("LoopClosure", {}).get("max_loop_delta_translation", 0.80)
+            max_loop_delta_r = self.config.get("LoopClosure", {}).get("max_loop_delta_rotation_deg", 45.0)
 
             if delta_t > max_loop_delta_t or delta_r > max_loop_delta_r:
                 Log(
                     f"[!] LOOP 一致性校验失败: 子图 {source_id}->{target_id} | "
-                    f"delta_t={delta_t:.3f}m, delta_r={delta_r:.2f}deg | "
-                    f"拒绝该闭环边"
+                    f"delta_t={delta_t:.3f}m, delta_r={delta_r:.2f}deg | 拒绝该闭环边"
                 )
                 return np.identity(4), np.identity(6), False
 
@@ -510,9 +503,7 @@ class LoopClosureProcess(mp.Process):
             all_submap_ids) > max_search_range else all_submap_ids
         id_mapping = {gid: lid for lid, gid in enumerate(recent_submap_ids)}
 
-        # --------------------------------------------------
         # 1) 开环 anchor + 当前已矫正位姿初值
-        # --------------------------------------------------
         open_loop_anchors, current_pose_guesses = self._build_current_pose_guesses(all_submap_ids)
 
         pose_graph = o3d.pipelines.registration.PoseGraph()
@@ -523,17 +514,13 @@ class LoopClosureProcess(mp.Process):
                 )
             )
 
-        # --------------------------------------------------
-        # 2) odom 边
-        # relative_pose 存的是 prev <- curr
-        # source=prev, target=curr
-        # 所以 source->target = curr <- prev = inv(prev <- curr)
-        # --------------------------------------------------
+        # 2) 相邻 odom 边
         info_odom = np.identity(6) * 100.0
         for i in range(1, len(recent_submap_ids)):
-            sid_curr = recent_submap_ids[i]
+            prev_sid = recent_submap_ids[i - 1]
+            curr_sid = recent_submap_ids[i]
 
-            rel_prev_from_curr = self._load_relative_pose_from_ckpt(sid_curr)
+            rel_prev_from_curr = self._load_prev_to_curr_transition(prev_sid, curr_sid)
             odom_source_to_target = np.linalg.inv(rel_prev_from_curr)
 
             pose_graph.edges.append(
@@ -546,9 +533,7 @@ class LoopClosureProcess(mp.Process):
                 )
             )
 
-        # --------------------------------------------------
-        # 3) loop 边
-        # --------------------------------------------------
+        # 3) 闭环边
         loop_found = False
         for query_id in all_submap_ids:
             if query_id not in id_mapping:
@@ -598,10 +583,6 @@ class LoopClosureProcess(mp.Process):
             option
         )
 
-        # --------------------------------------------------
-        # 4) 注意：这里不要再做 T_0_inv 归一化
-        # 节点 pose 本身就在当前全局参考系中
-        # --------------------------------------------------
         correction_list = []
         for i, sid in enumerate(recent_submap_ids):
             optimized_pose = np.array(pose_graph.nodes[i].pose, dtype=np.float64)
@@ -651,11 +632,7 @@ class LoopClosureProcess(mp.Process):
 
     def _build_open_loop_anchors(self, all_submap_ids):
         """
-        返回:
-            anchors[sid]: 子图 sid 的开环全局位姿（local -> global）
-        约定:
-            relative_pose = T_prev<-curr  （新子图局部 -> 上一子图局部）
-            anchor[curr]  = anchor[prev] @ relative_pose
+        anchors[sid]: 子图 sid 的开环全局位姿（local -> global）
         """
         anchors = {}
         if len(all_submap_ids) == 0:
@@ -666,7 +643,7 @@ class LoopClosureProcess(mp.Process):
         for i in range(1, len(all_submap_ids)):
             prev_sid = all_submap_ids[i - 1]
             curr_sid = all_submap_ids[i]
-            rel_prev_from_curr = self._load_relative_pose_from_ckpt(curr_sid)
+            rel_prev_from_curr = self._load_prev_to_curr_transition(prev_sid, curr_sid)
             anchors[curr_sid] = anchors[prev_sid] @ rel_prev_from_curr
 
         return anchors
@@ -701,6 +678,101 @@ class LoopClosureProcess(mp.Process):
         trace_val = np.clip((np.trace(R) - 1.0) * 0.5, -1.0, 1.0)
         return np.degrees(np.arccos(trace_val))
 
+    def _load_prev_to_curr_transition(self, prev_sid, curr_sid):
+        """
+        返回 T_prev<-curr
+
+        优先级：
+        1) curr.ckpt 中的 prev_submap_tsfm_refined
+        2) prev.ckpt 中的 next_submap_relative_pose
+        3) 兼容旧字段 prev.ckpt["relative_pose"]
+        """
+        # 1) 优先读取 curr.ckpt 中“curr -> prev”的精炼结果
+        curr_ckpt_path = self.submap_records.get(curr_sid)
+        if curr_ckpt_path is not None and os.path.exists(curr_ckpt_path):
+            curr_ckpt = torch.load(curr_ckpt_path, map_location="cpu")
+            if "prev_submap_tsfm_refined" in curr_ckpt:
+                rel = curr_ckpt["prev_submap_tsfm_refined"]
+                if isinstance(rel, torch.Tensor):
+                    rel = rel.numpy()
+                return np.array(rel, dtype=np.float64)
+
+        # 2) 读取 prev.ckpt 中“next submap pose in prev frame”
+        prev_ckpt_path = self.submap_records.get(prev_sid)
+        if prev_ckpt_path is not None and os.path.exists(prev_ckpt_path):
+            prev_ckpt = torch.load(prev_ckpt_path, map_location="cpu")
+            rel = prev_ckpt.get(
+                "next_submap_relative_pose",
+                prev_ckpt.get("relative_pose", np.eye(4))
+            )
+            if isinstance(rel, torch.Tensor):
+                rel = rel.numpy()
+            return np.array(rel, dtype=np.float64)
+
+        return np.eye(4)
+
+    def refine_adjacent_submap_edge(self, curr_sid):
+        if curr_sid <= 0:
+            return False
+
+        prev_sid = curr_sid - 1
+
+        if not self._ensure_pcd_loaded(curr_sid):
+            return False
+        if not self._ensure_pcd_loaded(prev_sid):
+            return False
+
+        all_ids = sorted(self.submap_records.keys())
+        _, current_pose_guesses = self._build_current_pose_guesses(all_ids)
+
+        # source=curr, target=prev
+        init_guess = (
+                np.linalg.inv(current_pose_guesses[prev_sid]) @
+                current_pose_guesses[curr_sid]
+        )
+
+        source_pcd = self.submap_pcds[curr_sid]
+        target_pcd = self.submap_pcds[prev_sid]
+
+        coarse = o3d.pipelines.registration.registration_icp(
+            source_pcd, target_pcd,
+            max_correspondence_distance=self.voxel_size * 6.0,
+            init=init_guess,
+            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+            criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=80)
+        )
+
+        fine = o3d.pipelines.registration.registration_icp(
+            source_pcd, target_pcd,
+            max_correspondence_distance=self.voxel_size * 2.5,
+            init=coarse.transformation,
+            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+            criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=120)
+        )
+
+        if fine.fitness < 0.40 or fine.inlier_rmse > 0.03:
+            Log(f"[AdjacentOdom] 相邻子图 {curr_sid}->{prev_sid} 精炼失败 "
+                f"(fitness={fine.fitness:.3f}, rmse={fine.inlier_rmse:.3f})")
+            return False
+
+        refined = np.array(fine.transformation, dtype=np.float64)
+
+        delta = refined @ np.linalg.inv(init_guess)
+        delta_t = np.linalg.norm(delta[:3, 3])
+        delta_r = self._rotation_error_deg(refined, init_guess)
+
+        if delta_t > 0.20 or delta_r > 10.0:
+            Log(f"[AdjacentOdom] 相邻子图 {curr_sid}->{prev_sid} 偏差过大，拒绝写回 "
+                f"(delta_t={delta_t:.3f}m, delta_r={delta_r:.2f}deg)")
+            return False
+
+        ckpt_path = self.submap_records[curr_sid]
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        ckpt["prev_submap_tsfm_refined"] = refined
+        torch.save(ckpt, ckpt_path)
+
+        Log(f"[AdjacentOdom] 已写回子图 {curr_sid} 的 refined prev edge")
+        return True
 
     def apply_correction_to_submaps(self, correction_list):
         """将 PGO 优化后的修正矩阵写回子图 ckpt 文件"""
@@ -753,6 +825,10 @@ class LoopClosureProcess(mp.Process):
                     if submap_id in self.submap_access_order:
                         self.submap_access_order.remove(submap_id)
                     self.submap_access_order.append(submap_id)
+
+                    # 先把“相邻子图过渡边”精炼一下，优先降低 seam
+                    if submap_id > 0:
+                        self.refine_adjacent_submap_edge(submap_id)
 
                     # 构建并优化位姿图
                     correction_list = self.construct_and_optimize_pose_graph()

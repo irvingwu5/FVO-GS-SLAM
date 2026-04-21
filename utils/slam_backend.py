@@ -317,8 +317,12 @@ class BackEnd(mp.Process):
     #初始化阶段只需要把场景几何/颜色的高斯模型尽快收敛到一个可用的状态，位姿保持固定（单位矩阵）并不参与优化。
     在没有位姿优化的情况下快速建立稳定的几何/颜色基础，给前端提供可靠的跟踪基准（后续帧和 BA 才会优化相机位姿）。
     '''
-    def initialize_map(self, cur_frame_idx, viewpoint): #第一帧多次迭代优化，每次迭代独立计算并及时更新高斯参数，不是多次迭代累积梯度
-        for mapping_iteration in range(self.init_itr_num):
+    def initialize_map(self, cur_frame_idx, viewpoint, iters=None): #第一帧多次迭代优化，每次迭代独立计算并及时更新高斯参数，不是多次迭代累积梯度
+        # 第一帧/子图 seed 帧多次迭代优化
+        if iters is None:
+            iters = self.init_itr_num
+
+        for mapping_iteration in range(iters):
             self.iteration_count += 1
             render_pkg = render(
                 viewpoint, self.gaussians, self.pipeline_params, self.background, surf=False
@@ -340,7 +344,7 @@ class BackEnd(mp.Process):
                 render_pkg["opacity"],
                 render_pkg["n_touched"],
             )
-            #_save_normal_pair(render_pkg, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/runtime_results/")
+
             loss_init = get_loss_mapping(
                 self.config, image, depth, viewpoint, initialization=True
             ) #0.4255
@@ -371,11 +375,9 @@ class BackEnd(mp.Process):
 
                 self.gaussians.optimizer.step() #执行gs参数更新
                 self.gaussians.optimizer.zero_grad(set_to_none=True) #清空梯度
-
-        self.occ_aware_visibility[cur_frame_idx] = (n_touched > 0).long()
-        Log("Initialized map")
-        # 【修改】：不再返回 render_pkg，改为返回 None
-        return None
+            # 可视化推送
+            if mapping_iteration % 5 == 0:
+                self.push_to_frontend()
 
 
     def map(self, current_window, prune=False, iters=1):
@@ -776,11 +778,17 @@ class BackEnd(mp.Process):
                     self.viewpoints[cur_frame_idx] = viewpoint
                     if getattr(viewpoint, "fixed_pose", False):
                         viewpoint.reset_pose_deltas()
-                    #扩展地图: 调用 add_next_kf (即 gaussians.extend_from_pcd_seq)，利用新关键帧的深度图在未知区域初始化新的高斯点。
                     self.add_next_kf(
                         cur_frame_idx, viewpoint, depth_map=depth_map, init=True
                     )
-                    self.initialize_map(cur_frame_idx, viewpoint)
+
+                    # 子图 seed 初始化用单独的迭代数
+                    if self.true_independent_submap and len(self.gaussians._xyz) == 0 and self.current_submap_id > 0:
+                        init_iters = self.seed_init_iters
+                    else:
+                        init_iters = self.init_itr_num
+
+                    self.initialize_map(cur_frame_idx, viewpoint, iters=init_iters)
                     self.push_to_frontend("init")
                 # 接收前端发送的新关键帧，将其纳入后端优化体系
                 # 添加新关键帧 -> 扩展地图 (add_next_kf) -> 配置关键帧位姿优化器 -> 执行特定迭代次数的建图优化 (map)
@@ -871,10 +879,16 @@ class BackEnd(mp.Process):
                     gaussian_params = self.gaussians.capture_dict()
                     submap_keyframes = sorted(list(self.viewpoints.keys()))
                     ckpt_data = {
-                        "gaussian_params": gaussian_params,#前一个子图gs参数字典
-                        "submap_keyframes": submap_keyframes,#前一个子图内的关键帧id列表，后续回环检测时可以直接加载这些关键帧的图像进行特征匹配，无需再从头解析ckpt文件找关键帧对应关系。
-                        "correct_tsfm": np.eye(4),#PGO闭环修正矩阵占位符，这里保存子图时还没有进行闭环检测和修正，所以先保存一个单位阵，等后续回环检测到时再更新这个字段。
-                        "relative_pose": relative_pose  #前一个子图最后一帧全局pose
+                        "gaussian_params": gaussian_params,
+                        "submap_keyframes": submap_keyframes,
+                        # PGO 修正矩阵
+                        "correct_tsfm": np.eye(4),
+                        # 兼容旧逻辑：保留旧字段
+                        "relative_pose": relative_pose,
+                        # 新字段：明确语义
+                        # 这是“下一子图 seed 帧在当前(已完成)子图坐标系下”的位姿
+                        # 也就是 T_prev<-next
+                        "next_submap_relative_pose": relative_pose,
                     }
 
                     ckpt_path = os.path.join(submaps_dir, f"{completed_submap_id:06d}.ckpt")

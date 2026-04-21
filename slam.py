@@ -33,6 +33,44 @@ import threading
 import subprocess
 import time
 
+def rebuild_submap_anchors_from_ckpts(save_dir):
+    submaps_dir = os.path.join(save_dir, "submaps")
+    if not os.path.isdir(submaps_dir):
+        return {}
+
+    ckpt_files = sorted(
+        [os.path.join(submaps_dir, f) for f in os.listdir(submaps_dir) if f.endswith(".ckpt")]
+    )
+    if len(ckpt_files) == 0:
+        return {}
+
+    sid_to_ckpt = {
+        int(os.path.basename(p).split(".")[0]): p
+        for p in ckpt_files
+    }
+
+    all_sids = sorted(sid_to_ckpt.keys())
+    anchors = {all_sids[0]: np.eye(4)}
+
+    for i in range(1, len(all_sids)):
+        prev_sid = all_sids[i - 1]
+        curr_sid = all_sids[i]
+
+        curr_ckpt = torch.load(sid_to_ckpt[curr_sid], map_location="cpu")
+        if "prev_submap_tsfm_refined" in curr_ckpt:
+            rel_prev_from_curr = np.array(curr_ckpt["prev_submap_tsfm_refined"], dtype=np.float64)
+        else:
+            prev_ckpt = torch.load(sid_to_ckpt[prev_sid], map_location="cpu")
+            rel_prev_from_curr = np.array(
+                prev_ckpt.get("next_submap_relative_pose", prev_ckpt.get("relative_pose", np.eye(4))),
+                dtype=np.float64
+            )
+
+        anchors[curr_sid] = anchors[prev_sid] @ rel_prev_from_curr
+
+    return anchors
+
+
 class GPUMemoryMonitor:
     def __init__(self, physical_gpu_id=0):
         self.keep_measuring = True
@@ -256,11 +294,17 @@ class SLAM:
 
         # 加载锚点位姿
         frame_to_submap = torch.load(os.path.join(save_dir, "frame_to_submap.pt"))
-        submap_anchor_poses_path = os.path.join(save_dir, "submap_anchor_poses.pt")
-        if os.path.exists(submap_anchor_poses_path):
-            submap_anchor_poses = torch.load(submap_anchor_poses_path)
-        else:
-            submap_anchor_poses = None
+        submaps_dir = os.path.join(save_dir, "submaps")
+        submap_anchor_poses = rebuild_submap_anchors_from_ckpts(submaps_dir)
+
+        # 如果重建失败，再回退到前端保存版
+        if len(submap_anchor_poses) == 0:
+            submap_anchor_poses_path = os.path.join(save_dir, "submap_anchor_poses.pt")
+            if os.path.exists(submap_anchor_poses_path):
+                submap_anchor_poses = torch.load(submap_anchor_poses_path)
+            else:
+                submap_anchor_poses = None
+
         submap_tsfms = {}
 
         # 🟢 第一步：仅读取 PGO 修正矩阵（体积极小）

@@ -54,13 +54,14 @@ Submap:
   rot_thre: 60
   # ========== 新增：真正独立子图模式 ==========
   true_independent_submap: True   # true=彻底清空旧地图，false=保留部分旧点（流式）
-  seed_init_iters: 500            # 种子帧初始化的优化迭代次数（建议 300-800）
   # ===========================================
   # 以下参数仅在 true_independent_submap: false 时生效
   use_critical_point_selection: true
   selection_strategy: simple
   retention_ratio: 0.30
   num_spatial_clusters: 10
+  cut_refine_iters: 30
+  seed_init_iters: 700
 
 # 【改进】：显存管理参数
 MemoryManagement:
@@ -77,8 +78,10 @@ MemoryManagement:
 LoopClosure:
   min_interval: 2        # 触发闭环的最小子图间隔
   voxel_size: 0.02
-  pgo_edge_prune_thres: 1.0 #对 PGO 的后果：较小阈值提高鲁棒性，减少错误回环导致的错位，但可能丢失有效约束导致校正不足；较大阈值增加约束密度，可能更好地收敛但风险是被错误回环拉偏。
+  pgo_edge_prune_thres: 0.25 #对 PGO 的后果：较小阈值提高鲁棒性，减少错误回环导致的错位，但可能丢失有效约束导致校正不足；较大阈值增加约束密度，可能更好地收敛但风险是被错误回环拉偏。
   max_search_range: 5 #限制参与位姿图优化（PGO）的最近子图数量，控制搜索范围、计算量和内存占用
+  max_loop_delta_translation: 0.80
+  max_loop_delta_rotation_deg: 45.0
 
 ## 3DGS default parameters
 opt_params:
