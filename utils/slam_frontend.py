@@ -218,6 +218,7 @@ class FrontEnd(mp.Process):
     def tracking(self, cur_frame_idx, viewpoint):
         # 【修复】：如果是子图的第一帧，不要继承上一帧的位姿，且后续始终固定该帧位姿
         if self.is_first_frame_of_submap:
+            Log(f"[DEBUG] tracking() consumed first-frame flag at frame {cur_frame_idx}")
             viewpoint.T = torch.eye(4, device=viewpoint.T.device)
             viewpoint.fixed_pose = True
             viewpoint.reset_pose_deltas()
@@ -624,50 +625,65 @@ class FrontEnd(mp.Process):
                         # ====================================================
                         # 计算当前子图相对于上一个子图的相对位姿
                         # current_c2w 是新子图的起点在旧子图坐标系下的位姿，上一个子图最后一帧的估计位姿（局部位姿还是全局位姿？子图0没区别，但其他子图就有区别了，后面debug注意这里）
-                        relative_pose = current_c2w.clone().cpu().numpy()
+                        # 当前帧在“旧子图局部坐标系”下的 c2w
+                        relative_pose = current_c2w.detach().cpu().numpy()
                         # ★★★ 新增：更新全局锚点位姿链 ★★★
                         # 第1个子图的全局锚点(第0子图最后一帧全局pose)=单位阵*第0个子图最后一帧全局pose
                         # 第2个子图的全局锚点(第1子图最后一帧全局pose)=第1个子图的全局锚点*第2个子图最后一帧的局部位姿？还是全局位姿？
-                        self.cumulative_anchor_c2w = self.cumulative_anchor_c2w @ relative_pose
+                        # 更稳的 anchor 递推方式：由上一子图 anchor 显式计算
+                        prev_anchor = np.array(
+                            self.submap_anchor_poses[self.current_submap_id],
+                            dtype=np.float64
+                        )
                         new_submap_id = self.current_submap_id + 1
-                        self.submap_anchor_poses[new_submap_id] = self.cumulative_anchor_c2w.copy() #子图sid局部坐标系原点在全局坐标系中的c2w
-                        # 1. 发送切图信号给后端，附带相对位姿
+                        new_anchor = prev_anchor @ relative_pose
+
+                        self.submap_anchor_poses[new_submap_id] = new_anchor
+                        self.cumulative_anchor_c2w = new_anchor.copy()
+
+                        # 1) 通知后端冻结旧子图
                         self.backend_queue.put(["new_submap", self.current_submap_id, relative_pose])
 
-                        # 2. 更新前端子图 ID
-                        self.current_submap_id += 1
+                        # 2) 前端切到新子图
+                        self.current_submap_id = new_submap_id
 
-                        # 3. 彻底清空前端状态
+                        # !!! 关键修复：当前帧已经不再属于旧子图，而是新子图 seed
+                        self.frame_to_submap[cur_frame_idx] = self.current_submap_id
+                        Log(
+                            f"[DEBUG] cut frame {cur_frame_idx} reassigned to submap "
+                            f"{self.frame_to_submap[cur_frame_idx]}"
+                        )
+                        # 3) 清空当前子图状态
                         self.current_window = []
                         self.occ_aware_visibility = {}
                         self.initialized = False
 
-                        # slam_frontend.py 626行修改为：
                         for cam in self.cameras.values():
                             if cam.cam_rot_delta is not None:
                                 cam.cam_rot_delta.data.fill_(0)
                             if cam.cam_trans_delta is not None:
                                 cam.cam_trans_delta.data.fill_(0)
 
-                        # 4. 【核心修复】：重置种子帧的位姿为单位阵（新子图的原点），并永久冻结其位姿
+                        # 4) 当前 cut frame 直接重置为新子图原点
                         viewpoint.T = torch.eye(4, device=viewpoint.T.device)
                         viewpoint.fixed_pose = True
                         viewpoint.reset_pose_deltas()
                         viewpoint.cam_rot_delta.requires_grad_(False)
                         viewpoint.cam_trans_delta.requires_grad_(False)
+
+                        # 新子图内部的运动监控锚点：局部原点
                         self.submap_anchor_pose = torch.eye(4, device=viewpoint.T.device)
 
-                        # 【修复】：强制断开与上一帧的 tracking 联系
-                        # 临时修改 use_every_n_frames 逻辑，或者在 tracking 中加入判断
-                        self.is_first_frame_of_submap = True
+                        # !!! 关键修复：当前帧已经是 seed，不要让下一帧再被重复 seed
+                        self.is_first_frame_of_submap = False
 
-                        # 5. 用重置后的位姿生成初始深度图
+                        # 5) 用当前帧初始化新子图
                         depth_map = self.add_new_keyframe(cur_frame_idx, init=True)
 
-                        # 6. 向后端发送 "init" 请求
+                        # 6) 发送 init 请求
                         self.request_init(cur_frame_idx, viewpoint, depth_map)
 
-                        # 7. 将当前帧加入新的滑动窗口
+                        # 7) 当前帧加入新窗口
                         self.current_window.append(cur_frame_idx)
 
                         cur_frame_idx += 1
