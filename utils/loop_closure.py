@@ -398,13 +398,8 @@ class LoopClosureProcess(mp.Process):
         torch.cuda.empty_cache()
         return matched_ids
 
-    def compute_relative_transform(self, source_id, target_id):
-        """
-        基于 PointToPlane ICP 的几何精核。
-        如果点云已被 LRU 清理，会自动从磁盘重新加载。
-        """
+    def compute_relative_transform(self, source_id, target_id, current_pose_guesses):
         try:
-            # 确保两个子图的点云都已加载
             if not self._ensure_pcd_loaded(source_id):
                 Log(f"[LoopClosure] 无法加载子图 {source_id} 的点云，跳过 ICP")
                 return np.identity(4), np.identity(6), False
@@ -415,21 +410,29 @@ class LoopClosureProcess(mp.Process):
             source_pcd = self.submap_pcds[source_id]
             target_pcd = self.submap_pcds[target_id]
 
-            # 第 1 阶段：粗配准
+            # --------------------------------------------------
+            # 1) 用当前全局位姿估计构造 source->target 的初值
+            # pose 是 local->global
+            # source->target = inv(T_target_global) @ T_source_global
+            # --------------------------------------------------
+            init_guess = (
+                    np.linalg.inv(current_pose_guesses[target_id]) @
+                    current_pose_guesses[source_id]
+            )
+
             coarse_icp = o3d.pipelines.registration.registration_icp(
                 source_pcd, target_pcd,
-                max_correspondence_distance=1.5,
-                init=np.identity(4),
+                max_correspondence_distance=self.voxel_size * 8.0,
+                init=init_guess,
                 estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
                 criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
-                    max_iteration=50, relative_fitness=1e-6, relative_rmse=1e-6
+                    max_iteration=60, relative_fitness=1e-6, relative_rmse=1e-6
                 )
             )
 
-            # 第 2 阶段：中等精度配准
             medium_icp = o3d.pipelines.registration.registration_icp(
                 source_pcd, target_pcd,
-                max_correspondence_distance=self.voxel_size * 5.0,
+                max_correspondence_distance=self.voxel_size * 4.0,
                 init=coarse_icp.transformation,
                 estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
                 criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
@@ -437,7 +440,6 @@ class LoopClosureProcess(mp.Process):
                 )
             )
 
-            # 第 3 阶段：精细配准
             fine_icp = o3d.pipelines.registration.registration_icp(
                 source_pcd, target_pcd,
                 max_correspondence_distance=self.voxel_size * 2.0,
@@ -455,15 +457,41 @@ class LoopClosureProcess(mp.Process):
                     f"(Fitness: {icp_result.fitness:.3f}, RMSE: {icp_result.inlier_rmse:.3f}m)")
                 return np.identity(4), np.identity(6), False
 
-            transformation = icp_result.transformation
-            fitness_weight = icp_result.fitness
-            rmse_penalty = 1.0 / (icp_result.inlier_rmse + 1e-6)
-            combined_weight = (fitness_weight * rmse_penalty) * 0.5
-            information = np.identity(6) * combined_weight
+            transformation = np.array(icp_result.transformation, dtype=np.float64)
 
-            Log(f"[ICP] 子图 {source_id}->{target_id} 配准成功! "
+            # --------------------------------------------------
+            # 2) 加一层“与当前全局先验是否一致”的校验
+            # --------------------------------------------------
+            delta = transformation @ np.linalg.inv(init_guess)
+            delta_t = np.linalg.norm(delta[:3, 3])
+            delta_r = self._rotation_error_deg(transformation, init_guess)
+
+            max_loop_delta_t = self.config.get("LoopClosure", {}).get("max_loop_delta_translation", 0.50)
+            max_loop_delta_r = self.config.get("LoopClosure", {}).get("max_loop_delta_rotation_deg", 25.0)
+
+            if delta_t > max_loop_delta_t or delta_r > max_loop_delta_r:
+                Log(
+                    f"[!] LOOP 一致性校验失败: 子图 {source_id}->{target_id} | "
+                    f"delta_t={delta_t:.3f}m, delta_r={delta_r:.2f}deg | "
+                    f"拒绝该闭环边"
+                )
+                return np.identity(4), np.identity(6), False
+
+            information = o3d.pipelines.registration.get_information_matrix_from_point_clouds(
+                source_pcd,
+                target_pcd,
+                self.voxel_size * 2.0,
+                transformation
+            )
+
+            confidence_scale = float(np.clip(icp_result.fitness, 0.1, 1.0))
+            information = information * confidence_scale
+
+            Log(
+                f"[ICP] 子图 {source_id}->{target_id} 配准成功! "
                 f"(Fitness: {icp_result.fitness:.3f}, RMSE: {icp_result.inlier_rmse:.3f}m, "
-                f"权重: {combined_weight:.2f})")
+                f"delta_t={delta_t:.3f}m, delta_r={delta_r:.2f}deg)"
+            )
 
             return transformation, information, True
 
@@ -472,81 +500,58 @@ class LoopClosureProcess(mp.Process):
             return np.identity(4), np.identity(6), False
 
     def construct_and_optimize_pose_graph(self):
-        """
-        构建并优化位姿图（PGO）。
-        适配真正独立子图策略：
-          - 里程计边：从 ckpt 中读取前端传递的真实 relative_pose
-          - 回环边：通过 CosPlace 视觉粗筛 + ICP 几何精核检测
-        """
         all_submap_ids = sorted(self.submap_records.keys())
         if len(all_submap_ids) < 2:
             Log(f"[LoopClosure] 子图数量不足 ({len(all_submap_ids)})，跳过 PGO")
             return []
-        #限制参与PGO优化的子图数量，避免过多子图导致PGO内存爆炸和优化失败
-        max_search_range = self.config.get("LoopClosure", {}).get("max_search_range", 5)
 
-        # 确定参与 PGO 优化的子图范围
-        if len(all_submap_ids) > max_search_range:
-            recent_submap_ids = all_submap_ids[-max_search_range:]
-        else:
-            recent_submap_ids = all_submap_ids
-        # 创建 ID 映射：全局子图 ID → PGO 节点的本地索引
-        # 子图索引和PGO节点索引不再直接对应，需要通过映射关系找到对应的节点索引
+        max_search_range = self.config.get("LoopClosure", {}).get("max_search_range", 5)
+        recent_submap_ids = all_submap_ids[-max_search_range:] if len(
+            all_submap_ids) > max_search_range else all_submap_ids
         id_mapping = {gid: lid for lid, gid in enumerate(recent_submap_ids)}
 
-        # ==========================================
-        # 1. 初始化位姿图，建立节点
-        # ==========================================
+        # --------------------------------------------------
+        # 1) 开环 anchor + 当前已矫正位姿初值
+        # --------------------------------------------------
+        open_loop_anchors, current_pose_guesses = self._build_current_pose_guesses(all_submap_ids)
+
         pose_graph = o3d.pipelines.registration.PoseGraph()
-        # 添加节点（每个子图一个节点，初始位姿为单位阵）
-        #每个子图是一个节点，初始位姿都设为单位阵 I。子图 0 是参考节点（reference_node=0），优化时它被锚定不动，其他节点相对于它调整
-        for i, submap_id in enumerate(recent_submap_ids):
+        for sid in recent_submap_ids:
             pose_graph.nodes.append(
-                o3d.pipelines.registration.PoseGraphNode(np.identity(4))
+                o3d.pipelines.registration.PoseGraphNode(
+                    np.array(current_pose_guesses[sid], dtype=np.float64)
+                )
             )
-        # ==========================================
-        # 2. 连里程计边(Odometry Edges)使用前端传递的真实 relative_pose
-        # 相邻子图之间连一条边，边的值是 relative_pose--就是切图时前端传给后端的那个"切图帧在旧子图中的 C2W"。
-        # 这条边的刚度（信息矩阵）设为 100 * I_6x6，表示"我很信任这个测量"。uncertain=False 告诉优化器"这是里程计边，别轻易丢弃"。
-        # ==========================================
-        info_odom = np.identity(6) * 100.0  # 里程计边刚度较强
+
+        # --------------------------------------------------
+        # 2) odom 边
+        # relative_pose 存的是 prev <- curr
+        # source=prev, target=curr
+        # 所以 source->target = curr <- prev = inv(prev <- curr)
+        # --------------------------------------------------
+        info_odom = np.identity(6) * 100.0
         for i in range(1, len(recent_submap_ids)):
             sid_curr = recent_submap_ids[i]
 
-            # 从 ckpt 中读取 sid_curr 子图相对于上一个子图的真实相对位姿
-            ckpt_path = self.submap_records.get(sid_curr)
-            relative_pose = np.identity(4)
-            if ckpt_path and os.path.exists(ckpt_path):
-                try:
-                    ckpt = torch.load(ckpt_path, map_location="cpu")
-                    relative_pose = ckpt.get("relative_pose", np.identity(4))
-                    if isinstance(relative_pose, torch.Tensor):
-                        relative_pose = relative_pose.numpy()
-                    del ckpt
-                except Exception as e:
-                    Log(f"[LoopClosure] 读取子图 {sid_curr} 的 relative_pose 失败: {e}")
+            rel_prev_from_curr = self._load_relative_pose_from_ckpt(sid_curr)
+            odom_source_to_target = np.linalg.inv(rel_prev_from_curr)
 
             pose_graph.edges.append(
                 o3d.pipelines.registration.PoseGraphEdge(
-                    i - 1, i,
-                    relative_pose,
+                    i - 1,
+                    i,
+                    odom_source_to_target,
                     info_odom,
                     uncertain=False
                 )
             )
-        # ==========================================
-        # 3. 检测回环并连回环边 (Loop Closure Edges)
-        #    CosPlace 视觉粗筛 + ICP 几何精核
-        # 对每个子图，用 CosPlace 特征做视觉粗筛，找到和它"长得像"的其他子图。
-        # 然后用三阶段 ICP 做几何精核，计算两个子图点云之间的精确相对变换。
-        # 如果 ICP 配准成功（fitness 够高、RMSE 够低），就连一条回环边。
-        # uncertain=True 告诉优化器"这条边可能不太靠谱，你可以适当打折"。
-        # ==========================================
+
+        # --------------------------------------------------
+        # 3) loop 边
+        # --------------------------------------------------
         loop_found = False
-        # 对所有子图进行回环检测（不仅限于最近的子图）
         for query_id in all_submap_ids:
             if query_id not in id_mapping:
-                # query_id 不在当前 PGO 优化范围内，跳过
                 continue
 
             matched_ids = self.detect_closure(query_id)
@@ -554,7 +559,10 @@ class LoopClosureProcess(mp.Process):
                 if target_id not in id_mapping:
                     continue
 
-                trans, info_loop, success = self.compute_relative_transform(query_id, target_id)
+                trans, info_loop, success = self.compute_relative_transform(
+                    query_id, target_id, current_pose_guesses
+                )
+
                 if success:
                     pose_graph.edges.append(
                         o3d.pipelines.registration.PoseGraphEdge(
@@ -574,21 +582,9 @@ class LoopClosureProcess(mp.Process):
             torch.cuda.empty_cache()
             return []
 
-        # ==========================================
-        # 4. 执行全局位姿图优化
-        #用 Levenberg-Marquardt 算法同时调整所有节点的位姿，目标是让所有边的约束尽量被满足。
-        # 里程计边权重高（刚度=100），所以局部结构基本保持不变；
-        # 回环边虽然权重低一些，但它提供了"远距离约束"，能把漂移拉回来。
-        # 一个节点一个位姿”就是说：PGO（位姿图优化）里的每个图节点对应一个子图（submap），节点里存的就是该子图相对全局的位姿（通常用 4x4 齐次变换矩阵表示，表示子图坐标系到全局坐标系的变换）
-        #节点 = 子图，节点的位姿就是该子图在全局坐标系下的变换矩阵，PGO 调整这些位姿来修正全局漂移。
-        # ==========================================
         Log(f"[LoopClosure] 检测到有效闭环，启动 Open3D 全局优化 ({len(recent_submap_ids)} 个子图)...")
-        #用于 PGO 中的边裁剪阈值，将节点 0 作为参考（固定）节点，其他节点相对于它进行优化。
-        #功能：在全局优化前裁剪“差”的边（主要是回环边）。度量通常与边的残差/不一致性相关，超过阈值的边会被丢弃，避免将明显错误的约束带入 PGO。
-        #阈值大小影响：阈值越小，裁剪越严格（更多边被移除）；阈值越大，裁剪越宽松（保留更多边，包括可能的错误边）。
-        #对 PGO 的后果：较小阈值提高鲁棒性，减少错误回环导致的错位，但可能丢失有效约束导致校正不足；较大阈值增加约束密度，可能更好地收敛但风险是被错误回环拉偏。
-        #调参建议：若出现错误闭环修正（全局位姿错乱），尝试减小该值；若回环太少、校正不足，可适当增大；同时需要配合 max_correspondence_distance（voxel_size）和信息矩阵权重一起调。
-        prune_threshold = self.config.get("LoopClosure", {}).get("pgo_edge_prune_thres", 1.0)
+
+        prune_threshold = self.config.get("LoopClosure", {}).get("pgo_edge_prune_thres", 0.25)
         option = o3d.pipelines.registration.GlobalOptimizationOption(
             max_correspondence_distance=self.voxel_size * 1.5,
             edge_prune_threshold=prune_threshold,
@@ -602,35 +598,23 @@ class LoopClosureProcess(mp.Process):
             option
         )
 
-        # ==========================================
-        # 5. 提取优化后的修正矩阵
-        # 优化完成后，每个节点都有了一个新的位姿 node[i].pose。
-        # 但我们不直接用这个位姿，而是计算相对于参考节点的修正量：
-        # correct_tsfm[i] = inv(node[0].pose) @ node[i].pose
-        # 为什么要除以 node[0].pose？因为虽然 reference_node=0，
-        # 但 Open3D 的优化器可能会微调参考节点（不是严格锁死的）。
-        # 所以用 inv(node[0].pose) 归一化，确保子图 0 的修正量是严格的单位阵
-        # ==========================================
+        # --------------------------------------------------
+        # 4) 注意：这里不要再做 T_0_inv 归一化
+        # 节点 pose 本身就在当前全局参考系中
+        # --------------------------------------------------
         correction_list = []
-        # 第 0 个节点是参考节点，其优化后位姿可能不是严格的单位阵
-        T_0_inv = np.linalg.inv(pose_graph.nodes[0].pose)
+        for i, sid in enumerate(recent_submap_ids):
+            optimized_pose = np.array(pose_graph.nodes[i].pose, dtype=np.float64)
+            anchor_pose = open_loop_anchors[sid]
+            correction = optimized_pose @ np.linalg.inv(anchor_pose)
 
-        for i, submap_id in enumerate(recent_submap_ids):
-            opt_trans = pose_graph.nodes[i].pose
-            # 相对于参考节点的修正量
-            final_trans = T_0_inv @ opt_trans
             correction_list.append({
-                'submap_id': submap_id,
-                'correct_tsfm': final_trans
+                "submap_id": sid,
+                "correct_tsfm": correction
             })
 
         del pose_graph
         torch.cuda.empty_cache()
-        #correct_tsfm 怎么用？终局阶段，全局位姿的计算公式是：global_c2w = correct_tsfm[sid] @ anchor_c2w[sid] @ local_c2w
-        #local_c2w = inv(cam.T) — 子图内部的局部位姿
-        #anchor_c2w[sid] — 开环锚点，把局部坐标搬到全局（有漂移）
-        #correct_tsfm[sid] — PGO 修正，消除漂移
-        #如果没有回环，correct_tsfm = eye(4)，不做任何修正。如果有回环，PGO 会给每个子图一个微调矩阵，把漂移"拉"回来。
         return correction_list
 
     def cleanup_old_submaps(self):
@@ -653,6 +637,70 @@ class LoopClosureProcess(mp.Process):
             torch.cuda.empty_cache()
             Log(f"[LoopClosure] 点云缓存清理完毕，当前缓存: {len(self.submap_access_order)} 个子图点云, "
                 f"{len(self.submap_features)} 个子图特征")
+
+    def _load_relative_pose_from_ckpt(self, sid):
+        ckpt_path = self.submap_records.get(sid)
+        if ckpt_path is None or not os.path.exists(ckpt_path):
+            return np.eye(4)
+
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        rel = ckpt.get("relative_pose", np.eye(4))
+        if isinstance(rel, torch.Tensor):
+            rel = rel.numpy()
+        return np.array(rel, dtype=np.float64)
+
+    def _build_open_loop_anchors(self, all_submap_ids):
+        """
+        返回:
+            anchors[sid]: 子图 sid 的开环全局位姿（local -> global）
+        约定:
+            relative_pose = T_prev<-curr  （新子图局部 -> 上一子图局部）
+            anchor[curr]  = anchor[prev] @ relative_pose
+        """
+        anchors = {}
+        if len(all_submap_ids) == 0:
+            return anchors
+
+        anchors[all_submap_ids[0]] = np.eye(4)
+
+        for i in range(1, len(all_submap_ids)):
+            prev_sid = all_submap_ids[i - 1]
+            curr_sid = all_submap_ids[i]
+            rel_prev_from_curr = self._load_relative_pose_from_ckpt(curr_sid)
+            anchors[curr_sid] = anchors[prev_sid] @ rel_prev_from_curr
+
+        return anchors
+
+    def _load_correct_tsfm_from_ckpt(self, sid):
+        ckpt_path = self.submap_records.get(sid)
+        if ckpt_path is None or not os.path.exists(ckpt_path):
+            return np.eye(4)
+
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        corr = ckpt.get("correct_tsfm", np.eye(4))
+        if isinstance(corr, torch.Tensor):
+            corr = corr.numpy()
+        return np.array(corr, dtype=np.float64)
+
+    def _build_current_pose_guesses(self, all_submap_ids):
+        """
+        current_pose[sid]: 当前对子图 sid 的全局位姿估计（local -> global）
+        = correct_tsfm @ open_loop_anchor
+        """
+        open_loop_anchors = self._build_open_loop_anchors(all_submap_ids)
+        current_pose_guesses = {}
+
+        for sid in all_submap_ids:
+            corr = self._load_correct_tsfm_from_ckpt(sid)
+            current_pose_guesses[sid] = corr @ open_loop_anchors[sid]
+
+        return open_loop_anchors, current_pose_guesses
+
+    def _rotation_error_deg(self, T_a, T_b):
+        R = T_a[:3, :3] @ T_b[:3, :3].T
+        trace_val = np.clip((np.trace(R) - 1.0) * 0.5, -1.0, 1.0)
+        return np.degrees(np.arccos(trace_val))
+
 
     def apply_correction_to_submaps(self, correction_list):
         """将 PGO 优化后的修正矩阵写回子图 ckpt 文件"""
