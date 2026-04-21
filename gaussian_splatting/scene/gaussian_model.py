@@ -149,12 +149,12 @@ class GaussianModel:
             valid_mask = np.ones((H, W), dtype=bool)
 
             # ==============================================================
-            # 【机制 1：FFT 频率掩膜应用】
+            # 【机制 1：FFT 频率掩膜应用】,
             # ==============================================================
             if use_fft_mask and hasattr(cam, 'freq_mask'):
-                freq_mask_np = cam.freq_mask.cpu().numpy()
+                freq_mask_np = cam.freq_mask.cpu().numpy() #读取频率掩膜，True表示高频区域，False表示低频区域
                 downsample_low = 3
-                low_freq_grid = np.zeros((H, W), dtype=bool)
+                low_freq_grid = np.zeros((H, W), dtype=bool) #低频区域保留网格状稀疏像素
                 low_freq_grid[::downsample_low, ::downsample_low] = True
 
                 # 高频全保，低频抽稀
@@ -170,7 +170,7 @@ class GaussianModel:
                 valid_mask = valid_mask & error_mask_np
 
             # 应用最终融合的掩膜
-            depth_raw[~valid_mask] = 0.0
+            depth_raw[~valid_mask] = 0.0 #强行把其余低频像素深度设为0
             rgb = o3d.geometry.Image(rgb_raw.astype(np.uint8))
             depth = o3d.geometry.Image(depth_raw.astype(np.float32))
 
@@ -193,7 +193,7 @@ class GaussianModel:
             convert_rgb_to_intensity=False,
         )
 
-        W2C = cam.T.cpu().numpy()
+        W2C = cam.T.cpu().numpy() #这里的cam.T是estimated的w2c
 
         pcd_tmp = o3d.geometry.PointCloud.create_from_rgbd_image(
             rgbd,
@@ -205,16 +205,16 @@ class GaussianModel:
                 cam.cx,
                 cam.cy,
             ),
-            extrinsic=W2C,
+            extrinsic=W2C, #传入相机的外参矩阵world2camera
             project_valid_depth_only=True,
-        )
+        ) #rgb+depth通过内参pinhole反投影得到相机坐标系下点云，为了将这些点放到真实世界下，open3d这里的函数内部做了一次变换，将这些点从相机坐标系下转到世界坐标系下，标准接口规定传入相机外参矩阵，函数内部会进行求逆
         #这里的核心是将相机坐标系下的法向量 (normal_raw) 转换到世界坐标系 (normal_global)，以便与点云 (_xyz) 在同一坐标系下。
         if cam.normal_raw is not None: #把相机坐标系下的法线变换到全局（世界）坐标系并赋给点云。
             valid_normal = cam.normal_raw[cam.depth > 0]
             valid_normal[np.abs(valid_normal) < 1e-9] = 1e-9
             normal_global = (
                     cam.T[0:3, 0:3].cpu().numpy().T @ valid_normal.transpose()
-            ).transpose()
+            ).transpose() #将法线从相机坐标系旋转到世界坐标系下，纯旋转为刚体变换，求逆等于转置、平移对法线无影响
             pcd_tmp.normals = o3d.utility.Vector3dVector(
                 normal_global.astype(np.float32)
             )
@@ -229,7 +229,7 @@ class GaussianModel:
         use_fft_mask = self.config.get("Ablation", {}).get("use_fft_mask", True)
         is_high_freq = np.ones(new_xyz.shape[0], dtype=bool)
         # ==============================================================
-        # 【修改：仅在开关开启且有数据时，才根据频率查表】
+        # 【修改：仅在开关开启且有数据时，才根据频率查表】反投影到像素的 3D 点，是否属于高频区域，从而决定是否保留或更密集地采样这些点。
         # ==============================================================
         if use_fft_mask and hasattr(cam, 'freq_mask'):
             freq_mask_np = cam.freq_mask.cpu().numpy()
@@ -237,7 +237,7 @@ class GaussianModel:
             H, W = cam.image_height, cam.image_width
 
             # (反投影查表逻辑...)
-            pts_in_cam = (W2C[:3, :3] @ new_xyz.T).T + W2C[:3, 3]
+            pts_in_cam = (W2C[:3, :3] @ new_xyz.T).T + W2C[:3, 3] #pts_cam = R * X_world + t，由于从open3d得到的点云已经是世界坐标系下的，所以这里直接用相机外参矩阵的旋转部分乘以点云位置，再加上平移部分，得到相机坐标系下的点位置
             u = np.round((pts_in_cam[:, 0] * cam.fx / pts_in_cam[:, 2]) + cam.cx).astype(int)
             v = np.round((pts_in_cam[:, 1] * cam.fy / pts_in_cam[:, 2]) + cam.cy).astype(int)
             u = np.clip(u, 0, W - 1)

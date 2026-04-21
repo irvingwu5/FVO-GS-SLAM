@@ -142,7 +142,7 @@ class SLAM:
         self.frontend = FrontEnd(self.config) # 执行__init_函数初始化前端各属性
         self.backend = BackEnd(self.config) # 执行__init_函数初始化后端各属性
         # 给前端一系列参数赋值
-        self.frontend.dataset = self.dataset
+        self.frontend.dataset = self.dataset #让 FrontEnd 可以直接访问数据集，实际是引用赋值（不是拷贝）
         self.frontend.background = self.background
         self.frontend.pipeline_params = self.pipeline_params
         self.frontend.frontend_queue = frontend_queue #后端传给前端的数据队列

@@ -47,13 +47,14 @@ class FrontEnd(mp.Process):
         # ========== 新增：子图策略状态变量 ==========
         self.current_submap_id = 0
         self.submap_anchor_poses = {0: np.eye(4)}  # 子图 0 的锚点就是全局原点
-        self.cumulative_anchor_c2w = np.eye(4)  # 当前累积的全局锚点位姿
+        self.cumulative_anchor_c2w = np.eye(4)  # 当前累积的全局锚点位姿??????????????????
         self.submap_trans_thre = self.config["Submap"]["trans_thre"]
         self.submap_rot_thre = self.config["Submap"]["rot_thre"]
         self.frame_to_submap = {}  # <--- 新增这行：记录每帧属于哪个子图
+        self.is_first_frame_of_submap = False  # <--- 新增这行：标记当前帧是否为子图的第一帧
         self.true_independent_submap = self.config.get("Submap", {}).get("true_independent_submap", False)
         # ★★★ 新增这一行，修复 AttributeError ★★★
-        self.submap_anchor_pose = None
+        self.submap_anchor_pose = None #运动监控锚点
         # ============================================
         # ============================================
         self.fft_filter = None  # <--- 新增这行：频域滤波器实例
@@ -78,6 +79,7 @@ class FrontEnd(mp.Process):
     def compute_error_mask(self, render_pkg, viewpoint):
         """
         基于当前渲染结果与真实观测的差异，计算哪里需要补点 (Error Mask)
+        grad_mask 管"在哪里优化位姿"，freq_mask 管"新高斯点怎么撒、撒多大"，error_mask 管"在哪里补新高斯点"
         """
         gt_image = viewpoint.original_image.cuda()  # [3, H, W]
         render_image = render_pkg["render"].detach()  # [3, H, W]
@@ -197,7 +199,7 @@ class FrontEnd(mp.Process):
 
         # Initialise the frame at the ground truth pose 将当前相机的位姿（R 和 T）强制更新为上述的真值
         #viewpoint.update_RT(viewpoint.R_gt, viewpoint.T_gt) #系统在初始化第一帧时，并不进行位姿估计，而是直接读取数据集提供的真实位姿
-        viewpoint.T = viewpoint.T_gt
+        viewpoint.T = viewpoint.T_gt #把第一帧真实位姿直接赋值给当前帧的估计位姿，确保系统从正确的状态开始
 
         self.kf_indices = []
         depth_map = self.add_new_keyframe(cur_frame_idx, init=True) #生成初始深度图（忽略无效区域）
@@ -211,7 +213,7 @@ class FrontEnd(mp.Process):
     '''
     def tracking(self, cur_frame_idx, viewpoint):
         # 【修复】：如果是子图的第一帧，不要继承上一帧的位姿
-        if getattr(self, 'is_first_frame_of_submap', False):
+        if self.is_first_frame_of_submap:
             viewpoint.T = torch.eye(4, device=viewpoint.T.device)
             self.is_first_frame_of_submap = False
         else:
@@ -487,7 +489,7 @@ class FrontEnd(mp.Process):
             submap_cut_info = {
                 "submap_id": self.current_submap_id,
                 "cut_frame_id": len(self.cameras),  # 当前帧 ID
-                "cut_pose_c2w": current_c2w.cpu().numpy(),  # 切图时的位姿
+                "cut_pose_c2w": current_c2w.cpu().numpy(),  # 当前子图最后一帧的估计位姿
                 "translation": translation,
                 "rotation_deg": angle_deg
             }
@@ -585,14 +587,15 @@ class FrontEnd(mp.Process):
                 self.initialized = self.initialized or (
                     len(self.current_window) == self.window_size
                 )
-
+                # 条件断点测试方法 1：在断点附近加一行代码
+                # self.backend_queue.put(["pause"])  # 在断点前暂停后端
                 # ------------------Tracking跟踪：估计当前帧的相机位姿（位置和旋转）---------------------
                 render_pkg = self.tracking(cur_frame_idx, viewpoint)
 
                 # ========== 新增：子图“切图”监控逻辑 ==========
                 current_c2w = torch.linalg.inv(viewpoint.T)
 
-                if self.submap_anchor_pose is None:
+                if self.submap_anchor_pose is None: #运动监控锚点，用来判断是否切图，初始为 None，第一帧处理时会被设置为当前帧的估计位姿
                     self.submap_anchor_pose = current_c2w.clone()
 
                 # ========== 子图切换逻辑 ==========
@@ -604,15 +607,14 @@ class FrontEnd(mp.Process):
                         # 【真正独立子图模式】：种子帧初始化
                         # ====================================================
                         # 计算当前子图相对于上一个子图的相对位姿
-                        # current_c2w 是新子图的起点在旧子图坐标系下的位姿
+                        # current_c2w 是新子图的起点在旧子图坐标系下的位姿，上一个子图最后一帧的估计位姿（局部位姿还是全局位姿？子图0没区别，但其他子图就有区别了，后面debug注意这里）
                         relative_pose = current_c2w.clone().cpu().numpy()
-
                         # ★★★ 新增：更新全局锚点位姿链 ★★★
-                        # 新子图的全局锚点 = 旧子图的全局锚点 × 当前帧在旧子图中的局部位姿
+                        # 第1个子图的全局锚点(第0子图最后一帧全局pose)=单位阵*第0个子图最后一帧全局pose
+                        # 第2个子图的全局锚点(第1子图最后一帧全局pose)=第1个子图的全局锚点*第2个子图最后一帧的局部位姿？还是全局位姿？
                         self.cumulative_anchor_c2w = self.cumulative_anchor_c2w @ relative_pose
                         new_submap_id = self.current_submap_id + 1
-                        self.submap_anchor_poses[new_submap_id] = self.cumulative_anchor_c2w.copy()
-
+                        self.submap_anchor_poses[new_submap_id] = self.cumulative_anchor_c2w.copy() #子图sid局部坐标系原点在全局坐标系中的c2w
                         # 1. 发送切图信号给后端，附带相对位姿
                         self.backend_queue.put(["new_submap", self.current_submap_id, relative_pose])
 
@@ -674,7 +676,7 @@ class FrontEnd(mp.Process):
                         kf_window=current_window_dict,
                     )
                 )
-
+                # 当已有未完成的关键帧请求时，前端不对当前帧做关键帧插入等进一步操作，而是清理当前帧并继续处理下一帧，避免并发冲突或重复请求。
                 if self.requested_keyframe > 0:
                     self.cleanup(cur_frame_idx)
                     cur_frame_idx += 1
@@ -757,13 +759,13 @@ class FrontEnd(mp.Process):
                 if (
                     self.save_results
                     and self.save_trj
-                    and create_kf
-                    and len(self.kf_indices) % self.save_trj_kf_intv == 0
+                    and create_kf #当前帧被判定为关键帧
+                    and len(self.kf_indices) % self.save_trj_kf_intv == 0 #关键帧数满足保存/评估的间隔
                 ):
                     Log("Evaluating ATE at frame: ", cur_frame_idx)
                     eval_ate(
-                        self.cameras,
-                        self.kf_indices,
+                        self.cameras, #传入全部帧的相机位姿数据（包括当前帧和之前的所有帧）
+                        self.kf_indices, #传入当前已经选为关键帧的帧索引列表（kf_indices），后端优化完成后会更新这个列表
                         self.save_dir,
                         cur_frame_idx,
                         monocular=self.monocular,

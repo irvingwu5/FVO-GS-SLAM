@@ -123,8 +123,8 @@ def eval_ate(frames, kf_ids, save_dir, iterations, final=False, monocular=False,
     # ------------------------------------------------------------------
     # 如果需要在线拼接（cameras_already_global=False），预加载 PGO 修正矩阵
     # ------------------------------------------------------------------
-    correct_tsfms = {}
-    if not cameras_already_global and frame_to_submap is not None:
+    correct_tsfms = {} #初始化一个空字典 correct_tsfms 用于存放每个子图的 4x4 修正矩阵
+    if not cameras_already_global and frame_to_submap is not None: #false表示当前frames中的相机位姿仍是子图局部坐标,表示存在子图分配信息
         correct_tsfms = _load_submap_correct_tsfms(save_dir)
 
     for kf_id in kf_ids:
@@ -147,13 +147,13 @@ def eval_ate(frames, kf_ids, save_dir, iterations, final=False, monocular=False,
             # 需要叠加 anchor + PGO correct_tsfm
             # -------------------------------------------------------
             sid = frame_to_submap.get(kf_id, 0)
-            if sid in submap_anchor_poses:
+            if sid in submap_anchor_poses: #因为第0个子图所有帧的局部和全局都一样，所以锚点(局部转到全局的变换)是单位矩阵
                 anchor_c2w = submap_anchor_poses[sid]
                 if isinstance(anchor_c2w, torch.Tensor):
                     anchor_c2w = anchor_c2w.cpu().numpy()
                 anchor_c2w = np.array(anchor_c2w, dtype=np.float64)
 
-                # 获取 PGO 修正矩阵（如果存在）
+                # 获取 PGO 修正矩阵（如果存在）子图内部不存在闭环修正
                 ct = correct_tsfms.get(sid, np.eye(4))
 
                 # 全局 C2W = correct_tsfm @ anchor_c2w @ local_c2w

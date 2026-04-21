@@ -210,13 +210,15 @@ class LoopClosureProcess(mp.Process):
         self.device = "cuda"
 
         # ==============================================================
-        # 点云内存缓存，彻底消除高频磁盘 I/O 阻塞
+        # 点云内存缓存（LRU 策略管理，按需从磁盘重新加载）
         # ==============================================================
-        self.submap_pcds = {}       # 内存缓存每个子图的点云数据
-        self.submap_centroids = {}  # 内存缓存每个子图的中心点
-        self.submap_records = {}    # 记录子图 ID 与其对应的 ckpt 路径
+        self.submap_pcds = {}       # 内存缓存每个子图的点云数据（LRU 管理，可被清理后重新加载）
+        self.submap_records = {}    # 记录子图 ID 与其对应的 ckpt 路径（永不清理）
 
-        # 视觉特征缓存
+        # ==============================================================
+        # 视觉特征缓存（永不清理，内存占用极小）
+        # CosPlace 特征向量每个子图约 N_kf * 512 * 4 bytes ≈ 几十 KB
+        # ==============================================================
         self.submap_features = {}      # 保存每个子图的多帧特征矩阵 [N, D]
         self.submap_thresholds = {}    # 保存每个子图的内部动态阈值 [N]
         self.min_similarity_ratio = 0.5  # 自相似度 Top-K 比例
@@ -258,25 +260,25 @@ class LoopClosureProcess(mp.Process):
 
     def extract_submap_features_and_threshold(self, img_paths):
         """
-        批量提取子图内所有关键帧的 CosPlace 特征，并计算动态阈值。
-        所有中间计算在 CPU 上完成，仅推理时短暂使用 GPU。
+        批量为一个子图的所有关键帧提取 CosPlace 视觉特征，并为每帧计算一个动态相似度阈值，用于后续视觉粗筛（回环候选过滤）
+        所有中间计算在 CPU 上完成，仅推理时短暂使用 GPU。自相似矩阵就是一个描述同一子图内各帧特征两两相似度的矩阵这里用来自适应地为每一帧计算动态匹配阈值：对每行取 Top‑K 相似度，把第 K 大的值作为该帧的阈值。这样匹配时只保留与子图内部结构相符的较高相似度，能增强视觉粗筛的鲁棒性（抑制孤立或噪声帧带来的误匹配）。
         """
         feats = []
         for img_path in img_paths:
             img_tensor = torch.load(img_path, map_location="cpu")  # [3, H, W]
             img_input = self.img_transform(img_tensor).unsqueeze(0).to(self.device)
             with torch.no_grad():
-                feat = self.feature_extractor(img_input).squeeze().detach().cpu()
+                feat = self.feature_extractor(img_input).squeeze().detach().cpu() #前向得到每帧的特征向量，detach 并搬回 CPU，收集到 feats
             feats.append(feat)
             del img_input
 
-        submap_desc = torch.stack(feats)  # [N, D]，已在 CPU 上
-        self_sim = torch.mm(submap_desc, submap_desc.T)
+        submap_desc = torch.stack(feats)  # [N, D]，已在 CPU 上，N：关键帧数，D：特征维度
+        self_sim = torch.mm(submap_desc, submap_desc.T) #自相似矩阵
 
-        k = max(int(len(submap_desc) * self.min_similarity_ratio), 1)
-        score_min, _ = self_sim.topk(k, dim=1)
-        dynamic_thresholds = score_min[:, -1]
-
+        k = max(int(len(submap_desc) * self.min_similarity_ratio), 1) #
+        score_min, _ = self_sim.topk(k, dim=1) #取每行的 Top-K 相似度
+        dynamic_thresholds = score_min[:, -1] #并把第 K 大的值作为该帧的动态阈值
+        #通过每帧在子图内部的自相似性动态决定匹配阈值，提升视觉粗筛鲁棒性（根据子图内部相似结构自适应）。
         return submap_desc, dynamic_thresholds
 
     def extract_pcd_from_2dgs_ckpt(self, ckpt_path):
@@ -304,14 +306,14 @@ class LoopClosureProcess(mp.Process):
         pcd.points = o3d.utility.Vector3dVector(xyz)
         pcd.normals = o3d.utility.Vector3dVector(normals)
 
-        # 【第 1 阶段】：统计离群值移除
+        # 【第 1 阶段】：统计离群值移除，去除噪点防止后续子图间icp被干扰
         pcd, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
 
-        # 【第 2 阶段】：粗下采样
+        # 【第 2 阶段】：粗下采样，加速icp最近邻搜索
         pcd_downsampled = pcd.voxel_down_sample(voxel_size=self.voxel_size)
 
-        # 【第 3 阶段】：保留关键特征点（高曲率点）
-        pcd_downsampled.estimate_normals()
+        # 【第 3 阶段】：保留关键特征点（高曲率点），提高子图间icp配准的稳定性和准确性
+        pcd_downsampled.estimate_normals() #这里重新估计了法线，能否用原来2dgs法线？
         points = np.asarray(pcd_downsampled.points)
         normals_ds = np.asarray(pcd_downsampled.normals)
 
@@ -340,6 +342,36 @@ class LoopClosureProcess(mp.Process):
         del submap_ckpt, gp
         return pcd_final
 
+    def _ensure_pcd_loaded(self, submap_id):
+        """
+        确保指定子图的点云已加载到内存。
+        如果点云已被 LRU 清理，则从磁盘 ckpt 重新加载。
+        返回 True 表示点云可用，False 表示加载失败。
+        """
+        if submap_id in self.submap_pcds:
+            return True
+
+        # 点云已被清理，从磁盘重新加载
+        ckpt_path = self.submap_records.get(submap_id)
+        if not ckpt_path or not os.path.exists(ckpt_path):
+            Log(f"[LoopClosure] 子图 {submap_id} 的 ckpt 不存在，无法重新加载点云")
+            return False
+
+        Log(f"[LoopClosure] 子图 {submap_id} 的点云已被清理，从磁盘重新加载: {ckpt_path}")
+        try:
+            pcd = self.extract_pcd_from_2dgs_ckpt(ckpt_path)
+            self.submap_pcds[submap_id] = pcd
+
+            # 更新 LRU 访问顺序
+            if submap_id in self.submap_access_order:
+                self.submap_access_order.remove(submap_id)
+            self.submap_access_order.append(submap_id)
+
+            return True
+        except Exception as e:
+            Log(f"[LoopClosure] 重新加载子图 {submap_id} 的点云失败: {e}")
+            return False
+
     def detect_closure(self, query_id):
         """纯视觉粗筛，使用 CosPlace 特征进行子图间相似度匹配"""
         matched_ids = []
@@ -367,8 +399,19 @@ class LoopClosureProcess(mp.Process):
         return matched_ids
 
     def compute_relative_transform(self, source_id, target_id):
-        """基于 2DGS 法线的 PointToPlane ICP 几何精核"""
+        """
+        基于 PointToPlane ICP 的几何精核。
+        如果点云已被 LRU 清理，会自动从磁盘重新加载。
+        """
         try:
+            # 确保两个子图的点云都已加载
+            if not self._ensure_pcd_loaded(source_id):
+                Log(f"[LoopClosure] 无法加载子图 {source_id} 的点云，跳过 ICP")
+                return np.identity(4), np.identity(6), False
+            if not self._ensure_pcd_loaded(target_id):
+                Log(f"[LoopClosure] 无法加载子图 {target_id} 的点云，跳过 ICP")
+                return np.identity(4), np.identity(6), False
+
             source_pcd = self.submap_pcds[source_id]
             target_pcd = self.submap_pcds[target_id]
 
@@ -439,7 +482,7 @@ class LoopClosureProcess(mp.Process):
         if len(all_submap_ids) < 2:
             Log(f"[LoopClosure] 子图数量不足 ({len(all_submap_ids)})，跳过 PGO")
             return []
-
+        #限制参与PGO优化的子图数量，避免过多子图导致PGO内存爆炸和优化失败
         max_search_range = self.config.get("LoopClosure", {}).get("max_search_range", 5)
 
         # 确定参与 PGO 优化的子图范围
@@ -447,29 +490,28 @@ class LoopClosureProcess(mp.Process):
             recent_submap_ids = all_submap_ids[-max_search_range:]
         else:
             recent_submap_ids = all_submap_ids
-
         # 创建 ID 映射：全局子图 ID → PGO 节点的本地索引
+        # 子图索引和PGO节点索引不再直接对应，需要通过映射关系找到对应的节点索引
         id_mapping = {gid: lid for lid, gid in enumerate(recent_submap_ids)}
 
         # ==========================================
-        # 1. 初始化位姿图
+        # 1. 初始化位姿图，建立节点
         # ==========================================
         pose_graph = o3d.pipelines.registration.PoseGraph()
-
         # 添加节点（每个子图一个节点，初始位姿为单位阵）
+        #每个子图是一个节点，初始位姿都设为单位阵 I。子图 0 是参考节点（reference_node=0），优化时它被锚定不动，其他节点相对于它调整
         for i, submap_id in enumerate(recent_submap_ids):
             pose_graph.nodes.append(
                 o3d.pipelines.registration.PoseGraphNode(np.identity(4))
             )
-
         # ==========================================
-        # 2. 添加里程计边 (Odometry Edges)
-        #    使用前端传递的真实 relative_pose
+        # 2. 连里程计边(Odometry Edges)使用前端传递的真实 relative_pose
+        # 相邻子图之间连一条边，边的值是 relative_pose--就是切图时前端传给后端的那个"切图帧在旧子图中的 C2W"。
+        # 这条边的刚度（信息矩阵）设为 100 * I_6x6，表示"我很信任这个测量"。uncertain=False 告诉优化器"这是里程计边，别轻易丢弃"。
         # ==========================================
         info_odom = np.identity(6) * 100.0  # 里程计边刚度较强
         for i in range(1, len(recent_submap_ids)):
             sid_curr = recent_submap_ids[i]
-            sid_prev = recent_submap_ids[i - 1]
 
             # 从 ckpt 中读取 sid_curr 子图相对于上一个子图的真实相对位姿
             ckpt_path = self.submap_records.get(sid_curr)
@@ -492,10 +534,13 @@ class LoopClosureProcess(mp.Process):
                     uncertain=False
                 )
             )
-
         # ==========================================
-        # 3. 检测回环并添加回环边 (Loop Closure Edges)
+        # 3. 检测回环并连回环边 (Loop Closure Edges)
         #    CosPlace 视觉粗筛 + ICP 几何精核
+        # 对每个子图，用 CosPlace 特征做视觉粗筛，找到和它"长得像"的其他子图。
+        # 然后用三阶段 ICP 做几何精核，计算两个子图点云之间的精确相对变换。
+        # 如果 ICP 配准成功（fitness 够高、RMSE 够低），就连一条回环边。
+        # uncertain=True 告诉优化器"这条边可能不太靠谱，你可以适当打折"。
         # ==========================================
         loop_found = False
         # 对所有子图进行回环检测（不仅限于最近的子图）
@@ -531,9 +576,18 @@ class LoopClosureProcess(mp.Process):
 
         # ==========================================
         # 4. 执行全局位姿图优化
+        #用 Levenberg-Marquardt 算法同时调整所有节点的位姿，目标是让所有边的约束尽量被满足。
+        # 里程计边权重高（刚度=100），所以局部结构基本保持不变；
+        # 回环边虽然权重低一些，但它提供了"远距离约束"，能把漂移拉回来。
+        # 一个节点一个位姿”就是说：PGO（位姿图优化）里的每个图节点对应一个子图（submap），节点里存的就是该子图相对全局的位姿（通常用 4x4 齐次变换矩阵表示，表示子图坐标系到全局坐标系的变换）
+        #节点 = 子图，节点的位姿就是该子图在全局坐标系下的变换矩阵，PGO 调整这些位姿来修正全局漂移。
         # ==========================================
         Log(f"[LoopClosure] 检测到有效闭环，启动 Open3D 全局优化 ({len(recent_submap_ids)} 个子图)...")
-
+        #用于 PGO 中的边裁剪阈值，将节点 0 作为参考（固定）节点，其他节点相对于它进行优化。
+        #功能：在全局优化前裁剪“差”的边（主要是回环边）。度量通常与边的残差/不一致性相关，超过阈值的边会被丢弃，避免将明显错误的约束带入 PGO。
+        #阈值大小影响：阈值越小，裁剪越严格（更多边被移除）；阈值越大，裁剪越宽松（保留更多边，包括可能的错误边）。
+        #对 PGO 的后果：较小阈值提高鲁棒性，减少错误回环导致的错位，但可能丢失有效约束导致校正不足；较大阈值增加约束密度，可能更好地收敛但风险是被错误回环拉偏。
+        #调参建议：若出现错误闭环修正（全局位姿错乱），尝试减小该值；若回环太少、校正不足，可适当增大；同时需要配合 max_correspondence_distance（voxel_size）和信息矩阵权重一起调。
         prune_threshold = self.config.get("LoopClosure", {}).get("pgo_edge_prune_thres", 1.0)
         option = o3d.pipelines.registration.GlobalOptimizationOption(
             max_correspondence_distance=self.voxel_size * 1.5,
@@ -550,6 +604,12 @@ class LoopClosureProcess(mp.Process):
 
         # ==========================================
         # 5. 提取优化后的修正矩阵
+        # 优化完成后，每个节点都有了一个新的位姿 node[i].pose。
+        # 但我们不直接用这个位姿，而是计算相对于参考节点的修正量：
+        # correct_tsfm[i] = inv(node[0].pose) @ node[i].pose
+        # 为什么要除以 node[0].pose？因为虽然 reference_node=0，
+        # 但 Open3D 的优化器可能会微调参考节点（不是严格锁死的）。
+        # 所以用 inv(node[0].pose) 归一化，确保子图 0 的修正量是严格的单位阵
         # ==========================================
         correction_list = []
         # 第 0 个节点是参考节点，其优化后位姿可能不是严格的单位阵
@@ -566,31 +626,33 @@ class LoopClosureProcess(mp.Process):
 
         del pose_graph
         torch.cuda.empty_cache()
-
+        #correct_tsfm 怎么用？终局阶段，全局位姿的计算公式是：global_c2w = correct_tsfm[sid] @ anchor_c2w[sid] @ local_c2w
+        #local_c2w = inv(cam.T) — 子图内部的局部位姿
+        #anchor_c2w[sid] — 开环锚点，把局部坐标搬到全局（有漂移）
+        #correct_tsfm[sid] — PGO 修正，消除漂移
+        #如果没有回环，correct_tsfm = eye(4)，不做任何修正。如果有回环，PGO 会给每个子图一个微调矩阵，把漂移"拉"回来。
         return correction_list
 
     def cleanup_old_submaps(self):
-        """清理显存中的旧子图，只保留最近的 N 个（LRU 策略）"""
+        """
+        LRU 策略清理旧子图的点云缓存，只保留最近的 N 个。
+        【关键改进】：只清理点云（占内存大），保留特征向量和阈值（占内存极小）。
+        被清理的子图仍然可以参与回环检测（视觉粗筛），如果 ICP 需要其点云，
+        会通过 _ensure_pcd_loaded 从磁盘自动重新加载。
+        """
         if len(self.submap_access_order) > self.max_cached_submaps:
-            to_delete = self.submap_access_order[:-self.max_cached_submaps]
+            to_evict = self.submap_access_order[:-self.max_cached_submaps]
 
-            for submap_id in to_delete:
+            for submap_id in to_evict:
+                # 只清理点云，不清理特征和阈值
                 if submap_id in self.submap_pcds:
                     del self.submap_pcds[submap_id]
-                    Log(f"[LoopClosure] 清理显存中的旧子图 {submap_id} (点云)")
-
-                if submap_id in self.submap_centroids:
-                    del self.submap_centroids[submap_id]
-
-                if submap_id in self.submap_features:
-                    del self.submap_features[submap_id]
-
-                if submap_id in self.submap_thresholds:
-                    del self.submap_thresholds[submap_id]
+                    Log(f"[LoopClosure] LRU 清理子图 {submap_id} 的点云缓存（特征保留）")
 
             self.submap_access_order = self.submap_access_order[-self.max_cached_submaps:]
             torch.cuda.empty_cache()
-            Log(f"[LoopClosure] 显存清理完毕，当前缓存子图数: {len(self.submap_access_order)}")
+            Log(f"[LoopClosure] 点云缓存清理完毕，当前缓存: {len(self.submap_access_order)} 个子图点云, "
+                f"{len(self.submap_features)} 个子图特征")
 
     def apply_correction_to_submaps(self, correction_list):
         """将 PGO 优化后的修正矩阵写回子图 ckpt 文件"""
@@ -631,9 +693,8 @@ class LoopClosureProcess(mp.Process):
                     Log(f"[LoopClosure] 提取并缓存子图 {submap_id} 的 3D 点云与特征...")
                     pcd = self.extract_pcd_from_2dgs_ckpt(ckpt_path)
                     self.submap_pcds[submap_id] = pcd
-                    self.submap_centroids[submap_id] = np.asarray(pcd.points).mean(axis=0)
 
-                    # 批量提取 CosPlace 特征并计算动态阈值
+                    # 批量提取 CosPlace 特征并计算每帧的动态阈值
                     submap_desc, thresholds = self.extract_submap_features_and_threshold(img_paths)
                     self.submap_features[submap_id] = submap_desc
                     self.submap_thresholds[submap_id] = thresholds

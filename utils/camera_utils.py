@@ -34,7 +34,7 @@ class Camera(nn.Module):
         # self.T = T[:3, 3]
         # self.R_gt = gt_T[:3, :3]
         # self.T_gt = gt_T[:3, 3]
-        self.T = torch.eye(4, device=device).to(torch.float32)
+        self.T = torch.eye(4, device=device).to(torch.float32) #被初始化为单位矩阵，表示当前（估计的）相机位姿
         self.T_gt = gt_T.to(device=device).to(torch.float32).clone() #4*4 matrix
 
 
@@ -82,7 +82,7 @@ class Camera(nn.Module):
 
     @staticmethod
     def init_from_dataset(dataset, idx, projection_matrix):
-        # 动态解析从 Dataset 中获取的元组
+        # 动态解析从 Dataset 中获取的元组, data tuple(TUMdataset) (color, depth, pose 从groundtruth文件中读取的相机位姿求逆后传入)
         data = dataset[idx]
         if len(data) == 3:
             gt_color, gt_depth, gt_pose = data
@@ -186,9 +186,7 @@ class Camera(nn.Module):
         # 正确计算相机在世界坐标系下的 3D 中心点
         return self.world_view_transform.inverse()[3, :3]
 
-    # def update_RT(self, R, t):
-    #     self.R = R.to(device=self.device) #接收新的旋转矩阵 R 和平移向量 t，并将它们更新到当前相机对象的属性中。
-    #     self.T = t.to(device=self.device)
+    #grad_mask 管"在哪里优化位姿"，freq_mask 管"新高斯点怎么撒、撒多大"，error_mask 管"在哪里补新高斯点"
     # 该梯度掩码在计算仅基于 RGB 颜色 的相机跟踪（Tracking）损失时使用
     # #该函数生成了一个二值掩码 self.grad_mask，掩码中的 True (或 1) 表示该像素点位于边缘或纹理区域，
     # 将被用于后续的 Tracking 损失计算，忽略平坦区域以提高计算效率和稳定性
@@ -238,8 +236,6 @@ class Camera(nn.Module):
             *mask_shape
         )
         self.rgb_pixel_mask = rgb_pixel_mask * self.grad_mask
-
-        self.rgb_pixel_mask = rgb_pixel_mask
         self.rgb_pixel_mask_mapping = rgb_pixel_mask
 
         if self.depth is not None:

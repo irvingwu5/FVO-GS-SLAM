@@ -77,7 +77,8 @@ MemoryManagement:
 LoopClosure:
   min_interval: 2        # 触发闭环的最小子图间隔
   voxel_size: 0.02
-  pgo_edge_prune_thres: 0.25  # 建议初始值
+  pgo_edge_prune_thres: 1.0 #对 PGO 的后果：较小阈值提高鲁棒性，减少错误回环导致的错位，但可能丢失有效约束导致校正不足；较大阈值增加约束密度，可能更好地收敛但风险是被错误回环拉偏。
+  max_search_range: 5 #限制参与位姿图优化（PGO）的最近子图数量，控制搜索范围、计算量和内存占用
 
 ## 3DGS default parameters
 opt_params:

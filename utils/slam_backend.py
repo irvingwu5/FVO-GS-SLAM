@@ -342,34 +342,8 @@ class BackEnd(mp.Process):
             )
             #_save_normal_pair(render_pkg, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/runtime_results/")
             loss_init = get_loss_mapping(
-                self.config, image, depth, viewpoint, opacity, initialization=True
+                self.config, image, depth, viewpoint, initialization=True
             ) #0.4255
-
-            if self.use_fdn and viewpoint.normal is not None:
-                rend_normal = render_pkg["rend_normal"]
-                rend_normal = F.normalize(rend_normal, p=2, dim=0)
-                depth_pixel_mask = (viewpoint.gt_depth > 0.01).view(*depth.shape)
-                # ==========================================
-                # 模式 1: 纯传感器法线 (Sensor only)
-                # ==========================================
-                # 获取传感器法线并转到世界坐标系
-                sensor_normal = viewpoint.normal
-                # 注意：这里假设 viewpoint.T 是 World2Cam，具体转换需根据你的坐标系定义确认
-                gt_normal = (viewpoint.T[0:3, 0:3].T @ sensor_normal.view(3, -1)).view(
-                    image.shape[0], image.shape[1], image.shape[2]
-                )
-                # _save_gt_normal(gt_normal, "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/", viewpoint.uid)
-                # _save_gt_normal(rend_normal,"/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/",viewpoint.uid, "rend")
-                # --- 新增：保存箭头图 ---
-                # quiver_save_dir = "/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/ablation_results/quivers/"
-                # os.makedirs(quiver_save_dir, exist_ok=True)
-                # save_normal_as_quiver(gt_normal, os.path.join(quiver_save_dir, f"gt_{viewpoint.uid}.png"))
-                # 保存渲染结果的箭头图
-                # save_normal_as_quiver(rend_normal, os.path.join(quiver_save_dir, f"rend_{viewpoint.uid}.png"))
-                # normal_mask = gt_normal > 0
-                # normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask * normal_mask).sum(dim=0))[None].mean() #0.9128
-                normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()
-                loss_init += (self.config["opt_params"]["lambda_sensor_normal"] * normal_error)
 
             loss_init.backward() #计算对gs模型参数的梯度（此阶段不更新相机位姿）
 
@@ -458,7 +432,7 @@ class BackEnd(mp.Process):
 
                 # 🔴 修改点 2：将全局 loss_mapping 改为单帧局部变量 loss_view
                 loss_view = get_loss_mapping(
-                    self.config, image, depth, viewpoint, opacity
+                    self.config, image, depth, viewpoint
                 )
 
                 if self.use_fdn and viewpoint.normal is not None:
@@ -513,7 +487,7 @@ class BackEnd(mp.Process):
 
                 # 🔴 修改点 4：历史帧同样使用局部变量 loss_view
                 loss_view = get_loss_mapping(
-                    self.config, image, depth, viewpoint, opacity
+                    self.config, image, depth, viewpoint
                 )
 
                 # 🔴 修改点 5：立刻反向传播，释放历史帧计算图
@@ -881,25 +855,25 @@ class BackEnd(mp.Process):
 
                 #在真正独立子图模式下，后端只需保存旧子图并彻底清空状态，不再做智能选择和关键帧保留。新子图的初始化将由随后到来的 "init" 消息触发
                 elif data[0] == "new_submap":
-
-                    completed_submap_id = data[1]
+                    #前端backend_queue.put(["new_submap"
+                    completed_submap_id = data[1] #已经完成的子图id
                     # 接收前端传来的相对位姿（如果是第一个子图，可能没有这个参数，默认为单位阵）
                     relative_pose = data[2] if len(data) > 2 else np.eye(4)
 
-                    self.current_submap_id = completed_submap_id + 1
+                    self.current_submap_id = completed_submap_id + 1 #更新当前子图 ID，为下一个子图做准备
                     Log(f"==> Backend received new_submap signal. Freezing submap {completed_submap_id}...")
 
                     save_dir = self.config["Results"]["save_dir"]
                     submaps_dir = os.path.join(save_dir, "submaps")
                     os.makedirs(submaps_dir, exist_ok=True)
-                    # ========== 步骤 1：保存当前子图的全部高斯参数到磁盘 ==========
+                    # ========== 步骤 1：保存前一个子图的全部高斯参数到磁盘 ==========
                     gaussian_params = self.gaussians.capture_dict()
                     submap_keyframes = sorted(list(self.viewpoints.keys()))
                     ckpt_data = {
-                        "gaussian_params": gaussian_params,
-                        "submap_keyframes": submap_keyframes,
-                        "correct_tsfm": np.eye(4),
-                        "relative_pose": relative_pose  # <--- 新增：保存相对位姿
+                        "gaussian_params": gaussian_params,#前一个子图gs参数字典
+                        "submap_keyframes": submap_keyframes,#前一个子图内的关键帧id列表，后续回环检测时可以直接加载这些关键帧的图像进行特征匹配，无需再从头解析ckpt文件找关键帧对应关系。
+                        "correct_tsfm": np.eye(4),#PGO闭环修正矩阵占位符，这里保存子图时还没有进行闭环检测和修正，所以先保存一个单位阵，等后续回环检测到时再更新这个字段。
+                        "relative_pose": relative_pose  #前一个子图最后一帧全局pose
                     }
 
                     ckpt_path = os.path.join(submaps_dir, f"{completed_submap_id:06d}.ckpt")
@@ -910,8 +884,8 @@ class BackEnd(mp.Process):
                     kf_image_paths = []
                     if len(submap_keyframes) > 0:
                         for kf_idx in submap_keyframes:
-                            kf_image = self.viewpoints[kf_idx].original_image.cpu()
-                            img_path = os.path.join(submaps_dir, f"{completed_submap_id:06d}_img_{kf_idx}.pt")
+                            kf_image = self.viewpoints[kf_idx].original_image.cpu() #提取关键帧图像并保存，供后续回环检测使用
+                            img_path = os.path.join(submaps_dir, f"{completed_submap_id:06d}_img_{kf_idx}.pt") #每张图像保存一个pt文件，文件名包含子图ID和关键帧ID，方便后续加载和对应
                             torch.save(kf_image, img_path)
                             kf_image_paths.append(img_path)
 
