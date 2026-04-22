@@ -54,8 +54,8 @@ Training:
   max_init_gaussian_scale: 0.06
 
 Submap:
-  trans_thre: 1.0
-  rot_thre: 45.0
+  trans_thre: 1.50
+  rot_thre: 60.0
   # ========== 新增：真正独立子图模式 ==========
   true_independent_submap: True   # true=彻底清空旧地图，false=保留部分旧点（流式）
   # ===========================================

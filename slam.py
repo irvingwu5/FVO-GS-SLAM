@@ -277,6 +277,15 @@ class SLAM:
         else:
             Log("Loop Closure is disabled, skipping PGO finalize.")
 
+        # ========= 新增：离线阶段前，释放前端历史相机中的重负载张量 =========
+        for cam in self.frontend.cameras.values():
+            if hasattr(cam, "release_mapping_payload"):
+                cam.release_mapping_payload()
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        # ================================================================
+
         # =========================================================================
         # 3. STREAMING MERGE: 流式子图合并与内存边缘化
         # =========================================================================
@@ -527,7 +536,14 @@ class SLAM:
                 rendering_result_current.get("mean_depth_l1", 0.0),
                 current_ATE, FPS,
             )
-
+            # ========= 新增：离线 color refinement 前，释放前端 camera 上的重负载张量 =========
+            for cam in self.frontend.cameras.values():
+                if hasattr(cam, "release_mapping_payload"):
+                    cam.release_mapping_payload()
+            Log("==> 已释放前端相机的映射相关张量，准备进入离线优化阶段... <==")
+            gc.collect()
+            torch.cuda.empty_cache()
+            # =============================================================================
             # -------------------------------------------------------------
             # 阶段 B：离线联合优化 (严格遵守 MonoGS 原版 Color Refinement 逻辑)
             # -------------------------------------------------------------
@@ -609,7 +625,6 @@ class SLAM:
 
                     # 循环结束，清理缓存
                     del cpu_image_cache
-                    import gc
                     gc.collect()
 
                     pbar.close()
@@ -682,8 +697,8 @@ if __name__ == "__main__":
         Log("Following config will be overriden")
         Log("\tsave_results=True")
         config["Results"]["save_results"] = True
-        Log("\tuse_gui=True")
-        config["Results"]["use_gui"] = True
+        Log("\tuse_gui=False")
+        config["Results"]["use_gui"] = False
         Log("\teval_rendering=True")
         config["Results"]["eval_rendering"] = True
         Log("\tuse_wandb=False")

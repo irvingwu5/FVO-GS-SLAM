@@ -283,6 +283,24 @@ class Camera(nn.Module):
         self.normal = None
         self.normal_raw = None
 
+    # utils/camera_utils.py
+    def release_mapping_payload(self):
+        """
+        只释放建图/监督相关的大张量，
+        保留位姿、内参、曝光参数、pose delta，不影响后续 render / refinement。
+        """
+        self.original_image = None
+        self.depth = None
+        self.grad_mask = None
+        self.rgb_pixel_mask = None
+        self.rgb_pixel_mask_mapping = None
+        self.gt_depth = None
+        self.normal = None
+        self.normal_raw = None
+        self.mask = None
+
+        if hasattr(self, "error_mask"):
+            self.error_mask = None
 
 class CameraMsg:
     def __init__(self, Camera=None, uid=None, T=None, T_gt=None):
