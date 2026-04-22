@@ -2,7 +2,7 @@ inherit_from: "configs/rgbd/scannetpp/base_config.yaml"
 Dataset:
   dataset_path: "/home/wuxiangyu/Desktop/data/2d_gaussian_slam/datasets/scanNetPP/data_download/data/8b5caf3398/iphone"
   single_thread: False
-  frame_rate: 60
+  frame_rate: 23
 #起始时间 (首帧): 3238.934642833
 #结束时间 (尾帧): 3371.409948583
 #总时长: $3371.409 - 3238.934 \approx 132.475$ 秒。

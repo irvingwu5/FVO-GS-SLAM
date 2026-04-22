@@ -24,23 +24,23 @@ Training:
   init_gaussian_th: 0.005
   init_gaussian_extent: 30
   # Tracking and Mapping
-  tracking_itr_num: 100 #100->200
-  mapping_itr_num: 150 #150-->250
+  tracking_itr_num: 100
+  mapping_itr_num: 150
   gaussian_update_every: 150
   gaussian_update_offset: 50
   gaussian_th: 0.7
   gaussian_extent: 1.0
   gaussian_reset: 2001
-  size_threshold: 20 #20->80
-  kf_interval: 5 #5->10
+  size_threshold: 20
+  kf_interval: 5
   window_size: 8
-  pose_window: 3 #3->8
+  pose_window: 3
   edge_threshold: 1.1
   rgb_boundary_threshold: 0.01
   alpha: 0.9
   kf_translation: 0.08
   kf_min_translation: 0.05
-  kf_overlap: 0.9 #0.8->0.6要求 95% 重叠才视为“相同视角”。该值越高，判定为“不同视角”的帧越多（会产生更多关键帧）；值越低，则关键帧更稀疏
+  kf_overlap: 0.9
   kf_cutoff: 0.3
   prune_mode: 'slam'
   single_thread: False
@@ -48,10 +48,14 @@ Training:
   lr:
     cam_rot_delta: 0.003
     cam_trans_delta: 0.001
+  #近景幕布gs+雾片挡相机，限制gs尺寸
+  low_freq_scale_multiplier: 1.05
+  min_init_gaussian_scale: 0.002
+  max_init_gaussian_scale: 0.06
 
 Submap:
-  trans_thre: 2.0
-  rot_thre: 90
+  trans_thre: 1.0
+  rot_thre: 45.0
   # ========== 新增：真正独立子图模式 ==========
   true_independent_submap: True   # true=彻底清空旧地图，false=保留部分旧点（流式）
   # ===========================================
@@ -80,9 +84,9 @@ MemoryManagement:
 
 LoopClosure:
   max_search_range: 5 #限制参与位姿图优化（PGO）的最近子图数量，控制搜索范围、计算量和内存占用
-  max_loop_delta_translation: 0.80
-  max_loop_delta_rotation_deg: 45.0
-  icp_fitness_threshold: 0.60
+  max_loop_delta_translation: 1.5
+  max_loop_delta_rotation_deg: 60.0
+  icp_fitness_threshold: 0.40
 
   adjacent_icp_fitness_threshold: 0.45
   adjacent_icp_rmse_threshold: 0.03
@@ -92,10 +96,10 @@ LoopClosure:
 
   enable_chain_pgo_without_loop: true
   chain_pgo_window: 4
-  recent_query_submaps: 2
+  recent_query_submaps: 4
 
   pgo_edge_prune_thres: 0.25
-  min_interval: 3
+  min_interval: 2
   voxel_size: 0.05
 
 ## 3DGS default parameters
@@ -113,10 +117,10 @@ opt_params:
   lambda_sensor_normal: 0.001
   lambda_dssim: 0.2
   densification_interval: 100
-  opacity_reset_interval: 3000 #3000->6000
+  opacity_reset_interval: 3000
   densify_from_iter: 500
   densify_until_iter: 15000
-  densify_grad_threshold: 0.0002 #0.0002->0.0008
+  densify_grad_threshold: 0.0002
 
 model_params:
   sh_degree: 0

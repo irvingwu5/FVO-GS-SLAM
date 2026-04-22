@@ -177,6 +177,10 @@ class GaussianModel:
         return self.create_pcd_from_image_and_depth(cam, rgb, depth, init)
 
     def create_pcd_from_image_and_depth(self, cam, rgb, depth, init=False):
+        low_freq_scale_multiplier = self.config["Training"].get("low_freq_scale_multiplier", 1.05)
+        min_init_gaussian_scale = self.config["Training"].get("min_init_gaussian_scale", 0.002)
+        max_init_gaussian_scale = self.config["Training"].get("max_init_gaussian_scale", 0.06)
+
         if init:
             downsample_factor = self.config["Dataset"]["pcd_downsample_init"]
         else:
@@ -277,10 +281,16 @@ class GaussianModel:
 
         # 对低频区域（例如白墙）的点进行尺度放大，倍率设为 2.5 (可在此处微调 2.0~3.0)
         # 这能让少量稀疏的 2D 盘覆盖住大面积空白，且配合法线 FDN 约束变得极度平滑
-        scale_multiplier[~is_high_freq_tensor] = 1.2
+        scale_multiplier[~is_high_freq_tensor] = low_freq_scale_multiplier
 
         # 因为 base_scales 在对数域，依据对数乘法原理：log(A * B) = log(A) + log(B)
         scales = base_scales + torch.log(scale_multiplier.unsqueeze(-1))
+        # 直接在初始化阶段做尺度硬裁剪，避免近景大幕布
+        scales = torch.clamp(
+            scales,
+            min=np.log(min_init_gaussian_scale),
+            max=np.log(max_init_gaussian_scale),
+        )
         # ==============================================================
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda") # 存储每个点的四元数表示
         rots[:, 0] = 1 # 将每个四元数的第一个元素设置为 1，其他元素保持为 0。这相当于将所有四元数初始化为单位四元数 [1, 0, 0, 0]，表示没有旋转
@@ -659,13 +669,47 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
 
     def reset_opacity_nonvisible(
-        self, visibility_filters
-    ):  ##Reset opacity for only non-visible gaussians
-        opacities_new = inverse_sigmoid(torch.ones_like(self.get_opacity) * 0.4)
+            self,
+            visibility_filters,
+            target_opacity=0.05,
+            stable_opacity=0.08,
+            stable_n_obs=4,
+    ):
+        """
+        只下调当前窗口不可见高斯的不透明度。
+        注意：优化器里保存的是 logit 域参数 self._opacity，
+        不能把 sigmoid 后的 self.get_opacity 直接塞回去。
+        """
+        if self._opacity.numel() == 0:
+            return
 
-        for filter in visibility_filters:
-            opacities_new[filter] = self.get_opacity[filter]
-        optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
+        device = self._opacity.device
+        visible_mask = torch.zeros(
+            (self.get_opacity.shape[0],), dtype=torch.bool, device=device
+        )
+
+        for filt in visibility_filters:
+            if filt is None:
+                continue
+            visible_mask |= filt.to(device).view(-1)
+
+        # 默认：不可见点统一压低
+        logits_new = inverse_sigmoid(
+            torch.ones_like(self.get_opacity) * target_opacity
+        )
+
+        # 稳定点（被观测次数较多）稍微留一点，但也不要太高
+        if self.n_obs.numel() == visible_mask.shape[0]:
+            stable_mask = (~visible_mask) & (self.n_obs.to(device) >= stable_n_obs)
+            if stable_mask.any():
+                logits_new[stable_mask] = inverse_sigmoid(
+                    torch.ones_like(self.get_opacity[stable_mask]) * stable_opacity
+                )
+
+        # 可见点必须保留“原始 logit 参数”
+        logits_new[visible_mask] = self._opacity.detach()[visible_mask]
+
+        optimizable_tensors = self.replace_tensor_to_optimizer(logits_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
 
     def load_ply(self, path):
@@ -868,6 +912,7 @@ class GaussianModel:
             del old_param
 
         return optimizable_tensors
+
 
     # 通过剪枝操作，移除不需要的高斯点，并更新剩余高斯点的相关属性，原mask中大于梯度阈值的点被标记为True(要剔除的)
     # 小于阈值的点被标记为False(需要的)，新生成的高斯点会被标记为 False(但是需要保留)

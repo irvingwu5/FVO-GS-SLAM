@@ -40,25 +40,29 @@ Training:
   mapping_itr_num: 150 #建图阶段每处理一个新关键帧时的优化迭代次数150->4dtam 5
   gaussian_update_every: 150 #每隔多少次进行一次gs密化和修剪,
   gaussian_update_offset: 50 #当总迭代次数为50、50+150、50+2*150、50+3*150...时进行gs密化和修剪
-  gaussian_th: 0.7 #0.7->4dtam 0.4 控制高斯点的不透明度下限，小于该值的gs会被剔除
-  gaussian_extent: 1.0 #4dtam 30.0 #gs的scaling>该值*camera_extent*0.1时被剔除
+  gaussian_th: 0.7 #控制高斯点的不透明度下限，小于该值的gs会被剔除
+  gaussian_extent: 1.0 ##gs的scaling>该值*camera_extent*0.1时被剔除
   gaussian_reset: 2001 #当总迭代次数iter_count达到该值时，把gs不透明度重置为0.01
-  size_threshold: 20 #20->50, 如果max_radii2d(好像全0)>投影gs尺寸阈值，则被剔除
-  kf_interval: 4 #4->5，创建关键帧的间隔帧数
+  size_threshold: 20 #如果max_radii2d(好像全0)>投影gs尺寸阈值，则被剔除
+  kf_interval: 4 #创建关键帧的间隔帧数
   window_size: 10 #关键帧滑动窗口
-  pose_window: 5 #5->4dtam 3,只更新滑动窗口中位姿优化窗口内的相机位姿
-  edge_threshold: 4 #4->4dtam 1.1
+  pose_window: 5 #只更新滑动窗口中位姿优化窗口内的相机位姿
+  edge_threshold: 4
   rgb_boundary_threshold: 0.01
 
   kf_translation: 0.04
-  kf_min_translation: 0.02 #0.02->4dtam 0.05
-  kf_overlap: 0.95 #0.95->4dtam 0.9
+  kf_min_translation: 0.02
+  kf_overlap: 0.95
   prune_mode: 'slam'
   single_thread: False
   spherical_harmonics: False
   lr:
     cam_rot_delta: 0.003
     cam_trans_delta: 0.001
+  #近景幕布gs+雾片挡相机，限制gs尺寸
+  low_freq_scale_multiplier: 1.05
+  min_init_gaussian_scale: 0.002
+  max_init_gaussian_scale: 0.06
 
 Submap:
   trans_thre: 1.5

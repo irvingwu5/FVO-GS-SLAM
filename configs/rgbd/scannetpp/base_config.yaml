@@ -15,17 +15,17 @@ Dataset:
   point_size: 0.05 # 影响scales的初始化
   type: 'scannetpp'
   Calibration:
-    fx: 190.3925
-    fy: 190.3925
-    cx: 127.1969
-    cy: 96.4810
+    fx: 1427.94375 #190.3925
+    fy: 1427.94375 #190.3925
+    cx: 960.0 #127.1969
+    cy: 720.0 #96.4810
     k1: 0.0
     k2: 0.0
     p1: 0.0
     p2: 0.0
     k3: 0.0
-    width: 256
-    height: 192
+    width: 1920 #256
+    height: 1440 #192
     depth_scale: 1000.0
     distorted: False
 
@@ -59,15 +59,48 @@ Training:
   lr:
     cam_rot_delta: 0.003
     cam_trans_delta: 0.001
+  #近景幕布gs+雾片挡相机，限制gs尺寸
+  low_freq_scale_multiplier: 1.05
+  min_init_gaussian_scale: 0.002
+  max_init_gaussian_scale: 0.06
+
 
 Submap:
-  trans_thre: 1.5     # 平移切图阈值(米)
-  rot_thre: 60           # 旋转切图阈值(度)
+  trans_thre: 1.0     # 平移切图阈值(米)
+  rot_thre: 45           # 旋转切图阈值(度)
+  # ========== 新增：真正独立子图模式 ==========
+  true_independent_submap: True   # true=彻底清空旧地图，false=保留部分旧点（流式）
+  # ===========================================
+  # 以下参数仅在 true_independent_submap: false 时生效
+  use_critical_point_selection: true
+  selection_strategy: simple
+  retention_ratio: 0.30
+  num_spatial_clusters: 10
+  seed_init_iters: 700
+  enable_cut_local_ba: true
+  cut_local_ba_iters: 40
+  cut_local_prune_iters: 8
+  cut_refine_iters: 20
 
 LoopClosure:
-  min_interval: 2        # 触发闭环的最小子图间隔
-  voxel_size: 0.02
-  pgo_edge_prune_thres: 0.25  # 建议初始值
+  max_search_range: 5 #限制参与位姿图优化（PGO）的最近子图数量，控制搜索范围、计算量和内存占用
+  max_loop_delta_translation: 0.80
+  max_loop_delta_rotation_deg: 45.0
+  icp_fitness_threshold: 0.60
+
+  adjacent_icp_fitness_threshold: 0.45
+  adjacent_icp_rmse_threshold: 0.03
+  max_adjacent_delta_translation: 0.25
+  max_adjacent_delta_rotation_deg: 12.0
+  default_odom_info_scale: 120.0
+
+  enable_chain_pgo_without_loop: true
+  chain_pgo_window: 4
+  recent_query_submaps: 2
+
+  pgo_edge_prune_thres: 0.25
+  min_interval: 3
+  voxel_size: 0.05
 
 opt_params:
   iterations: 30000

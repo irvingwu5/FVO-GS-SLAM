@@ -225,7 +225,7 @@ class LoopClosureProcess(mp.Process):
 
         self.min_interval = self.config.get("LoopClosure", {}).get("min_interval", 3)
         self.voxel_size = self.config.get("LoopClosure", {}).get("voxel_size", 0.05)
-        self.icp_fitness_threshold = 0.45  # 真正独立子图模式下放宽阈值
+        self.icp_fitness_threshold = self.config.get("LoopClosure", {}).get("icp_fitness_threshold", 0.40)
 
         # LRU 缓存参数
         self.max_cached_submaps = self.config.get("LoopClosure", {}).get("keep_recent_submaps", 3)

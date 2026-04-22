@@ -98,6 +98,14 @@ class BackEnd(mp.Process):
             if "single_thread" in self.config["Dataset"]
             else False
         ) # 是否单线程运行后端
+        #近景幕布gs雾片挡相机
+        self.nonvisible_reset_opacity = self.config["Training"].get("nonvisible_reset_opacity", 0.05)
+        self.nonvisible_reset_stable_opacity = self.config["Training"].get("nonvisible_reset_stable_opacity", 0.08)
+        self.nonvisible_reset_stable_n_obs = self.config["Training"].get("nonvisible_reset_stable_n_obs", 4)
+        self.min_gaussian_scale = self.config["Training"].get("min_gaussian_scale", 0.002)
+        self.max_gaussian_scale = self.config["Training"].get("max_gaussian_scale", 0.08)
+        self.stale_blob_opacity_th = self.config["Training"].get("stale_blob_opacity_th", 0.15)
+        self.stale_blob_n_obs_th = self.config["Training"].get("stale_blob_n_obs_th", 1)
     #扩展地图: 调用 add_next_kf (即 gaussians.extend_from_pcd_seq)，利用新关键帧的深度图在未知区域初始化新的高斯点。
     def add_next_kf(self, frame_idx, viewpoint, init=False, scale=2.0, depth_map=None):
         self.gaussians.extend_from_pcd_seq(
@@ -451,7 +459,8 @@ class BackEnd(mp.Process):
                     gt_normal = (viewpoint.T[0:3, 0:3].T @ sensor_normal.view(3, -1)).view(
                         image.shape[0], image.shape[1], image.shape[2]
                     )
-                    normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()
+                    normal_mask = gt_normal > 0
+                    normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask * normal_mask).sum(dim=0))[None].mean()
                     loss_view += (self.config["opt_params"]["lambda_sensor_normal"] * normal_error)
 
                 # 🔴 修改点 3：【核心】单帧计算完毕，立刻反向传播！
@@ -578,7 +587,12 @@ class BackEnd(mp.Process):
                         not update_gaussian
                 ):
                     Log("Resetting the opacity of non-visible Gaussians")
-                    self.gaussians.reset_opacity_nonvisible(visibility_filter_acm)
+                    self.gaussians.reset_opacity_nonvisible(
+                        visibility_filter_acm,
+                        target_opacity=self.nonvisible_reset_opacity,
+                        stable_opacity=self.nonvisible_reset_stable_opacity,
+                        stable_n_obs=self.nonvisible_reset_stable_n_obs,
+                    )
                     gaussian_split = True
 
                 # 只有在优化器被初始化后才执行 step
