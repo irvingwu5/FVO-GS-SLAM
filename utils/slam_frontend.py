@@ -418,67 +418,84 @@ class FrontEnd(mp.Process):
     逻辑: 将新关键帧加入窗口。当窗口已满时，它会基于重叠度（Szymkiewicz–Simpson coefficient）
     和共视关系移除冗余的关键帧（通常是重叠度低或空间分布上对当前帧贡献最小的帧），即使在单目模式下，如果初始化失败也会触发重置
     '''
+
     def add_to_window(
-        self, cur_frame_idx, cur_frame_visibility_filter, occ_aware_visibility, window
+            self, cur_frame_idx, cur_frame_visibility_filter, occ_aware_visibility, window
     ):
-        N_dont_touch = 2 #这意味着最新的 2 个关键帧（当前帧和紧挨着的上一帧）被视为“活跃区”，受到保护，绝对不会被此算法移除。移除检查只针对窗口中索引为 2 及其之后的旧帧
-        window = [cur_frame_idx] + window #将当前帧的索引 cur_frame_idx 插入到窗口列表的最前面
-        # remove frames which has little overlap with the current frame
+        N_dont_touch = 2
+        window = [cur_frame_idx] + window
         curr_frame = self.cameras[cur_frame_idx]
         to_remove = []
         removed_frame = None
-        # 策略一：基于视觉重叠度剔除 (Visual Overlap Pruning)代码遍历保护区之外的所有旧关键帧，计算它们与当前帧的共视关系
+
+        # 策略一：基于视觉重叠度剔除
         for i in range(N_dont_touch, len(window)):
             kf_idx = window[i]
-            # szymkiewicz–simpson coefficient
-            # 使用了 Szymkiewicz–Simpson 系数（Overlap Coefficient）。它计算当前帧看到的点与旧帧看到的点的交集，除以两者中可见点数量较小的那个（min(当前, 旧)）。这比简单的 IoU 更能容忍视场大小差异。
+
+            # 防御：如果旧关键帧 visibility 丢了，直接标记移除
+            if kf_idx not in occ_aware_visibility:
+                Log(
+                    f"[Warning] Window keyframe {kf_idx} missing in visibility dict, "
+                    f"mark it for removal."
+                )
+                to_remove.append(kf_idx)
+                continue
+
+            kf_visibility = occ_aware_visibility[kf_idx]
+
             intersection = torch.logical_and(
-                cur_frame_visibility_filter, occ_aware_visibility[kf_idx]
+                cur_frame_visibility_filter, kf_visibility
             ).count_nonzero()
+
             denom = min(
                 cur_frame_visibility_filter.count_nonzero(),
-                occ_aware_visibility[kf_idx].count_nonzero(),
+                kf_visibility.count_nonzero(),
             )
-            point_ratio_2 = intersection / denom
+
+            if denom == 0:
+                point_ratio_2 = torch.tensor(0.0, device=cur_frame_visibility_filter.device)
+            else:
+                point_ratio_2 = intersection.float() / denom.float()
+
             cut_off = (
                 self.config["Training"]["kf_cutoff"]
                 if "kf_cutoff" in self.config["Training"]
                 else 0.4
             )
-            # 如果某个旧关键帧与当前帧的视觉重叠度 point_ratio_2 低于阈值（cut_off，默认 0.4），说明该旧帧对当前视角的约束贡献很小
-            if not self.initialized:
-                cut_off = 0.4
+
             if point_ratio_2 <= cut_off:
-                to_remove.append(kf_idx) # 该帧会被加入 to_remove 列表
-        # 如果存在这样的帧，代码最后会移除其中一个（to_remove[-1]）
-        if to_remove:
-            window.remove(to_remove[-1])
-            removed_frame = to_remove[-1]
-        # kf_0_WC = torch.linalg.inv(getWorld2View2(curr_frame.R, curr_frame.T))
-        kf_0_WC = torch.linalg.inv(curr_frame.T)
-        # 策略二：基于几何分布剔除 (Geometric Pruning)如果经过策略一处理后，窗口大小仍然超过配置的限制（window_size），则强制基于空间几何关系移除一帧。
-        # 解释：系统倾向于移除那些 “既离当前位置很远，又和其他旧帧挤在一起” 的关键帧。这样可以保留那些空间分布较均匀、或者离当前区域较近的关键帧。
-        if len(window) > self.config["Training"]["window_size"]:
-            # we need to find the keyframe to remove...
-            inv_dist = [] #打分逻辑：为每个候选旧帧计算一个分数 inv_dist。
+                to_remove.append(kf_idx)
+
+        for kf_idx in to_remove:
+            if kf_idx in window:
+                window.remove(kf_idx)
+
+        # 策略二：窗口过大时，按距离启发式移除
+        if len(window) > self.window_size:
+            inv_dist = []
             for i in range(N_dont_touch, len(window)):
-                inv_dists = []
                 kf_i_idx = window[i]
                 kf_i = self.cameras[kf_i_idx]
                 kf_i_CW = kf_i.T
+                kf_i_WC = torch.linalg.inv(kf_i_CW)
+
+                dists = []
                 for j in range(N_dont_touch, len(window)):
                     if i == j:
                         continue
                     kf_j_idx = window[j]
                     kf_j = self.cameras[kf_j_idx]
-                    kf_j_WC = torch.linalg.inv(kf_j.T)
-                    T_CiCj = kf_i_CW @ kf_j_WC
-                    inv_dists.append(1.0 / (torch.norm(T_CiCj[0:3, 3]) + 1e-6).item())
-                T_CiC0 = kf_i_CW @ kf_0_WC
-                k = torch.sqrt(torch.norm(T_CiC0[0:3, 3])).item() # 距离项 (k): 计算该帧与当前帧（最新帧）的距离。该值越大，说明该帧离当前位置越远。
-                inv_dist.append(k * sum(inv_dists)) # 密集度项 (sum(inv_dists)): 计算该帧与其他所有旧帧距离的倒数之和。该值越大，说明该帧周围越拥挤（冗余）
+                    kf_j_CW = kf_j.T
+                    kf_j_WC = torch.linalg.inv(kf_j_CW)
+                    dist = torch.norm((kf_i_CW @ kf_j_WC)[0:3, 3])
+                    dists.append(dist)
 
-            idx = np.argmax(inv_dist) #决策：移除分数最高的帧。
+                kf_0_WC = torch.linalg.inv(curr_frame.T)
+                kf_i_dist_to_0 = torch.norm((kf_i_CW @ kf_0_WC)[0:3, 3])
+
+                inv_dist.append(1.0 / (sum(dists) + 1e-6) + kf_i_dist_to_0 * 0.0)
+
+            idx = torch.argmax(torch.tensor(inv_dist)).item()
             removed_frame = window[N_dont_touch + idx]
             window.remove(removed_frame)
 
@@ -511,12 +528,24 @@ class FrontEnd(mp.Process):
     发送请求: 通过 backend_queue 向后端发送 keyframe（插入关键帧）、init（初始化）、map（建图）等指令。
     接收更新: 通过 frontend_queue 接收后端优化好的全局高斯模型（gaussians）、关键帧位姿修正和可见性信息，并更新本地状态。
     '''
-    def sync_backend(self, data): # 从后端接收更新的数据包，并同步前端的高斯模型、关键帧位姿和可见性信息
-        self.gaussians = data[1] #更新全局高斯模型
-        self.occ_aware_visibility = data[2] #更新可见性信息
-        keyframes = data[3] #修正后的关键帧位姿列表，包含 (kf_id, kf_R, kf_T)
 
+    def sync_backend(self, data):
+        self.gaussians = data[1]
+
+        backend_occ = data[2] if data[2] is not None else {}
+        keyframes = data[3]
+
+        if not isinstance(self.occ_aware_visibility, dict):
+            self.occ_aware_visibility = {}
+
+        if isinstance(backend_occ, dict) and len(backend_occ) > 0:
+            self.occ_aware_visibility.update(backend_occ)
+
+        # Ensure that visibility data is ready before processing keyframes
         for kf_id, kf_T in keyframes:
+            if kf_id not in self.occ_aware_visibility:
+                Log(f"[Warning] Keyframe {kf_id} visibility not ready yet, skipping update.")
+                continue  # Skip processing this keyframe if its visibility is not ready
             self.cameras[kf_id].T = kf_T
 
     def cleanup(self, cur_frame_idx):
@@ -772,44 +801,55 @@ class FrontEnd(mp.Process):
                     cur_frame_idx += 1
                     continue
 
-                last_keyframe_idx = self.current_window[0] #获取最近一个已添加的关键帧的索引，最新的关键帧总是被插入到列表的头部
-                check_time = (cur_frame_idx - last_keyframe_idx) >= self.kf_interval #检查帧间隔约束，计算当前帧与上一个关键帧之间的帧数差，这是一种强制的时间/帧数限制，防止系统过于频繁地插入关键帧。
-                '''
-                -------------n_touched变量的含义和作用：
-                #这个变量后续将用于计算当前帧与上一关键帧的共视程度（Overlap/Intersection over Union），这是判断是否需要插入新关键帧的核心依据之一（如果重叠度过低，说明到了新环境，通常需要插入关键帧）。
-                # n_touched 其长度等于当前全局地图中所有高斯点（3D Gaussians）的总数量。它的值：表示每一个高斯点在当前这一帧图像的渲染过程中，投影并覆盖了多少个像素（或渲染图块 tiles）
-                # 如果某个高斯点的 n_touched > 0：说明这个 3D 点在当前相机视角下是可见的（即它投影到了屏幕内，且参与了成像）
-                # 如果某个高斯点的 n_touched == 0：说明这个点在当前视角下是不可见的（可能在相机背后、视野外，或者被深度剔除）
-                -------------为什么要计算 curr_visibility？
-                它是为了后续计算共视关系（Co-visibility / Overlap）（见第 464-470 行）：
-                SLAM 前端需要判断当前帧和上一个关键帧之间有多少重叠。
-                如果两帧看到的“可见高斯点集合”（即 curr_visibility）重合度很高，说明相机没怎么动。
-                如果重合度变低（看到很多新点，旧点看不到了），说明相机移动到了新区域，系统就需要插入一个新的关键帧（Keyframe）
-                '''
-                curr_visibility = (render_pkg["n_touched"] > 0).long() #tensor(N,)
-                # --------------------关键帧判断
-                create_kf = self.is_keyframe(
-                    cur_frame_idx,
-                    last_keyframe_idx,
-                    curr_visibility,
-                    self.occ_aware_visibility, # dict{keyframe_idx: tensor(N,)}一个字典（dictionary），用于存储各个关键帧（Keyframe）对场景中 3D 高斯点的可见性掩码（visibility mask）
-                )
+                last_keyframe_idx = self.current_window[0]
+                check_time = (cur_frame_idx - last_keyframe_idx) >= self.kf_interval
+                curr_visibility = (render_pkg["n_touched"] > 0).long()
+
+                # 如果上一关键帧的 visibility 还没同步回来，先走保守策略
+                if last_keyframe_idx not in self.occ_aware_visibility:
+                    Log(f"[Warning] Keyframe {last_keyframe_idx} visibility missing, skipping point_ratio check.")
+                    create_kf = check_time
+                else:
+                    create_kf = self.is_keyframe(
+                        cur_frame_idx,
+                        last_keyframe_idx,
+                        curr_visibility,
+                        self.occ_aware_visibility,
+                    )
                 '''
                 这段代码的作用是加速填充窗口。在窗口未满时，系统不像通常那样严格考量几何位移距离，而是主要依赖视觉变化率。
                 只要画面变化足够大（重叠度低）且满足最小间隔，就立即插入关键帧，以便尽快建立起局部地图并填满优化窗口。
                 '''
-                if len(self.current_window) < self.window_size: #前端在滑动窗口未填满时的关键帧选择策略，这通常发生在系统刚启动、刚完成初始化或者重置之后。
-                    union = torch.logical_or(
-                        curr_visibility, self.occ_aware_visibility[last_keyframe_idx]
-                    ).count_nonzero() #计算当前帧看到的点与上一关键帧看到的点的并集数量
-                    intersection = torch.logical_and(
-                        curr_visibility, self.occ_aware_visibility[last_keyframe_idx]
-                    ).count_nonzero() #计算两帧共同看到的点的交集数量
-                    point_ratio = intersection / union #计算交并比，这个值越接近 1，说明两帧画面基本一样，这个值越接近 0，说明当前帧看到了很多新区域，或者之前看到的区域看不到了
-                    create_kf = (
-                        check_time #必须满足最小帧间隔限制
-                        and point_ratio < self.config["Training"]["kf_overlap"] #视觉重叠度必须低于阈值。这意味着视野发生了足够大的变化，需要新的关键帧来补充信息
-                    ) #决定是否将当前帧选为关键帧
+                if len(self.current_window) < self.window_size:
+                    # 只有当上一关键帧的 visibility 真实存在时，才允许做 point_ratio 计算
+                    if last_keyframe_idx in self.occ_aware_visibility:
+                        last_visibility = self.occ_aware_visibility[last_keyframe_idx]
+
+                        union = torch.logical_or(
+                            curr_visibility, last_visibility
+                        ).count_nonzero()
+
+                        intersection = torch.logical_and(
+                            curr_visibility, last_visibility
+                        ).count_nonzero()
+
+                        if union > 0:
+                            point_ratio = intersection.float() / union.float()
+                        else:
+                            point_ratio = torch.tensor(0.0, device=curr_visibility.device)
+
+                        create_kf = (
+                                check_time
+                                and point_ratio < self.config["Training"]["kf_overlap"]
+                        )
+                    else:
+                        # is_keyframe() 已经判定这里状态不一致，需要“自愈”
+                        # 这里不能再访问缺失的 dict 项，直接强制关键帧
+                        Log(
+                            f"[Warning] Skip point_ratio check because keyframe "
+                            f"{last_keyframe_idx} is missing in visibility dict."
+                        )
+                        create_kf = check_time
                 if self.single_thread:
                     create_kf = check_time and create_kf
                 if create_kf: # 当前帧是关键帧
