@@ -187,31 +187,27 @@ def eval_ate(frames, kf_ids, save_dir, iterations, final=False, monocular=False,
 
             # 优先使用从 ckpt 重建的 anchor
 
-            anchor_source = rebuilt_anchor_poses if len(rebuilt_anchor_poses) > 0 else submap_anchor_poses
+            # 新逻辑：优先用磁盘重建锚点；当前活动子图缺失时，回退到前端内存锚点
+            anchor_c2w = None
 
-            if anchor_source is not None and sid in anchor_source:
+            if rebuilt_anchor_poses is not None and sid in rebuilt_anchor_poses:
+                anchor_c2w = rebuilt_anchor_poses[sid]  # 冻结过的子图，优先用磁盘/精炼结果
+            elif submap_anchor_poses is not None and sid in submap_anchor_poses:
+                anchor_c2w = submap_anchor_poses[sid]  # 当前活动子图，回退到前端在线锚点
 
-                anchor_c2w = anchor_source[sid]
-
+            if anchor_c2w is not None:
                 if isinstance(anchor_c2w, torch.Tensor):
                     anchor_c2w = anchor_c2w.cpu().numpy()
-
                 anchor_c2w = np.array(anchor_c2w, dtype=np.float64)
 
                 ct = correct_tsfms.get(sid, np.eye(4))
-
                 global_c2w = ct @ anchor_c2w @ local_c2w
-
                 pose_est = global_c2w
-
             else:
-
                 pose_est = local_c2w
-        else:
-            # -------------------------------------------------------
-            # 模式 C：无子图信息（单子图 / 未启用子图策略）
-            # -------------------------------------------------------
-            pose_est = local_c2w
+
+            if anchor_c2w is None and sid > 0:
+                Log(f"[eval_ate] submap {sid} anchor missing, fallback to local pose")
 
         pose_gt = np.linalg.inv(kf.T_gt.cpu().numpy())
 

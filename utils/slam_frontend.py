@@ -77,6 +77,24 @@ class FrontEnd(mp.Process):
         self.window_size = self.config["Training"]["window_size"] # 滑动窗口大小，限制同时优化的关键帧数量，当关键帧数量超过此值时，会根据重叠度等策略移除旧的关键帧
         self.single_thread = self.config["Training"]["single_thread"] # 如果为 True，前端在请求关键帧或初始化后会主动等待（sleep），直到后端处理完成，表现为串行执行；否则前端和后端并行工作。
 
+    # 加一个“给显示/评估用的全局化相机拷贝”函数，不改原始 self.cameras，只给 GUI 用
+    def _camera_to_global_copy(self, cam):
+        cam_g = clone_obj(cam)
+
+        sid = self.frame_to_submap.get(cam.uid, self.current_submap_id)
+        anchor_c2w = self.submap_anchor_poses.get(sid, np.eye(4))
+
+        if isinstance(anchor_c2w, torch.Tensor):
+            anchor_c2w = anchor_c2w.cpu().numpy()
+        anchor_c2w = np.array(anchor_c2w, dtype=np.float64)
+
+        local_w2c = cam.T.detach().cpu().numpy()
+        local_c2w = np.linalg.inv(local_w2c)
+        global_c2w = anchor_c2w @ local_c2w
+        global_w2c = np.linalg.inv(global_c2w)
+
+        cam_g.T = torch.from_numpy(global_w2c).to(cam.T.device).type_as(cam.T)
+        return cam_g
 
     def compute_error_mask(self, render_pkg, viewpoint):
         """
@@ -531,7 +549,6 @@ class FrontEnd(mp.Process):
 
     def sync_backend(self, data):
         self.gaussians = data[1]
-
         backend_occ = data[2] if data[2] is not None else {}
         keyframes = data[3]
 
@@ -541,12 +558,11 @@ class FrontEnd(mp.Process):
         if isinstance(backend_occ, dict) and len(backend_occ) > 0:
             self.occ_aware_visibility.update(backend_occ)
 
-        # Ensure that visibility data is ready before processing keyframes
+        # 先无条件更新位姿
         for kf_id, kf_T in keyframes:
-            if kf_id not in self.occ_aware_visibility:
-                Log(f"[Warning] Keyframe {kf_id} visibility not ready yet, skipping update.")
-                continue  # Skip processing this keyframe if its visibility is not ready
             self.cameras[kf_id].T = kf_T
+
+        # 只有 visibility 相关判断，才依赖 occ_aware_visibility
 
     def cleanup(self, cur_frame_idx):
         self.cameras[cur_frame_idx].clean()
@@ -785,13 +801,15 @@ class FrontEnd(mp.Process):
                 # 窗口维护作用: 维护一个固定大小的滑动窗口（current_window），用于限制优化规模
                 current_window_dict = {}
                 current_window_dict[self.current_window[0]] = self.current_window[1:]
-                keyframes = [self.cameras[kf_idx] for kf_idx in self.current_window]
+                vis_current = self._camera_to_global_copy(viewpoint)
+                vis_keyframes = [self._camera_to_global_copy(self.cameras[kf_idx])
+                                 for kf_idx in self.current_window]
 
                 self.q_main2vis.put(
                     gui_utils.GaussianPacket(
                         gaussians=clone_obj(self.gaussians),
-                        current_frame=viewpoint,
-                        keyframes=keyframes,
+                        current_frame=vis_current,
+                        keyframes=vis_keyframes,
                         kf_window=current_window_dict,
                     )
                 )
