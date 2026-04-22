@@ -3,7 +3,7 @@ Results:
   save_dir: "replica_results"
   save_trj: True
   save_trj_kf_intv: 20 #20->40
-  use_gui: True
+  use_gui: False
   eval_rendering: False
   use_wandb: False
 

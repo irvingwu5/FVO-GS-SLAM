@@ -43,7 +43,7 @@ class FrontEnd(mp.Process):
         self.cameras = dict()
         self.device = "cuda:0"
         self.pause = False
-
+        self.use_gui = config["Results"]["use_gui"]  # 新增
         # ========== 新增：子图策略状态变量 ==========
         self.current_submap_id = 0
         self.submap_anchor_poses = {0: np.eye(4)}  # 子图 0 的锚点就是全局原点
@@ -309,7 +309,7 @@ class FrontEnd(mp.Process):
                 else:
                     converged = update_pose(viewpoint) # update_pose 将增量应用到实际位姿，返回是否收敛（converged）
             # 每 10 次迭代把当前视点与 GT 图发到可视化队列（q_main2vis），用于前端显示
-            if tracking_itr % 10 == 0:
+            if self.use_gui and tracking_itr % 10 == 0:
                 self.q_main2vis.put(
                     gui_utils.GaussianPacket(
                         current_frame=viewpoint,
@@ -799,20 +799,24 @@ class FrontEnd(mp.Process):
                 # ============================================
 
                 # 窗口维护作用: 维护一个固定大小的滑动窗口（current_window），用于限制优化规模
-                current_window_dict = {}
-                current_window_dict[self.current_window[0]] = self.current_window[1:]
-                vis_current = self._camera_to_global_copy(viewpoint)
-                vis_keyframes = [self._camera_to_global_copy(self.cameras[kf_idx])
-                                 for kf_idx in self.current_window]
+                if self.use_gui:
+                    current_window_dict = {}
+                    current_window_dict[self.current_window[0]] = self.current_window[1:]
 
-                self.q_main2vis.put(
-                    gui_utils.GaussianPacket(
-                        gaussians=clone_obj(self.gaussians),
-                        current_frame=vis_current,
-                        keyframes=vis_keyframes,
-                        kf_window=current_window_dict,
+                    vis_current = self._camera_to_global_copy(viewpoint)
+                    vis_keyframes = [
+                        self._camera_to_global_copy(self.cameras[kf_idx])
+                        for kf_idx in self.current_window
+                    ]
+
+                    self.q_main2vis.put(
+                        gui_utils.GaussianPacket(
+                            gaussians=clone_obj(self.gaussians),
+                            current_frame=vis_current,
+                            keyframes=vis_keyframes,
+                            kf_window=current_window_dict,
+                        )
                     )
-                )
                 # 当已有未完成的关键帧请求时，前端不对当前帧做关键帧插入等进一步操作，而是清理当前帧并继续处理下一帧，避免并发冲突或重复请求。
                 if self.requested_keyframe > 0:
                     self.cleanup(cur_frame_idx)
