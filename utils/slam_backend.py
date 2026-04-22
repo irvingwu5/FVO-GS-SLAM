@@ -379,6 +379,8 @@ class BackEnd(mp.Process):
             if mapping_iteration % 5 == 0:
                 self.push_to_frontend()
 
+        self.occ_aware_visibility[cur_frame_idx] = (n_touched > 0).long()
+        Log("Initialized map")
 
     def map(self, current_window, prune=False, iters=1):
         if len(current_window) == 0:
