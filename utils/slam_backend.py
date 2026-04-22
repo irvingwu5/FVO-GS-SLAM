@@ -57,6 +57,10 @@ class BackEnd(mp.Process):
         self.reuse_render_tensors = self.config.get("MemoryManagement", {}).get("reuse_render_tensors", True)
         self.keyframe_window_size = self.config.get("MemoryManagement", {}).get("keyframe_window_size", 10)
         self.gradient_accumulation_frames = self.config.get("MemoryManagement", {}).get("gradient_accumulation_frames",5)
+        # ===== submap cut 前的局部收紧 =====
+        self.enable_cut_local_ba = self.config.get("Submap", {}).get("enable_cut_local_ba", True)
+        self.cut_local_ba_iters = self.config.get("Submap", {}).get("cut_local_ba_iters", 40)
+        self.cut_local_prune_iters = self.config.get("Submap", {}).get("cut_local_prune_iters", 8)
         # ========== 【新增】方案 3：智能关键点选择配置 ==========
         self.use_critical_point_selection = self.config.get("Submap", {}).get("use_critical_point_selection", True)
         self.selection_strategy = self.config.get("Submap", {}).get("selection_strategy", "advanced")
@@ -600,6 +604,38 @@ class BackEnd(mp.Process):
                     self.gaussians.update_learning_rate(self.iteration_count)
 
         return gaussian_split
+
+    def finalize_submap_before_freeze(self):
+        """
+        在切图冻结前，对旧子图当前窗口做一次额外局部优化。
+        目标：把边界关键帧位姿和局部几何尽量压稳，再写入 ckpt。
+        """
+        if not self.enable_cut_local_ba:
+            return
+
+        if len(self.current_window) == 0:
+            return
+
+        if self.keyframe_optimizers is None:
+            Log("[SubmapLocalBA] skip: keyframe_optimizers is None")
+            return
+
+        ba_iters = max(int(self.cut_local_ba_iters), 0)
+        prune_iters = max(int(self.cut_local_prune_iters), 0)
+
+        Log(
+            f"[SubmapLocalBA] freeze 前局部优化开始 | "
+            f"window={len(self.current_window)}, "
+            f"ba_iters={ba_iters}, prune_iters={prune_iters}"
+        )
+
+        if ba_iters > 0:
+            self.map(self.current_window, prune=False, iters=ba_iters)
+
+        if prune_iters > 0:
+            self.map(self.current_window, prune=True, iters=prune_iters)
+
+        Log("[SubmapLocalBA] freeze 前局部优化完成")
     '''
     ------------------离线精修模块(Color Refinement)------------------
     作用: 在 SLAM 过程结束后（或暂停时），对地图进行高质量的离线渲染优化。
@@ -873,7 +909,8 @@ class BackEnd(mp.Process):
 
                     self.current_submap_id = completed_submap_id + 1 #更新当前子图 ID，为下一个子图做准备
                     Log(f"==> Backend received new_submap signal. Freezing submap {completed_submap_id}...")
-
+                    # ===== 新增：先对子图边界做一次局部收紧，再冻结 =====
+                    self.finalize_submap_before_freeze()
                     save_dir = self.config["Results"]["save_dir"]
                     submaps_dir = os.path.join(save_dir, "submaps")
                     os.makedirs(submaps_dir, exist_ok=True)

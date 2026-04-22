@@ -238,6 +238,17 @@ class LoopClosureProcess(mp.Process):
             "weight_path", f"weights/{self.cosplace_backbone}_{self.cosplace_dim}_cosplace.pth"
         )
 
+        # ===== 相邻子图边精炼参数 =====
+        self.adjacent_icp_fitness_threshold = self.config.get("LoopClosure", {}).get("adjacent_icp_fitness_threshold", 0.45)
+        self.adjacent_icp_rmse_threshold = self.config.get("LoopClosure", {}).get("adjacent_icp_rmse_threshold", 0.03)
+        self.max_adjacent_delta_translation = self.config.get("LoopClosure", {}).get("max_adjacent_delta_translation", 0.25)
+        self.max_adjacent_delta_rotation_deg = self.config.get("LoopClosure", {}).get("max_adjacent_delta_rotation_deg", 12.0)
+        self.default_odom_info_scale = self.config.get("LoopClosure", {}).get("default_odom_info_scale", 120.0)
+
+        # ===== 每次切图后的局部链式 PGO =====local ba in submap，在每次切图后，至少对最近 N 个子图做一次局部链式 PGO
+        self.enable_chain_pgo_without_loop = self.config.get("LoopClosure", {}).get("enable_chain_pgo_without_loop", True)
+        self.chain_pgo_window = self.config.get("LoopClosure", {}).get("chain_pgo_window", 4)
+
     def init_feature_extractor(self):
         """
         初始化 CosPlace 特征提取器。
@@ -498,30 +509,27 @@ class LoopClosureProcess(mp.Process):
             Log(f"[LoopClosure] 子图数量不足 ({len(all_submap_ids)})，跳过 PGO")
             return []
 
-        max_search_range = self.config.get("LoopClosure", {}).get("max_search_range", 5)
-        recent_submap_ids = all_submap_ids[-max_search_range:] if len(
-            all_submap_ids) > max_search_range else all_submap_ids
-        id_mapping = {gid: lid for lid, gid in enumerate(recent_submap_ids)}
-
-        # 1) 开环 anchor + 当前已矫正位姿初值
         open_loop_anchors, current_pose_guesses = self._build_current_pose_guesses(all_submap_ids)
 
         pose_graph = o3d.pipelines.registration.PoseGraph()
-        for sid in recent_submap_ids:
+        id_mapping = {sid: i for i, sid in enumerate(all_submap_ids)}
+
+        # 1) 全部子图建节点
+        for sid in all_submap_ids:
             pose_graph.nodes.append(
                 o3d.pipelines.registration.PoseGraphNode(
                     np.array(current_pose_guesses[sid], dtype=np.float64)
                 )
             )
 
-        # 2) 相邻 odom 边
-        info_odom = np.identity(6) * 100.0
-        for i in range(1, len(recent_submap_ids)):
-            prev_sid = recent_submap_ids[i - 1]
-            curr_sid = recent_submap_ids[i]
+        # 2) 全链路相邻 odom 边：使用 refined pose + refined info
+        for i in range(1, len(all_submap_ids)):
+            prev_sid = all_submap_ids[i - 1]
+            curr_sid = all_submap_ids[i]
 
             rel_prev_from_curr = self._load_prev_to_curr_transition(prev_sid, curr_sid)
             odom_source_to_target = np.linalg.inv(rel_prev_from_curr)
+            info_odom = self._load_prev_to_curr_information(prev_sid, curr_sid)
 
             pose_graph.edges.append(
                 o3d.pipelines.registration.PoseGraphEdge(
@@ -529,19 +537,22 @@ class LoopClosureProcess(mp.Process):
                     i,
                     odom_source_to_target,
                     info_odom,
-                    uncertain=False
+                    uncertain=False,
                 )
             )
 
-        # 3) 闭环边
+        # 3) 真正闭环：只让最近几个新子图作为 query，但 target 可以是所有历史子图
+        recent_query_submaps = self.config.get("LoopClosure", {}).get("recent_query_submaps", 2)
+        query_ids = all_submap_ids[-min(recent_query_submaps, len(all_submap_ids)):]
         loop_found = False
-        for query_id in all_submap_ids:
-            if query_id not in id_mapping:
-                continue
 
+        for query_id in query_ids:
             matched_ids = self.detect_closure(query_id)
+
             for target_id in matched_ids:
                 if target_id not in id_mapping:
+                    continue
+                if abs(query_id - target_id) < self.min_interval:
                     continue
 
                 trans, info_loop, success = self.compute_relative_transform(
@@ -555,47 +566,42 @@ class LoopClosureProcess(mp.Process):
                             id_mapping[target_id],
                             trans,
                             info_loop,
-                            uncertain=True
+                            uncertain=True,
                         )
                     )
                     loop_found = True
                     Log(f"[LoopClosure] 添加回环边: 子图 {query_id} <-> {target_id}")
 
         if not loop_found:
-            Log(f"[LoopClosure] 未检测到有效闭环")
-            del pose_graph
-            torch.cuda.empty_cache()
+            Log("[LoopClosure] 当前无有效非相邻闭环，跳过 full-graph PGO")
             return []
 
-        Log(f"[LoopClosure] 检测到有效闭环，启动 Open3D 全局优化 ({len(recent_submap_ids)} 个子图)...")
+        Log(f"[LoopClosure] 检测到有效闭环，启动全图 PGO ({len(all_submap_ids)} 个子图)...")
 
         prune_threshold = self.config.get("LoopClosure", {}).get("pgo_edge_prune_thres", 0.25)
         option = o3d.pipelines.registration.GlobalOptimizationOption(
             max_correspondence_distance=self.voxel_size * 1.5,
             edge_prune_threshold=prune_threshold,
-            reference_node=0
+            reference_node=0,
         )
 
         o3d.pipelines.registration.global_optimization(
             pose_graph,
             o3d.pipelines.registration.GlobalOptimizationLevenbergMarquardt(),
             o3d.pipelines.registration.GlobalOptimizationConvergenceCriteria(),
-            option
+            option,
         )
 
         correction_list = []
-        for i, sid in enumerate(recent_submap_ids):
+        for i, sid in enumerate(all_submap_ids):
             optimized_pose = np.array(pose_graph.nodes[i].pose, dtype=np.float64)
             anchor_pose = open_loop_anchors[sid]
             correction = optimized_pose @ np.linalg.inv(anchor_pose)
-
             correction_list.append({
                 "submap_id": sid,
-                "correct_tsfm": correction
+                "correct_tsfm": correction,
             })
 
-        del pose_graph
-        torch.cuda.empty_cache()
         return correction_list
 
     def cleanup_old_submaps(self):
@@ -711,6 +717,25 @@ class LoopClosureProcess(mp.Process):
 
         return np.eye(4)
 
+    def _load_prev_to_curr_information(self, prev_sid, curr_sid):
+        """
+        返回 curr -> prev 这条相邻边对应的 6x6 information matrix。
+        优先读 curr.ckpt 里 refine 后保存的信息矩阵；
+        如果没有，就退化成固定权重。
+        """
+        default_info = np.identity(6, dtype=np.float64) * float(self.default_odom_info_scale)
+
+        curr_ckpt_path = self.submap_records.get(curr_sid)
+        if curr_ckpt_path is not None and os.path.exists(curr_ckpt_path):
+            curr_ckpt = torch.load(curr_ckpt_path, map_location="cpu")
+            info = curr_ckpt.get("prev_submap_info_matrix", None)
+            if info is not None:
+                if isinstance(info, torch.Tensor):
+                    info = info.numpy()
+                return np.array(info, dtype=np.float64)
+
+        return default_info
+
     def refine_adjacent_submap_edge(self, curr_sid):
         if curr_sid <= 0:
             return False
@@ -725,7 +750,7 @@ class LoopClosureProcess(mp.Process):
         all_ids = sorted(self.submap_records.keys())
         _, current_pose_guesses = self._build_current_pose_guesses(all_ids)
 
-        # source=curr, target=prev
+        # source = curr, target = prev
         init_guess = (
                 np.linalg.inv(current_pose_guesses[prev_sid]) @
                 current_pose_guesses[curr_sid]
@@ -735,24 +760,43 @@ class LoopClosureProcess(mp.Process):
         target_pcd = self.submap_pcds[prev_sid]
 
         coarse = o3d.pipelines.registration.registration_icp(
-            source_pcd, target_pcd,
-            max_correspondence_distance=self.voxel_size * 6.0,
+            source_pcd,
+            target_pcd,
+            max_correspondence_distance=self.voxel_size * 8.0,
             init=init_guess,
             estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-            criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=80)
+            criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
+                max_iteration=60, relative_fitness=1e-6, relative_rmse=1e-6
+            ),
+        )
+
+        medium = o3d.pipelines.registration.registration_icp(
+            source_pcd,
+            target_pcd,
+            max_correspondence_distance=self.voxel_size * 4.0,
+            init=coarse.transformation,
+            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+            criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
+                max_iteration=100, relative_fitness=1e-7, relative_rmse=1e-7
+            ),
         )
 
         fine = o3d.pipelines.registration.registration_icp(
-            source_pcd, target_pcd,
-            max_correspondence_distance=self.voxel_size * 2.5,
-            init=coarse.transformation,
+            source_pcd,
+            target_pcd,
+            max_correspondence_distance=self.voxel_size * 2.0,
+            init=medium.transformation,
             estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-            criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=120)
+            criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
+                max_iteration=150, relative_fitness=1e-8, relative_rmse=1e-8
+            ),
         )
 
-        if fine.fitness < 0.40 or fine.inlier_rmse > 0.03:
-            Log(f"[AdjacentOdom] 相邻子图 {curr_sid}->{prev_sid} 精炼失败 "
-                f"(fitness={fine.fitness:.3f}, rmse={fine.inlier_rmse:.3f})")
+        if fine.fitness < self.adjacent_icp_fitness_threshold or fine.inlier_rmse > self.adjacent_icp_rmse_threshold:
+            Log(
+                f"[AdjacentOdom] 相邻子图 {curr_sid}->{prev_sid} 精炼失败 "
+                f"(fitness={fine.fitness:.3f}, rmse={fine.inlier_rmse:.3f})"
+            )
             return False
 
         refined = np.array(fine.transformation, dtype=np.float64)
@@ -761,18 +805,106 @@ class LoopClosureProcess(mp.Process):
         delta_t = np.linalg.norm(delta[:3, 3])
         delta_r = self._rotation_error_deg(refined, init_guess)
 
-        if delta_t > 0.20 or delta_r > 10.0:
-            Log(f"[AdjacentOdom] 相邻子图 {curr_sid}->{prev_sid} 偏差过大，拒绝写回 "
-                f"(delta_t={delta_t:.3f}m, delta_r={delta_r:.2f}deg)")
+        if delta_t > self.max_adjacent_delta_translation or delta_r > self.max_adjacent_delta_rotation_deg:
+            Log(
+                f"[AdjacentOdom] 相邻子图 {curr_sid}->{prev_sid} 偏差过大，拒绝写回 "
+                f"(delta_t={delta_t:.3f}m, delta_r={delta_r:.2f}deg)"
+            )
             return False
+
+        info = o3d.pipelines.registration.get_information_matrix_from_point_clouds(
+            source_pcd,
+            target_pcd,
+            self.voxel_size * 2.0,
+            refined,
+        )
+
+        # 用 fitness / rmse 再做一次置信度缩放
+        confidence = float(np.clip(fine.fitness / max(fine.inlier_rmse, 1e-3), 1.0, 30.0))
+        info = np.array(info, dtype=np.float64) * confidence
 
         ckpt_path = self.submap_records[curr_sid]
         ckpt = torch.load(ckpt_path, map_location="cpu")
         ckpt["prev_submap_tsfm_refined"] = refined
+        ckpt["prev_submap_info_matrix"] = info
+        ckpt["prev_submap_metrics"] = {
+            "fitness": float(fine.fitness),
+            "rmse": float(fine.inlier_rmse),
+            "delta_t": float(delta_t),
+            "delta_r": float(delta_r),
+        }
         torch.save(ckpt, ckpt_path)
 
-        Log(f"[AdjacentOdom] 已写回子图 {curr_sid} 的 refined prev edge")
+        Log(
+            f"[AdjacentOdom] 已写回子图 {curr_sid} 的 refined prev edge | "
+            f"fitness={fine.fitness:.3f}, rmse={fine.inlier_rmse:.3f}, "
+            f"delta_t={delta_t:.3f}, delta_r={delta_r:.2f}"
+        )
         return True
+
+    def optimize_submap_chain(self, chain_submap_ids):
+        """
+        只对最近若干个子图做链式 PGO。
+        没有真实闭环也允许优化，核心是把 refined adjacent edge 真正传播成 correction。
+        """
+        if len(chain_submap_ids) < 2:
+            return []
+
+        all_submap_ids = sorted(self.submap_records.keys())
+        open_loop_anchors, current_pose_guesses = self._build_current_pose_guesses(all_submap_ids)
+
+        pose_graph = o3d.pipelines.registration.PoseGraph()
+        id_mapping = {sid: i for i, sid in enumerate(chain_submap_ids)}
+
+        for sid in chain_submap_ids:
+            pose_graph.nodes.append(
+                o3d.pipelines.registration.PoseGraphNode(
+                    np.array(current_pose_guesses[sid], dtype=np.float64)
+                )
+            )
+
+        for i in range(1, len(chain_submap_ids)):
+            prev_sid = chain_submap_ids[i - 1]
+            curr_sid = chain_submap_ids[i]
+
+            rel_prev_from_curr = self._load_prev_to_curr_transition(prev_sid, curr_sid)
+            odom_source_to_target = np.linalg.inv(rel_prev_from_curr)
+            info_odom = self._load_prev_to_curr_information(prev_sid, curr_sid)
+
+            pose_graph.edges.append(
+                o3d.pipelines.registration.PoseGraphEdge(
+                    i - 1,
+                    i,
+                    odom_source_to_target,
+                    info_odom,
+                    uncertain=False,
+                )
+            )
+
+        option = o3d.pipelines.registration.GlobalOptimizationOption(
+            max_correspondence_distance=self.voxel_size * 1.5,
+            edge_prune_threshold=0.25,
+            reference_node=0,
+        )
+
+        o3d.pipelines.registration.global_optimization(
+            pose_graph,
+            o3d.pipelines.registration.GlobalOptimizationLevenbergMarquardt(),
+            o3d.pipelines.registration.GlobalOptimizationConvergenceCriteria(),
+            option,
+        )
+
+        correction_list = []
+        for i, sid in enumerate(chain_submap_ids):
+            optimized_pose = np.array(pose_graph.nodes[i].pose, dtype=np.float64)
+            anchor_pose = open_loop_anchors[sid]
+            correction = optimized_pose @ np.linalg.inv(anchor_pose)
+            correction_list.append({
+                "submap_id": sid,
+                "correct_tsfm": correction,
+            })
+
+        return correction_list
 
     def apply_correction_to_submaps(self, correction_list):
         """将 PGO 优化后的修正矩阵写回子图 ckpt 文件"""
@@ -826,13 +958,20 @@ class LoopClosureProcess(mp.Process):
                         self.submap_access_order.remove(submap_id)
                     self.submap_access_order.append(submap_id)
 
-                    # 先把“相邻子图过渡边”精炼一下，优先降低 seam
+                    # 1) 先精炼相邻子图边
                     if submap_id > 0:
                         self.refine_adjacent_submap_edge(submap_id)
 
-                    # 构建并优化位姿图
-                    correction_list = self.construct_and_optimize_pose_graph()
+                    # 2) 即使没有真实闭环，也先对最近几段子图链做一次局部 PGO
+                    if self.enable_chain_pgo_without_loop:
+                        chain_ids = sorted(self.submap_records.keys())[-self.chain_pgo_window:]
+                        local_chain_corr = self.optimize_submap_chain(chain_ids)
+                        if len(local_chain_corr) > 0:
+                            self.apply_correction_to_submaps(local_chain_corr)
+                            Log(f"[ChainPGO] 已对最近 {len(chain_ids)} 个子图执行局部链式 PGO")
 
+                    # 3) 再尝试真正的闭环 PGO
+                    correction_list = self.construct_and_optimize_pose_graph()
                     if len(correction_list) > 0:
                         self.apply_correction_to_submaps(correction_list)
                         Log("==> PGO 闭环校正及硬盘回写完毕！ <==")

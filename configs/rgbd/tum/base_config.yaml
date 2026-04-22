@@ -50,8 +50,8 @@ Training:
     cam_trans_delta: 0.001
 
 Submap:
-  trans_thre: 1.5
-  rot_thre: 60
+  trans_thre: 2.0
+  rot_thre: 90
   # ========== 新增：真正独立子图模式 ==========
   true_independent_submap: True   # true=彻底清空旧地图，false=保留部分旧点（流式）
   # ===========================================
@@ -60,8 +60,11 @@ Submap:
   selection_strategy: simple
   retention_ratio: 0.30
   num_spatial_clusters: 10
-  cut_refine_iters: 30
   seed_init_iters: 700
+  enable_cut_local_ba: true
+  cut_local_ba_iters: 40
+  cut_local_prune_iters: 8
+  cut_refine_iters: 20
 
 # 【改进】：显存管理参数
 MemoryManagement:
@@ -76,12 +79,24 @@ MemoryManagement:
 
 
 LoopClosure:
-  min_interval: 2        # 触发闭环的最小子图间隔
-  voxel_size: 0.02
-  pgo_edge_prune_thres: 0.25 #对 PGO 的后果：较小阈值提高鲁棒性，减少错误回环导致的错位，但可能丢失有效约束导致校正不足；较大阈值增加约束密度，可能更好地收敛但风险是被错误回环拉偏。
   max_search_range: 5 #限制参与位姿图优化（PGO）的最近子图数量，控制搜索范围、计算量和内存占用
   max_loop_delta_translation: 0.80
   max_loop_delta_rotation_deg: 45.0
+  icp_fitness_threshold: 0.60
+
+  adjacent_icp_fitness_threshold: 0.45
+  adjacent_icp_rmse_threshold: 0.03
+  max_adjacent_delta_translation: 0.25
+  max_adjacent_delta_rotation_deg: 12.0
+  default_odom_info_scale: 120.0
+
+  enable_chain_pgo_without_loop: true
+  chain_pgo_window: 4
+  recent_query_submaps: 2
+
+  pgo_edge_prune_thres: 0.25
+  min_interval: 3
+  voxel_size: 0.05
 
 ## 3DGS default parameters
 opt_params:

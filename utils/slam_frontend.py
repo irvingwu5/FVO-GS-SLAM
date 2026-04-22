@@ -715,7 +715,7 @@ class FrontEnd(mp.Process):
                     Log(f"==> 启动新子图 (ID: {self.current_submap_id + 1}) <==")
 
                     if self.true_independent_submap:
-                        cut_refine_iters = self.config.get("Submap", {}).get("cut_refine_iters", 0)
+                        cut_refine_iters = self.config.get("Submap", {}).get("cut_refine_iters", 20)
                         if cut_refine_iters > 0:
                             self.refine_cut_frame_pose(viewpoint, extra_iters=cut_refine_iters, lr_scale=0.25)
                             current_c2w = torch.linalg.inv(viewpoint.T)
