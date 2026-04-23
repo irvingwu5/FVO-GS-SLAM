@@ -630,8 +630,10 @@ class BackEnd(mp.Process):
                         not update_gaussian
                 ):
                     Log("Resetting the opacity of non-visible Gaussians")
+                    # 用真实 touched 信号，而不是宽松的 visibility_filter
+                    actual_touched_filters = [(n_touched > 0) for n_touched in n_touched_acm]
                     self.gaussians.reset_opacity_nonvisible(
-                        visibility_filter_acm,
+                        actual_touched_filters,
                         target_opacity=self.nonvisible_reset_opacity,
                         stable_opacity=self.nonvisible_reset_stable_opacity,
                         stable_n_obs=self.nonvisible_reset_stable_n_obs,
