@@ -830,6 +830,11 @@ class LoopClosureProcess(mp.Process):
             )
             return False
 
+        large_delta = (
+                delta_t > self.max_adjacent_delta_translation or
+                delta_r > self.max_adjacent_delta_rotation_deg
+        )
+
         info = o3d.pipelines.registration.get_information_matrix_from_point_clouds(
             source_pcd,
             target_pcd,
@@ -840,8 +845,19 @@ class LoopClosureProcess(mp.Process):
         raw_conf = fine.fitness / max(fine.inlier_rmse, 1e-3)
         conf = float(np.clip(raw_conf, self.adjacent_info_min_scale, self.adjacent_info_max_scale))
 
-        # 核心：相邻边降权
-        info = np.array(info, dtype=np.float64) * conf * float(self.adjacent_edge_weight)
+        if large_delta:
+            # 不拒绝，改为大幅降权
+            penalty_t = np.exp(-max(0.0, delta_t - self.max_adjacent_delta_translation) * 4.0)
+            penalty_r = np.exp(-max(0.0, delta_r - self.max_adjacent_delta_rotation_deg) * 0.15)
+            soft_scale = max(0.05, penalty_t * penalty_r)
+            Log(
+                f"[AdjacentOdom] 相邻子图 {curr_sid}->{prev_sid} 偏差较大，但保留写回并降权 "
+                f"(delta_t={delta_t:.3f}m, delta_r={delta_r:.2f}deg, soft_scale={soft_scale:.3f})"
+            )
+        else:
+            soft_scale = 1.0
+
+        info = np.array(info, dtype=np.float64) * conf * float(self.adjacent_edge_weight) * soft_scale
 
         ckpt_path = self.submap_records[curr_sid]
         ckpt = torch.load(ckpt_path, map_location="cpu")

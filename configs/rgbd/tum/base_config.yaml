@@ -55,7 +55,7 @@ Training:
 
 Submap:
   trans_thre: 1.80
-  rot_thre: 75.0
+  rot_thre: 100.0
   # ========== 新增：真正独立子图模式 ==========
   true_independent_submap: True   # true=彻底清空旧地图，false=保留部分旧点（流式）
   # ===========================================

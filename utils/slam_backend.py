@@ -487,15 +487,12 @@ class BackEnd(mp.Process):
                 loss_view = get_loss_mapping(
                     self.config, image, depth, viewpoint
                 )
-                #新子图 seed 在初始化阶段就不是完全自由漂，而是“默认贴近局部原点”。
-                if getattr(viewpoint, "is_submap_seed", False) and getattr(viewpoint, "seed_relax_steps_left", 0) > 0:
-                    w_t = float(self.config.get("Submap", {}).get("seed_prior_weight_trans", 0.02))
-                    w_r = float(self.config.get("Submap", {}).get("seed_prior_weight_rot", 0.01))
 
-                    # 让 seed 只做“小范围回弹”，而不是完全自由漂
-                    loss_view = loss_view \
-                                + w_t * torch.norm(viewpoint.cam_trans_delta, p=2) \
-                                + w_r * torch.norm(viewpoint.cam_rot_delta, p=2)
+                if getattr(viewpoint, "is_submap_seed", False) and getattr(viewpoint, "seed_relax_steps_left", 0) > 0:
+                    abs_prior = self.compute_seed_pose_prior_loss(viewpoint)
+                    if abs_prior is not None:
+                        relax_scale = float(self.config.get("Submap", {}).get("seed_relax_scale", 0.25))
+                        loss_view = loss_view + relax_scale * abs_prior
 
                 if self.use_fdn and viewpoint.normal is not None:
                     rend_normal = render_pkg["rend_normal"]
@@ -900,12 +897,11 @@ class BackEnd(mp.Process):
                     # initialize_map 完成后
                     if self.true_independent_submap and self.current_submap_id > 0:
                         viewpoint.is_submap_seed = True
-                        viewpoint.seed_relax_steps_left = self.config.get("Submap", {}).get("seed_relax_kf_count", 4)
-
-                        # 初始化阶段结束后，允许 seed 在后续 BA 中轻微优化
-                        viewpoint.fixed_pose = False
-                        viewpoint.cam_rot_delta.requires_grad_(True)
-                        viewpoint.cam_trans_delta.requires_grad_(True)
+                        viewpoint.seed_relax_steps_left = 0  # 先彻底关闭“后续放松”
+                        viewpoint.fixed_pose = True  # 关键：seed 永久固定
+                        viewpoint.reset_pose_deltas()
+                        viewpoint.cam_rot_delta.requires_grad_(False)
+                        viewpoint.cam_trans_delta.requires_grad_(False)
                     self.push_to_frontend("init")
                 # 接收前端发送的新关键帧，将其纳入后端优化体系
                 # 添加新关键帧 -> 扩展地图 (add_next_kf) -> 配置关键帧位姿优化器 -> 执行特定迭代次数的建图优化 (map)
