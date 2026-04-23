@@ -56,6 +56,19 @@ Training:
 Submap:
   trans_thre: 1.80
   rot_thre: 100.0
+  #修改子图切图策略相关参数，增加了重叠度的判断，避免过早切图导致的地图碎片化和漂移
+  min_frames: 20            # 一个子图至少先跑这么多帧
+  min_kfs: 6                # 一个子图至少先积累这么多关键帧
+
+  recent_kfs: 3             # 用最近 3 个关键帧检查与旧子图的重叠
+  cut_overlap: 0.40         # 最近关键帧最大重叠低于它，才算“真的要离开旧子图”
+  cut_overlap_hard: 0.25    # 极低重叠，用于非关键帧情况下的强 novel 保护
+  cut_confirm_frames: 2     # 连续满足 2 次再切，防止单帧噪声误切
+  cancel_overlap: 0.65      # 如果重叠又回来了，就取消 pending cut
+
+  hard_trans_mult: 1.35     # 平移远超阈值时允许更快切图
+  hard_rot_mult: 1.20       # 旋转远超阈值时进入“强旋转模式”
+  rot_only_overlap_guard: 0.55  # 纯旋转切图时必须仍然要求 overlap 不高
   # ========== 新增：真正独立子图模式 ==========
   true_independent_submap: True   # true=彻底清空旧地图，false=保留部分旧点（流式）
   # ===========================================
@@ -69,9 +82,9 @@ Submap:
   cut_local_ba_iters: 80
   cut_local_prune_iters: 0
   cut_refine_iters: 40
-  #微调子图第一帧而不是固定死
-  seed_prior_weight_trans: 0.10
-  seed_prior_weight_rot: 0.05
+  #微调子图第一帧而不是固定死，0为固定
+  seed_prior_weight_trans: 0.0
+  seed_prior_weight_rot: 0.0
 
 
 # 【改进】：显存管理参数

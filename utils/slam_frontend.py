@@ -56,8 +56,24 @@ class FrontEnd(mp.Process):
         # ★★★ 新增这一行，修复 AttributeError ★★★
         self.submap_anchor_pose = None #运动监控锚点
         self.cut_refine_iters = self.config.get("Submap", {}).get("cut_refine_iters", 0)
-        # ============================================
-        # ============================================
+        # ===== 新增：更稳的切图策略参数 =====
+        self.submap_min_frames = self.config.get("Submap", {}).get("min_frames", 20)
+        self.submap_min_kfs = self.config.get("Submap", {}).get("min_kfs", 6)
+        self.submap_recent_kfs = self.config.get("Submap", {}).get("recent_kfs", 3)
+
+        self.submap_cut_overlap = self.config.get("Submap", {}).get("cut_overlap", 0.40)
+        self.submap_cut_overlap_hard = self.config.get("Submap", {}).get("cut_overlap_hard", 0.25)
+        self.submap_cut_confirm_frames = self.config.get("Submap", {}).get("cut_confirm_frames", 2)
+        self.submap_cancel_overlap = self.config.get("Submap", {}).get("cancel_overlap", 0.65)
+
+        self.submap_hard_trans_mult = self.config.get("Submap", {}).get("hard_trans_mult", 1.35)
+        self.submap_hard_rot_mult = self.config.get("Submap", {}).get("hard_rot_mult", 1.20)
+        self.submap_rot_only_overlap_guard = self.config.get("Submap", {}).get("rot_only_overlap_guard", 0.55)
+
+        self.submap_start_frame_idx = 0
+        self.submap_cut_pending = False
+        self.submap_cut_pending_count = 0
+        # ====================================
         self.fft_filter = None  # <--- 新增这行：频域滤波器实例
         # 【新增：读取消融实验开关，兼容旧版配置防止报错】
         self.use_submap = self.config.get("Ablation", {}).get("use_submap", True)
@@ -213,6 +229,11 @@ class FrontEnd(mp.Process):
         self.iteration_count = 0
         self.occ_aware_visibility = {}
         self.current_window = []
+        #========= 新增：子图切换策略相关状态重置 ==========
+        self.submap_start_frame_idx = cur_frame_idx
+        self.submap_cut_pending = False
+        self.submap_cut_pending_count = 0
+        #===========================================
         # remove everything from the queues
         while not self.backend_queue.empty():
             self.backend_queue.get()
@@ -586,54 +607,242 @@ class FrontEnd(mp.Process):
         if cur_frame_idx % 5 == 0: #10->5
             torch.cuda.empty_cache()
 
-    def exceeds_motion_thresholds(self, current_c2w, anchor_c2w):
-        """
-        判断是否需要切分新子图。
-        关键：保存切图时的位姿，确保新子图的位姿连续性。
-        """
-        if not self.use_submap:
-            return False
-
+    #“运动预触发 + 最近关键帧真实重叠 + 关键帧门控 + 连续确认”的子图切换策略核心函数，综合评估当前帧与子图锚点之间的运动差异，以及与最近关键帧的视野重叠度，来判断是否应该切换到一个新的子图。
+    def compute_submap_motion(self, current_c2w, anchor_c2w):
         if anchor_c2w is None:
-            return False
+            return 0.0, 0.0
 
-        # 计算相对变换矩阵
         delta_T = torch.linalg.inv(anchor_c2w) @ current_c2w
-
-        # 1. 计算平移距离
         translation = torch.norm(delta_T[0:3, 3]).item()
 
-        # 2. 计算旋转角度
         R = delta_T[0:3, 0:3]
         trace = torch.trace(R)
         cos_theta = torch.clamp((trace - 1.0) / 2.0, -1.0, 1.0)
         angle_rad = torch.acos(cos_theta).item()
         angle_deg = angle_rad * 180.0 / np.pi
+        return translation, angle_deg
 
-        if translation > self.submap_trans_thre or angle_deg > self.submap_rot_thre:
-            Log(f"[Submap Cut] Translation: {translation:.3f}m (threshold: {self.submap_trans_thre}m), "
-                f"Rotation: {angle_deg:.1f}° (threshold: {self.submap_rot_thre}°)")
+    def compute_visibility_overlap(self, vis_a, vis_b, mode="simpson"):
+        if vis_a is None or vis_b is None:
+            return 1.0
 
-            # 【新增】：保存切图时的位姿信息
-            submap_cut_info = {
-                "submap_id": self.current_submap_id,
-                "cut_frame_id": len(self.cameras),  # 当前帧 ID
-                "cut_pose_c2w": current_c2w.cpu().numpy(),  # 当前子图最后一帧的估计位姿
-                "translation": translation,
-                "rotation_deg": angle_deg
-            }
-
-            # 保存到文件供后续参考
-            cut_info_path = os.path.join(
-                self.config["Results"]["save_dir"],
-                f"submap_cut_{self.current_submap_id:06d}.npy"
+        intersection = torch.logical_and(vis_a, vis_b).count_nonzero().float()
+        if mode == "iou":
+            denom = torch.logical_or(vis_a, vis_b).count_nonzero().float()
+        else:
+            # 用 Simpson coefficient，比 IoU 更适合“还保留多少旧视野”这个判定
+            denom = torch.minimum(
+                vis_a.count_nonzero().float(),
+                vis_b.count_nonzero().float(),
             )
-            np.save(cut_info_path, submap_cut_info)
 
+        if denom.item() <= 0:
+            return 0.0
+        return (intersection / denom).item()
+
+    def get_recent_submap_keyframes(self):
+        recent_kfs = []
+        for kf_idx in self.current_window:
+            if self.frame_to_submap.get(kf_idx, self.current_submap_id) != self.current_submap_id:
+                continue
+            recent_kfs.append(kf_idx)
+            if len(recent_kfs) >= self.submap_recent_kfs:
+                break
+        return recent_kfs
+
+    def compute_submap_cut_metrics(self, cur_frame_idx, current_c2w, curr_visibility):
+        translation, angle_deg = self.compute_submap_motion(current_c2w, self.submap_anchor_pose)
+
+        recent_kfs = self.get_recent_submap_keyframes()
+        overlap_scores = []
+        for kf_idx in recent_kfs:
+            kf_visibility = self.occ_aware_visibility.get(kf_idx, None)
+            if kf_visibility is None:
+                continue
+            overlap_scores.append(
+                self.compute_visibility_overlap(curr_visibility, kf_visibility, mode="simpson")
+            )
+
+        max_recent_overlap = max(overlap_scores) if len(overlap_scores) > 0 else 1.0
+        last_kf_overlap = overlap_scores[0] if len(overlap_scores) > 0 else 1.0
+        num_submap_kfs = sum(
+            1
+            for kf_idx in self.current_window
+            if self.frame_to_submap.get(kf_idx, self.current_submap_id) == self.current_submap_id
+        )
+
+        return {
+            "translation": translation,
+            "rotation_deg": angle_deg,
+            "max_recent_overlap": max_recent_overlap,
+            "last_kf_overlap": last_kf_overlap,
+            "num_submap_kfs": num_submap_kfs,
+            "frames_since_anchor": cur_frame_idx - self.submap_start_frame_idx,
+            "recent_kfs": recent_kfs,
+        }
+
+    def should_start_new_submap(self, cur_frame_idx, current_c2w, curr_visibility, create_kf):
+        if not self.use_submap:
+            return False, None
+
+        if self.submap_anchor_pose is None:
+            return False, None
+
+        metrics = self.compute_submap_cut_metrics(cur_frame_idx, current_c2w, curr_visibility)
+
+        # 1) 子图先要“长大”
+        mature_enough = (
+                metrics["frames_since_anchor"] >= self.submap_min_frames
+                and metrics["num_submap_kfs"] >= self.submap_min_kfs
+        )
+        if not mature_enough:
+            self.submap_cut_pending = False
+            self.submap_cut_pending_count = 0
+            return False, metrics
+
+        # 2) 先看运动是否达到预触发
+        soft_motion = (
+                metrics["translation"] > self.submap_trans_thre
+                or metrics["rotation_deg"] > self.submap_rot_thre
+        )
+        if not soft_motion:
+            self.submap_cut_pending = False
+            self.submap_cut_pending_count = 0
+            return False, metrics
+
+        low_overlap = metrics["max_recent_overlap"] < self.submap_cut_overlap
+        hard_low_overlap = metrics["max_recent_overlap"] < self.submap_cut_overlap_hard
+
+        # 3) 不在普通 tracking 帧上硬切，除非 overlap 已经非常低
+        if (not create_kf) and (not hard_low_overlap):
+            return False, metrics
+
+        # 4) 真正“非常离开旧子图”时，允许更快切
+        hard_translation = metrics["translation"] > (self.submap_trans_thre * self.submap_hard_trans_mult)
+        hard_rotation = (
+                metrics["rotation_deg"] > (self.submap_rot_thre * self.submap_hard_rot_mult)
+                and metrics["max_recent_overlap"] < self.submap_rot_only_overlap_guard
+        )
+
+        if create_kf and (hard_translation or (hard_rotation and low_overlap)):
+            self.submap_cut_pending = False
+            self.submap_cut_pending_count = 0
+            return True, metrics
+
+        # 5) 连续确认，防抖
+        if create_kf and low_overlap:
+            self.submap_cut_pending = True
+            self.submap_cut_pending_count += 1
+        else:
+            if metrics["max_recent_overlap"] > self.submap_cancel_overlap:
+                self.submap_cut_pending = False
+                self.submap_cut_pending_count = 0
+
+        if self.submap_cut_pending and self.submap_cut_pending_count >= self.submap_cut_confirm_frames:
+            self.submap_cut_pending = False
+            self.submap_cut_pending_count = 0
+            return True, metrics
+
+        return False, metrics
+
+    def save_submap_cut_info(self, current_c2w, cut_metrics):
+        submap_cut_info = {
+            "submap_id": self.current_submap_id,
+            "cut_frame_id": len(self.cameras),
+            "cut_pose_c2w": current_c2w.detach().cpu().numpy(),
+            "translation": cut_metrics["translation"],
+            "rotation_deg": cut_metrics["rotation_deg"],
+            "max_recent_overlap": cut_metrics["max_recent_overlap"],
+            "last_kf_overlap": cut_metrics["last_kf_overlap"],
+            "num_submap_kfs": cut_metrics["num_submap_kfs"],
+            "frames_since_anchor": cut_metrics["frames_since_anchor"],
+        }
+        cut_info_path = os.path.join(
+            self.config["Results"]["save_dir"],
+            f"submap_cut_{self.current_submap_id:06d}.npy"
+        )
+        np.save(cut_info_path, submap_cut_info)
+
+    def perform_submap_cut(self, cur_frame_idx, viewpoint, current_c2w, cut_metrics):
+        Log(
+            f"==> 启动新子图 (ID: {self.current_submap_id + 1}) | "
+            f"trans={cut_metrics['translation']:.3f}m, "
+            f"rot={cut_metrics['rotation_deg']:.1f}°, "
+            f"max_overlap={cut_metrics['max_recent_overlap']:.3f}, "
+            f"submap_kfs={cut_metrics['num_submap_kfs']} <=="
+        )
+        self.save_submap_cut_info(current_c2w, cut_metrics)
+
+        if self.true_independent_submap:
+            cut_refine_iters = self.config.get("Submap", {}).get("cut_refine_iters", 20)
+            if cut_refine_iters > 0:
+                self.refine_cut_frame_pose(viewpoint, extra_iters=cut_refine_iters, lr_scale=0.25)
+                current_c2w = torch.linalg.inv(viewpoint.T)
+
+            relative_pose = current_c2w.detach().cpu().numpy()
+            prev_anchor = np.array(
+                self.submap_anchor_poses[self.current_submap_id],
+                dtype=np.float64
+            )
+            new_submap_id = self.current_submap_id + 1
+            new_anchor = prev_anchor @ relative_pose
+
+            self.submap_anchor_poses[new_submap_id] = new_anchor
+            self.cumulative_anchor_c2w = new_anchor.copy()
+
+            self.backend_queue.put(["new_submap", self.current_submap_id, relative_pose])
+            self.current_submap_id = new_submap_id
+            self.frame_to_submap[cur_frame_idx] = self.current_submap_id
+
+            Log(
+                f"[DEBUG] cut frame {cur_frame_idx} reassigned to submap "
+                f"{self.frame_to_submap[cur_frame_idx]}"
+            )
+
+            self.current_window = []
+            self.occ_aware_visibility = {}
+            self.initialized = False
+
+            for cam in self.cameras.values():
+                if cam.cam_rot_delta is not None:
+                    cam.cam_rot_delta.data.fill_(0)
+                if cam.cam_trans_delta is not None:
+                    cam.cam_trans_delta.data.fill_(0)
+
+            eye4 = torch.eye(4, device=viewpoint.T.device, dtype=viewpoint.T.dtype)
+            viewpoint.T = eye4
+            viewpoint.fixed_pose = False
+            viewpoint.is_submap_seed = True
+            viewpoint.seed_pose_prior = eye4.clone()
+            viewpoint.seed_prior_weight_trans = self.config.get("Submap", {}).get(
+                "seed_prior_weight_trans", 0.10
+            )
+            viewpoint.seed_prior_weight_rot = self.config.get("Submap", {}).get(
+                "seed_prior_weight_rot", 0.05
+            )
+            viewpoint.reset_pose_deltas()
+            viewpoint.cam_rot_delta.requires_grad_(True)
+            viewpoint.cam_trans_delta.requires_grad_(True)
+
+            self.submap_anchor_pose = eye4.clone()
+            self.submap_start_frame_idx = cur_frame_idx
+            self.submap_cut_pending = False
+            self.submap_cut_pending_count = 0
+            self.is_first_frame_of_submap = False
+
+            depth_map = self.add_new_keyframe(cur_frame_idx, init=True)
+            self.request_init(cur_frame_idx, viewpoint, depth_map)
+            self.current_window.append(cur_frame_idx)
             return True
 
-        return False
-
+        self.backend_queue.put(["new_submap", self.current_submap_id])
+        self.current_submap_id += 1
+        self.submap_anchor_pose = current_c2w.clone()
+        self.submap_start_frame_idx = cur_frame_idx
+        self.submap_cut_pending = False
+        self.submap_cut_pending_count = 0
+        return True
+    #=======================子图切换策略相关函数 end========================
     '''
     -------------------前端 SLAM 主循环---------------------
     作用: 前端 SLAM 系统的主循环，负责处理数据流、执行跟踪和关键帧管理，并与后端进行通信。
@@ -721,111 +930,10 @@ class FrontEnd(mp.Process):
                 # ------------------Tracking跟踪：估计当前帧的相机位姿（位置和旋转）---------------------
                 render_pkg = self.tracking(cur_frame_idx, viewpoint)
 
-                # ========== 新增：子图“切图”监控逻辑 ==========
                 current_c2w = torch.linalg.inv(viewpoint.T)
 
                 if self.submap_anchor_pose is None: #运动监控锚点，用来判断是否切图，初始为 None，第一帧处理时会被设置为当前帧的估计位姿
                     self.submap_anchor_pose = current_c2w.clone()
-
-                # ========== 子图切换逻辑 ==========
-                if self.exceeds_motion_thresholds(current_c2w, self.submap_anchor_pose):
-                    Log(f"==> 启动新子图 (ID: {self.current_submap_id + 1}) <==")
-
-                    if self.true_independent_submap:
-                        cut_refine_iters = self.config.get("Submap", {}).get("cut_refine_iters", 20)
-                        if cut_refine_iters > 0:
-                            self.refine_cut_frame_pose(viewpoint, extra_iters=cut_refine_iters, lr_scale=0.25)
-                            current_c2w = torch.linalg.inv(viewpoint.T)
-                        # ====================================================
-                        # 【真正独立子图模式】：种子帧初始化
-                        # ====================================================
-                        # 计算当前子图相对于上一个子图的相对位姿
-                        # current_c2w 是新子图的起点在旧子图坐标系下的位姿，上一个子图最后一帧的估计位姿（局部位姿还是全局位姿？子图0没区别，但其他子图就有区别了，后面debug注意这里）
-                        # 当前帧在“旧子图局部坐标系”下的 c2w
-                        relative_pose = current_c2w.detach().cpu().numpy()
-                        # ★★★ 新增：更新全局锚点位姿链 ★★★
-                        # 第1个子图的全局锚点(第0子图最后一帧全局pose)=单位阵*第0个子图最后一帧全局pose
-                        # 第2个子图的全局锚点(第1子图最后一帧全局pose)=第1个子图的全局锚点*第2个子图最后一帧的局部位姿？还是全局位姿？
-                        # 更稳的 anchor 递推方式：由上一子图 anchor 显式计算
-                        prev_anchor = np.array(
-                            self.submap_anchor_poses[self.current_submap_id],
-                            dtype=np.float64
-                        )
-                        new_submap_id = self.current_submap_id + 1
-                        new_anchor = prev_anchor @ relative_pose
-
-                        self.submap_anchor_poses[new_submap_id] = new_anchor
-                        self.cumulative_anchor_c2w = new_anchor.copy()
-
-                        # 1) 通知后端冻结旧子图
-                        self.backend_queue.put(["new_submap", self.current_submap_id, relative_pose])
-
-                        # 2) 前端切到新子图
-                        self.current_submap_id = new_submap_id
-
-                        # !!! 关键修复：当前帧已经不再属于旧子图，而是新子图 seed
-                        self.frame_to_submap[cur_frame_idx] = self.current_submap_id
-                        Log(
-                            f"[DEBUG] cut frame {cur_frame_idx} reassigned to submap "
-                            f"{self.frame_to_submap[cur_frame_idx]}"
-                        )
-                        # 3) 清空当前子图状态
-                        self.current_window = []
-                        self.occ_aware_visibility = {}
-                        self.initialized = False
-
-                        for cam in self.cameras.values():
-                            if cam.cam_rot_delta is not None:
-                                cam.cam_rot_delta.data.fill_(0)
-                            if cam.cam_trans_delta is not None:
-                                cam.cam_trans_delta.data.fill_(0)
-
-                        # 4) 当前 cut frame 作为新子图 seed：局部原点 + 软锚定，不再硬锁死
-                        eye4 = torch.eye(4, device=viewpoint.T.device, dtype=viewpoint.T.dtype)
-                        viewpoint.T = eye4
-
-                        viewpoint.fixed_pose = False
-                        viewpoint.is_submap_seed = True
-                        viewpoint.seed_pose_prior = eye4.clone()
-
-                        viewpoint.seed_prior_weight_trans = self.config.get("Submap", {}).get(
-                            "seed_prior_weight_trans", 0.10
-                        )
-                        viewpoint.seed_prior_weight_rot = self.config.get("Submap", {}).get(
-                            "seed_prior_weight_rot", 0.05
-                        )
-
-                        viewpoint.reset_pose_deltas()
-                        viewpoint.cam_rot_delta.requires_grad_(True)
-                        viewpoint.cam_trans_delta.requires_grad_(True)
-
-                        # 新子图内部的运动监控锚点：局部原点
-                        self.submap_anchor_pose = eye4.clone()
-
-                        # !!! 关键修复：当前帧已经是 seed，不要让下一帧再被重复 seed
-                        self.is_first_frame_of_submap = False
-
-                        # 5) 用当前帧初始化新子图
-                        depth_map = self.add_new_keyframe(cur_frame_idx, init=True)
-
-                        # 6) 发送 init 请求
-                        self.request_init(cur_frame_idx, viewpoint, depth_map)
-
-                        # 7) 当前帧加入新窗口
-                        self.current_window.append(cur_frame_idx)
-
-                        cur_frame_idx += 1
-                        continue
-
-                    else:
-                        # ====================================================
-                        # 【流式子图模式】：保留部分旧点（原有逻辑）
-                        # ====================================================
-                        self.backend_queue.put(["new_submap", self.current_submap_id])
-                        self.current_submap_id += 1
-                        self.submap_anchor_pose = current_c2w.clone()
-                        continue
-                # ============================================
 
                 # 窗口维护作用: 维护一个固定大小的滑动窗口（current_window），用于限制优化规模
                 if self.use_gui:
@@ -901,8 +1009,28 @@ class FrontEnd(mp.Process):
                             f"{last_keyframe_idx} is missing in visibility dict."
                         )
                         create_kf = check_time
+
                 if self.single_thread:
                     create_kf = check_time and create_kf
+                #tracking 完 → 先算 visibility → 先判断是不是合格关键帧 → 再结合 overlap 决定切不切
+                should_cut_submap, cut_metrics = self.should_start_new_submap(
+                    cur_frame_idx,
+                    current_c2w,
+                    curr_visibility,
+                    create_kf,
+                )
+
+                if should_cut_submap:
+                    did_cut = self.perform_submap_cut(
+                        cur_frame_idx,
+                        viewpoint,
+                        current_c2w,
+                        cut_metrics,
+                    )
+                    if did_cut:
+                        cur_frame_idx += 1
+                        continue
+
                 if create_kf: # 当前帧是关键帧
                     # 将当前关键帧加入滑动窗口
                     self.current_window, removed = self.add_to_window(
