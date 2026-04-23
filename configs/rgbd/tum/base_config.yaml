@@ -69,6 +69,9 @@ Submap:
   cut_local_ba_iters: 40
   cut_local_prune_iters: 8
   cut_refine_iters: 20
+  #微调子图第一帧而不是固定死
+  seed_prior_weight_trans: 0.10
+  seed_prior_weight_rot: 0.05
 
 # 【改进】：显存管理参数
 MemoryManagement:

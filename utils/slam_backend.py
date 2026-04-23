@@ -360,6 +360,10 @@ class BackEnd(mp.Process):
             loss_init = get_loss_mapping(
                 self.config, image, depth, viewpoint, initialization=True
             ) #0.4255
+            #这样新子图 seed 在初始化阶段就不是完全自由漂，而是“默认贴近局部原点”。
+            seed_prior_loss = self.compute_seed_pose_prior_loss(viewpoint)
+            if seed_prior_loss is not None:
+                loss_init = loss_init + seed_prior_loss
 
             loss_init.backward() #计算对gs模型参数的梯度（此阶段不更新相机位姿）
 
@@ -393,6 +397,39 @@ class BackEnd(mp.Process):
 
         self.occ_aware_visibility[cur_frame_idx] = (n_touched > 0).long()
         Log("Initialized map")
+
+    def compute_seed_pose_prior_loss(self, viewpoint):
+        """
+        对子图 seed 帧施加弱位姿先验：
+        - 目标是停留在新子图局部原点附近
+        - 但不是硬锁死，允许在必要时小幅修正
+        """
+        if not getattr(viewpoint, "is_submap_seed", False):
+            return None
+
+        target_T = getattr(viewpoint, "seed_pose_prior", None)
+        if target_T is None:
+            return None
+
+        cur_T = viewpoint.T
+        target_T = target_T.to(device=cur_T.device, dtype=cur_T.dtype)
+
+        # 相对变换：target -> current
+        rel_T = torch.inverse(target_T) @ cur_T
+        rel_t = rel_T[:3, 3]
+        rel_R = rel_T[:3, :3]
+
+        # SO(3) geodesic angle^2
+        cos_theta = torch.clamp((torch.trace(rel_R) - 1.0) * 0.5, -1.0 + 1e-6, 1.0 - 1e-6)
+        theta = torch.acos(cos_theta)
+
+        w_t = float(getattr(viewpoint, "seed_prior_weight_trans", 0.10))
+        w_r = float(getattr(viewpoint, "seed_prior_weight_rot", 0.05))
+
+        trans_loss = torch.sum(rel_t ** 2)
+        rot_loss = theta ** 2
+
+        return w_t * trans_loss + w_r * rot_loss
 
     def map(self, current_window, prune=False, iters=1):
         if len(current_window) == 0:
@@ -450,6 +487,10 @@ class BackEnd(mp.Process):
                 loss_view = get_loss_mapping(
                     self.config, image, depth, viewpoint
                 )
+                #新子图 seed 在初始化阶段就不是完全自由漂，而是“默认贴近局部原点”。
+                seed_prior_loss = self.compute_seed_pose_prior_loss(viewpoint)
+                if seed_prior_loss is not None:
+                    loss_view = loss_view + seed_prior_loss
 
                 if self.use_fdn and viewpoint.normal is not None:
                     rend_normal = render_pkg["rend_normal"]
@@ -608,9 +649,14 @@ class BackEnd(mp.Process):
                     frames_to_optimize = self.config["Training"]["pose_window"]
                     for cam_idx in range(min(frames_to_optimize, len(current_window))):
                         viewpoint = viewpoint_stack[cam_idx]
-                        if getattr(viewpoint, "fixed_pose", False):
+
+                        is_fixed_pose = getattr(viewpoint, "fixed_pose", False)
+                        is_seed_pose = getattr(viewpoint, "is_submap_seed", False)
+
+                        if is_fixed_pose and (not is_seed_pose):
                             viewpoint.reset_pose_deltas()
                             continue
+
                         update_pose(viewpoint)
                 else:
                     self.gaussians.optimizer.step()
@@ -874,39 +920,39 @@ class BackEnd(mp.Process):
                             iter_per_kf = self.mapping_itr_num
                     for cam_idx in range(len(self.current_window)):
                         viewpoint = self.viewpoints[current_window[cam_idx]]
-                        if cam_idx < frames_to_optimize and not getattr(viewpoint, "fixed_pose", False):
-                            opt_params.append(
-                                {
-                                    "params": [viewpoint.cam_rot_delta],
-                                    "lr": self.config["Training"]["lr"]["cam_rot_delta"]
-                                    * 0.5,
-                                    "name": "rot_{}".format(viewpoint.uid),
-                                }
-                            )
-                            opt_params.append(
-                                {
-                                    "params": [viewpoint.cam_trans_delta],
-                                    "lr": self.config["Training"]["lr"][
-                                        "cam_trans_delta"
-                                    ]
-                                    * 0.5,
-                                    "name": "trans_{}".format(viewpoint.uid),
-                                }
-                            )
-                        opt_params.append(
-                            {
+
+                        is_fixed_pose = getattr(viewpoint, "fixed_pose", False)
+                        is_seed_pose = getattr(viewpoint, "is_submap_seed", False)
+
+                        if cam_idx < frames_to_optimize and ((not is_fixed_pose) or is_seed_pose):
+                            rot_lr = self.config["Training"]["lr"]["cam_rot_delta"] * 0.5
+                            trans_lr = self.config["Training"]["lr"]["cam_trans_delta"] * 0.5
+
+                            # seed 帧允许优化，但学习率稍微小一点
+                            if is_seed_pose:
+                                rot_lr *= 0.25
+                                trans_lr *= 0.25
+
+                            opt_params.append({
+                                "params": [viewpoint.cam_rot_delta],
+                                "lr": rot_lr,
+                                "name": "rot_{}".format(viewpoint.uid),
+                            })
+                            opt_params.append({
+                                "params": [viewpoint.cam_trans_delta],
+                                "lr": trans_lr,
+                                "name": "trans_{}".format(viewpoint.uid),
+                            })
+                            opt_params.append({
                                 "params": [viewpoint.exposure_a],
                                 "lr": 0.01,
                                 "name": "exposure_a_{}".format(viewpoint.uid),
-                            }
-                        )
-                        opt_params.append(
-                            {
+                            })
+                            opt_params.append({
                                 "params": [viewpoint.exposure_b],
                                 "lr": 0.01,
                                 "name": "exposure_b_{}".format(viewpoint.uid),
-                            }
-                        )
+                            })
                     self.keyframe_optimizers = torch.optim.Adam(opt_params)
                     # 局部联合优化几何与位姿（BA）
                     self.map(self.current_window, iters=iter_per_kf)

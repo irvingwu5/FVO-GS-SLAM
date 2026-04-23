@@ -61,6 +61,12 @@ class Camera(nn.Module):
         # 对于这类帧，只允许优化高斯与曝光，不允许通过相机增量更新位姿。
         self.fixed_pose = False
 
+        # --- B1/B2: submap seed soft-anchor state ---
+        self.is_submap_seed = False
+        self.seed_pose_prior = None  # 4x4 target pose in current local frame
+        self.seed_prior_weight_trans = 0.0  # translation prior weight
+        self.seed_prior_weight_rot = 0.0  # rotation prior weight
+
         self.exposure_a = nn.Parameter(
             torch.tensor([0.0], requires_grad=True, device=device)
         )
@@ -176,6 +182,28 @@ class Camera(nn.Module):
         if self.cam_trans_delta is not None:
             self.cam_trans_delta.data.zero_()
 
+    def setup_as_submap_seed(
+            self,
+            prior_T=None,
+            trans_w=0.10,
+            rot_w=0.05,
+    ):
+        self.fixed_pose = False
+        self.is_submap_seed = True
+        self.seed_pose_prior = prior_T
+        self.seed_prior_weight_trans = float(trans_w)
+        self.seed_prior_weight_rot = float(rot_w)
+
+        self.reset_pose_deltas()
+        self.cam_rot_delta.requires_grad_(True)
+        self.cam_trans_delta.requires_grad_(True)
+
+    def clear_submap_seed_state(self):
+        self.is_submap_seed = False
+        self.seed_pose_prior = None
+        self.seed_prior_weight_trans = 0.0
+        self.seed_prior_weight_rot = 0.0
+
     @property
     def world_view_transform(self):
         # return getWorld2View2(self.R, self.T).transpose(0, 1)
@@ -269,7 +297,12 @@ class Camera(nn.Module):
         self.original_image = None
         self.depth = None
         self.grad_mask = None
+        #子图第一帧
         self.fixed_pose = False
+        self.is_submap_seed = False
+        self.seed_pose_prior = None
+        self.seed_prior_weight_trans = 0.0
+        self.seed_prior_weight_rot = 0.0
 
         self.cam_rot_delta = None
         self.cam_trans_delta = None

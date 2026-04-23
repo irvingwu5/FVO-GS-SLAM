@@ -236,19 +236,40 @@ class FrontEnd(mp.Process):
     逻辑: 基于当前帧与上一关键帧的相对位移（kf_translation）、视锥体重叠度（kf_overlap）以及可见性掩码来综合判断
     '''
     def tracking(self, cur_frame_idx, viewpoint):
-        # 【修复】：如果是子图的第一帧，不要继承上一帧的位姿，且后续始终固定该帧位姿
+        # 如果是子图的第一帧
         if self.is_first_frame_of_submap:
             Log(f"[DEBUG] tracking() consumed first-frame flag at frame {cur_frame_idx}")
-            viewpoint.T = torch.eye(4, device=viewpoint.T.device)
-            viewpoint.fixed_pose = True
+
+            eye4 = torch.eye(4, device=viewpoint.T.device, dtype=viewpoint.T.dtype)
+            viewpoint.T = eye4
+
+            viewpoint.fixed_pose = False
+            viewpoint.is_submap_seed = True
+            viewpoint.seed_pose_prior = eye4.clone()
+
+            viewpoint.seed_prior_weight_trans = self.config.get("Submap", {}).get(
+                "seed_prior_weight_trans", 0.10
+            )
+            viewpoint.seed_prior_weight_rot = self.config.get("Submap", {}).get(
+                "seed_prior_weight_rot", 0.05
+            )
+
             viewpoint.reset_pose_deltas()
-            viewpoint.cam_rot_delta.requires_grad_(False)
-            viewpoint.cam_trans_delta.requires_grad_(False)
+            viewpoint.cam_rot_delta.requires_grad_(True)
+            viewpoint.cam_trans_delta.requires_grad_(True)
+
             self.is_first_frame_of_submap = False
         else:
             prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
-            viewpoint.T = prev.T.clone()  # 使用 clone 避免引用污染
+            viewpoint.T = prev.T.clone()
             viewpoint.fixed_pose = False
+
+            # 普通帧不是 seed
+            viewpoint.is_submap_seed = False
+            viewpoint.seed_pose_prior = None
+            viewpoint.seed_prior_weight_trans = 0.0
+            viewpoint.seed_prior_weight_rot = 0.0
+
             viewpoint.cam_rot_delta.requires_grad_(True)
             viewpoint.cam_trans_delta.requires_grad_(True)
         # 优化参数与优化器构建
@@ -531,13 +552,9 @@ class FrontEnd(mp.Process):
     def request_init(self, cur_frame_idx, viewpoint, depth_map):
         msg = ["init", cur_frame_idx, viewpoint, depth_map]
         self.backend_queue.put(msg)
-        # 【核心修复】：只有在非第0个子图（即切图后）时，才将种子帧重置为单位阵
-        # 第0个子图的第0帧必须保持其 GT 位姿，作为全局坐标系的基准
-        if self.current_submap_id > 0:
-            with torch.no_grad():
-                # 将种子帧的位姿重置为单位阵，使其成为新子图的局部原点
-                viewpoint.T = torch.eye(4, device=self.device)
-                self.cameras[cur_frame_idx].T = torch.eye(4, device=self.device)
+
+        # B1: seed 的局部原点重置已经在切图处完成；
+        # 这里不再二次覆盖，只做状态标记。
         self.requested_init = True
     '''
     -------------------后端同步与通信模块---------------------
@@ -763,15 +780,27 @@ class FrontEnd(mp.Process):
                             if cam.cam_trans_delta is not None:
                                 cam.cam_trans_delta.data.fill_(0)
 
-                        # 4) 当前 cut frame 直接重置为新子图原点
-                        viewpoint.T = torch.eye(4, device=viewpoint.T.device)
-                        viewpoint.fixed_pose = True
+                        # 4) 当前 cut frame 作为新子图 seed：局部原点 + 软锚定，不再硬锁死
+                        eye4 = torch.eye(4, device=viewpoint.T.device, dtype=viewpoint.T.dtype)
+                        viewpoint.T = eye4
+
+                        viewpoint.fixed_pose = False
+                        viewpoint.is_submap_seed = True
+                        viewpoint.seed_pose_prior = eye4.clone()
+
+                        viewpoint.seed_prior_weight_trans = self.config.get("Submap", {}).get(
+                            "seed_prior_weight_trans", 0.10
+                        )
+                        viewpoint.seed_prior_weight_rot = self.config.get("Submap", {}).get(
+                            "seed_prior_weight_rot", 0.05
+                        )
+
                         viewpoint.reset_pose_deltas()
-                        viewpoint.cam_rot_delta.requires_grad_(False)
-                        viewpoint.cam_trans_delta.requires_grad_(False)
+                        viewpoint.cam_rot_delta.requires_grad_(True)
+                        viewpoint.cam_trans_delta.requires_grad_(True)
 
                         # 新子图内部的运动监控锚点：局部原点
-                        self.submap_anchor_pose = torch.eye(4, device=viewpoint.T.device)
+                        self.submap_anchor_pose = eye4.clone()
 
                         # !!! 关键修复：当前帧已经是 seed，不要让下一帧再被重复 seed
                         self.is_first_frame_of_submap = False
