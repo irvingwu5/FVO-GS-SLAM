@@ -211,10 +211,13 @@ class LoopClosureProcess(mp.Process):
 
         # ==============================================================
         # 点云内存缓存（LRU 策略管理，按需从磁盘重新加载）
+        #稀疏特征点云（用于非相邻ICP / loopclosure）
+        #稠密点云（用于相邻 refine）
         # ==============================================================
-        self.submap_pcds = {}       # 内存缓存每个子图的点云数据（LRU 管理，可被清理后重新加载）
+        self.submap_pcds = {}       # 非相邻子图用sparse点云，内存缓存每个子图的点云数据（LRU 管理，可被清理后重新加载）
         self.submap_records = {}    # 记录子图 ID 与其对应的 ckpt 路径（永不清理）
-
+        # 相邻子图refine要用dense点云
+        self.submap_dense_pcds = {}  # 专门给相邻 refine 用  # raw dense downsampled cloud
         # ==============================================================
         # 视觉特征缓存（永不清理，内存占用极小）
         # CosPlace 特征向量每个子图约 N_kf * 512 * 4 bytes ≈ 几十 KB
@@ -238,16 +241,23 @@ class LoopClosureProcess(mp.Process):
             "weight_path", f"weights/{self.cosplace_backbone}_{self.cosplace_dim}_cosplace.pth"
         )
 
-        # ===== 相邻子图边精炼参数 =====
+        # ===== 相邻子图边精炼参数 =====相邻子图icp用dense点云，且门槛更严格，避免误匹配引入错误的约束
         self.adjacent_icp_fitness_threshold = self.config.get("LoopClosure", {}).get("adjacent_icp_fitness_threshold", 0.45)
         self.adjacent_icp_rmse_threshold = self.config.get("LoopClosure", {}).get("adjacent_icp_rmse_threshold", 0.03)
         self.max_adjacent_delta_translation = self.config.get("LoopClosure", {}).get("max_adjacent_delta_translation", 0.25)
         self.max_adjacent_delta_rotation_deg = self.config.get("LoopClosure", {}).get("max_adjacent_delta_rotation_deg", 12.0)
         self.default_odom_info_scale = self.config.get("LoopClosure", {}).get("default_odom_info_scale", 120.0)
+        # 新增：相邻边降权参数
+        self.adjacent_edge_weight = self.config.get("LoopClosure", {}).get("adjacent_edge_weight", 0.25)
+        self.adjacent_info_min_scale = self.config.get("LoopClosure", {}).get("adjacent_info_min_scale", 0.5)
+        self.adjacent_info_max_scale = self.config.get("LoopClosure", {}).get("adjacent_info_max_scale", 8.0)
 
         # ===== 每次切图后的局部链式 PGO =====local ba in submap，在每次切图后，至少对最近 N 个子图做一次局部链式 PGO
         self.enable_chain_pgo_without_loop = self.config.get("LoopClosure", {}).get("enable_chain_pgo_without_loop", True)
         self.chain_pgo_window = self.config.get("LoopClosure", {}).get("chain_pgo_window", 4)
+
+        # 回环边用feature cloud 新增：feature cloud 保留比例（建议保留 top 30% 曲率点）
+        self.feature_keep_ratio = self.config.get("LoopClosure", {}).get("feature_keep_ratio", 0.30)
 
     def init_feature_extractor(self):
         """
@@ -294,93 +304,117 @@ class LoopClosureProcess(mp.Process):
 
     def extract_pcd_from_2dgs_ckpt(self, ckpt_path):
         """
-        从 2DGS checkpoint 提取点云，两阶段下采样。
-        先粗下采样，再保留关键特征点。
+        从 2DGS checkpoint 提取两类点云：
+        1) dense cloud   : 去离群 + voxel 下采样后的点云（给相邻 refine 用）
+        2) feature cloud : 在 dense cloud 基础上做曲率筛选后的点云（给非相邻 loop ICP 用）
+        dense 分支：保留 voxel 平均后的 2DGS normals，不再 estimate_normals
+        feature 分支：在 dense 副本上 estimate_normals，再做曲率筛选
         """
         submap_ckpt = torch.load(ckpt_path, map_location="cpu")
         gp = submap_ckpt["gaussian_params"]
 
-        xyz = gp['_xyz'].numpy()
-        rot_q = gp['_rotation']
+        xyz = gp["_xyz"].numpy()
+        rot_q = gp["_rotation"]
 
-        # 在 CPU 上计算法线
+        # 2DGS 法线：由高斯旋转矩阵第 3 列近似得到
         rot_mat = roma.unitquat_to_rotmat(rot_q).numpy()
         normals = rot_mat[:, :, 2]
 
-        # 法线归一化
         normals_norm = np.linalg.norm(normals, axis=1, keepdims=True)
         normals_norm[normals_norm < 1e-6] = 1.0
         normals = normals / normals_norm
 
-        # 创建点云
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(xyz)
         pcd.normals = o3d.utility.Vector3dVector(normals)
 
-        # 【第 1 阶段】：统计离群值移除，去除噪点防止后续子图间icp被干扰
-        pcd, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+        # 1) 去离群
+        pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
 
-        # 【第 2 阶段】：粗下采样，加速icp最近邻搜索
-        pcd_downsampled = pcd.voxel_down_sample(voxel_size=self.voxel_size)
+        # 2) voxel 下采样：这一步的结果直接作为 dense cloud
+        pcd_dense = pcd.voxel_down_sample(voxel_size=self.voxel_size)
 
-        # 【第 3 阶段】：保留关键特征点（高曲率点），提高子图间icp配准的稳定性和准确性
-        pcd_downsampled.estimate_normals() #这里重新估计了法线，能否用原来2dgs法线？
-        points = np.asarray(pcd_downsampled.points)
-        normals_ds = np.asarray(pcd_downsampled.normals)
+        # Open3D 的 voxel_down_sample 会对已有 normals 做平均
+        # 所以 dense cloud 已经有 normals，可直接用于 point-to-plane ICP
+        if len(pcd_dense.points) == 0:
+            Log(f"[LoopClosure] 子图点云为空: {ckpt_path}")
+            del submap_ckpt, gp
+            return pcd_dense, pcd_dense
 
-        tree = o3d.geometry.KDTreeFlann(pcd_downsampled)
+        # 3) feature cloud 在 dense 的副本上做，避免污染 dense normals
+        pcd_for_feature = o3d.geometry.PointCloud(pcd_dense)
+
+        # 这里建议保留重新估计法线，但只作用在 feature 分支
+        pcd_for_feature.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamKNN(knn=20)
+        )
+        pcd_for_feature.normalize_normals()
+
+        points = np.asarray(pcd_for_feature.points)
+        normals_ds = np.asarray(pcd_for_feature.normals)
+
+        if len(points) < 10:
+            Log(f"[LoopClosure] 点数过少，dense 直接兼作 feature: {len(points)}")
+            del submap_ckpt, gp
+            return pcd_dense, pcd_for_feature
+
+        tree = o3d.geometry.KDTreeFlann(pcd_for_feature)
         curvatures = []
         for i in range(len(points)):
-            [k, idx, _] = tree.search_knn_vector_3d(points[i], 10)
+            k, idx, _ = tree.search_knn_vector_3d(points[i], 10)
             neighbor_normals = normals_ds[idx]
             curvature = np.std(neighbor_normals, axis=0).mean()
             curvatures.append(curvature)
 
-        curvatures = np.array(curvatures)
-        high_curvature_threshold = np.percentile(curvatures, 30)
-        feature_mask = curvatures > high_curvature_threshold
+        curvatures = np.asarray(curvatures)
+
+        # keep_ratio=0.30 表示保留 top 30% 曲率点
+        keep_ratio = float(self.feature_keep_ratio)
+        keep_ratio = min(max(keep_ratio, 0.05), 0.95)
+        threshold = np.percentile(curvatures, 100.0 * (1.0 - keep_ratio))
+        feature_mask = curvatures >= threshold
         feature_indices = np.where(feature_mask)[0]
 
         feature_points = points[feature_indices]
         feature_normals = normals_ds[feature_indices]
 
-        pcd_final = o3d.geometry.PointCloud()
-        pcd_final.points = o3d.utility.Vector3dVector(feature_points)
-        pcd_final.normals = o3d.utility.Vector3dVector(feature_normals)
+        pcd_feature = o3d.geometry.PointCloud()
+        pcd_feature.points = o3d.utility.Vector3dVector(feature_points)
+        pcd_feature.normals = o3d.utility.Vector3dVector(feature_normals)
 
-        Log(f"[LoopClosure] 两阶段下采样：原始 {len(pcd.points)} → 下采样 {len(pcd_downsampled.points)} → 最终 {len(pcd_final.points)}")
+        Log(
+            f"[LoopClosure] 点云提取：原始 {len(pcd.points)} "
+            f"→ dense {len(pcd_dense.points)} "
+            f"→ feature {len(pcd_feature.points)}"
+        )
 
         del submap_ckpt, gp
-        return pcd_final
+        return pcd_dense, pcd_feature
 
     def _ensure_pcd_loaded(self, submap_id):
         """
-        确保指定子图的点云已加载到内存。
-        如果点云已被 LRU 清理，则从磁盘 ckpt 重新加载。
-        返回 True 表示点云可用，False 表示加载失败。
+        确保指定子图的 dense / feature 两类点云都已加载。
         """
-        if submap_id in self.submap_pcds:
+        if submap_id in self.submap_pcds and submap_id in self.submap_dense_pcds:
             return True
 
-        # 点云已被清理，从磁盘重新加载
         ckpt_path = self.submap_records.get(submap_id)
         if not ckpt_path or not os.path.exists(ckpt_path):
             Log(f"[LoopClosure] 子图 {submap_id} 的 ckpt 不存在，无法重新加载点云")
             return False
 
-        Log(f"[LoopClosure] 子图 {submap_id} 的点云已被清理，从磁盘重新加载: {ckpt_path}")
+        Log(f"[LoopClosure] 子图 {submap_id} 点云已被清理，从磁盘重新加载: {ckpt_path}")
         try:
-            pcd = self.extract_pcd_from_2dgs_ckpt(ckpt_path)
-            self.submap_pcds[submap_id] = pcd
+            dense_pcd, feature_pcd = self.extract_pcd_from_2dgs_ckpt(ckpt_path)
+            self.submap_dense_pcds[submap_id] = dense_pcd
+            self.submap_pcds[submap_id] = feature_pcd
 
-            # 更新 LRU 访问顺序
             if submap_id in self.submap_access_order:
                 self.submap_access_order.remove(submap_id)
             self.submap_access_order.append(submap_id)
-
             return True
         except Exception as e:
-            Log(f"[LoopClosure] 重新加载子图 {submap_id} 的点云失败: {e}")
+            Log(f"[LoopClosure] 重新加载子图 {submap_id} 点云失败: {e}")
             return False
 
     def detect_closure(self, query_id):
@@ -409,99 +443,6 @@ class LoopClosureProcess(mp.Process):
         torch.cuda.empty_cache()
         return matched_ids
 
-    def compute_relative_transform(self, source_id, target_id, current_pose_guesses):
-        try:
-            if not self._ensure_pcd_loaded(source_id):
-                Log(f"[LoopClosure] 无法加载子图 {source_id} 的点云，跳过 ICP")
-                return np.identity(4), np.identity(6), False
-            if not self._ensure_pcd_loaded(target_id):
-                Log(f"[LoopClosure] 无法加载子图 {target_id} 的点云，跳过 ICP")
-                return np.identity(4), np.identity(6), False
-
-            source_pcd = self.submap_pcds[source_id]
-            target_pcd = self.submap_pcds[target_id]
-
-            # source -> target 的先验
-            init_guess = (
-                    np.linalg.inv(current_pose_guesses[target_id]) @
-                    current_pose_guesses[source_id]
-            )
-
-            coarse_icp = o3d.pipelines.registration.registration_icp(
-                source_pcd, target_pcd,
-                max_correspondence_distance=self.voxel_size * 8.0,
-                init=init_guess,
-                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-                criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
-                    max_iteration=60, relative_fitness=1e-6, relative_rmse=1e-6
-                )
-            )
-
-            medium_icp = o3d.pipelines.registration.registration_icp(
-                source_pcd, target_pcd,
-                max_correspondence_distance=self.voxel_size * 4.0,
-                init=coarse_icp.transformation,
-                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-                criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
-                    max_iteration=100, relative_fitness=1e-7, relative_rmse=1e-7
-                )
-            )
-
-            fine_icp = o3d.pipelines.registration.registration_icp(
-                source_pcd, target_pcd,
-                max_correspondence_distance=self.voxel_size * 2.0,
-                init=medium_icp.transformation,
-                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-                criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
-                    max_iteration=150, relative_fitness=1e-8, relative_rmse=1e-8
-                )
-            )
-
-            icp_result = fine_icp
-
-            if icp_result.fitness < self.icp_fitness_threshold or icp_result.inlier_rmse > 0.04:
-                Log(f"[!] ICP 配准失败: 子图 {source_id}->{target_id} "
-                    f"(Fitness: {icp_result.fitness:.3f}, RMSE: {icp_result.inlier_rmse:.3f}m)")
-                return np.identity(4), np.identity(6), False
-
-            transformation = np.array(icp_result.transformation, dtype=np.float64)
-
-            # 与先验做一致性校验
-            delta = transformation @ np.linalg.inv(init_guess)
-            delta_t = np.linalg.norm(delta[:3, 3])
-            delta_r = self._rotation_error_deg(transformation, init_guess)
-
-            max_loop_delta_t = self.config.get("LoopClosure", {}).get("max_loop_delta_translation", 0.80)
-            max_loop_delta_r = self.config.get("LoopClosure", {}).get("max_loop_delta_rotation_deg", 45.0)
-
-            if delta_t > max_loop_delta_t or delta_r > max_loop_delta_r:
-                Log(
-                    f"[!] LOOP 一致性校验失败: 子图 {source_id}->{target_id} | "
-                    f"delta_t={delta_t:.3f}m, delta_r={delta_r:.2f}deg | 拒绝该闭环边"
-                )
-                return np.identity(4), np.identity(6), False
-
-            information = o3d.pipelines.registration.get_information_matrix_from_point_clouds(
-                source_pcd,
-                target_pcd,
-                self.voxel_size * 2.0,
-                transformation
-            )
-
-            confidence_scale = float(np.clip(icp_result.fitness, 0.1, 1.0))
-            information = information * confidence_scale
-
-            Log(
-                f"[ICP] 子图 {source_id}->{target_id} 配准成功! "
-                f"(Fitness: {icp_result.fitness:.3f}, RMSE: {icp_result.inlier_rmse:.3f}m, "
-                f"delta_t={delta_t:.3f}m, delta_r={delta_r:.2f}deg)"
-            )
-
-            return transformation, information, True
-
-        except Exception as e:
-            Log(f"[LoopClosure] ICP 异常: {source_id}->{target_id}: {e}")
-            return np.identity(4), np.identity(6), False
 
     def construct_and_optimize_pose_graph(self):
         all_submap_ids = sorted(self.submap_records.keys())
@@ -604,27 +545,6 @@ class LoopClosureProcess(mp.Process):
 
         return correction_list
 
-    def cleanup_old_submaps(self):
-        """
-        LRU 策略清理旧子图的点云缓存，只保留最近的 N 个。
-        【关键改进】：只清理点云（占内存大），保留特征向量和阈值（占内存极小）。
-        被清理的子图仍然可以参与回环检测（视觉粗筛），如果 ICP 需要其点云，
-        会通过 _ensure_pcd_loaded 从磁盘自动重新加载。
-        """
-        if len(self.submap_access_order) > self.max_cached_submaps:
-            to_evict = self.submap_access_order[:-self.max_cached_submaps]
-
-            for submap_id in to_evict:
-                # 只清理点云，不清理特征和阈值
-                if submap_id in self.submap_pcds:
-                    del self.submap_pcds[submap_id]
-                    Log(f"[LoopClosure] LRU 清理子图 {submap_id} 的点云缓存（特征保留）")
-
-            self.submap_access_order = self.submap_access_order[-self.max_cached_submaps:]
-            torch.cuda.empty_cache()
-            Log(f"[LoopClosure] 点云缓存清理完毕，当前缓存: {len(self.submap_access_order)} 个子图点云, "
-                f"{len(self.submap_features)} 个子图特征")
-
     def _load_relative_pose_from_ckpt(self, sid):
         ckpt_path = self.submap_records.get(sid)
         if ckpt_path is None or not os.path.exists(ckpt_path):
@@ -723,7 +643,9 @@ class LoopClosureProcess(mp.Process):
         优先读 curr.ckpt 里 refine 后保存的信息矩阵；
         如果没有，就退化成固定权重。
         """
-        default_info = np.identity(6, dtype=np.float64) * float(self.default_odom_info_scale)
+        default_info = np.identity(6, dtype=np.float64) * (
+                float(self.default_odom_info_scale) * float(self.adjacent_edge_weight)
+        )
 
         curr_ckpt_path = self.submap_records.get(curr_sid)
         if curr_ckpt_path is not None and os.path.exists(curr_ckpt_path):
@@ -736,6 +658,102 @@ class LoopClosureProcess(mp.Process):
 
         return default_info
 
+    # compute_relative_transform()  -> self.submap_pcds回环边ICP用的点云是feature cloud，特征点云更稀疏但更稳定，适合非相邻子图的粗匹配；相邻子图的 refine 则用 dense cloud，提供更多点对支持更精细的配准。函数内部会自动判断当前边是相邻 refine 还是非相邻 loop ICP，并选择对应的点云和更严格的门槛进行配准和一致性校验。
+    def compute_relative_transform(self, source_id, target_id, current_pose_guesses):
+        try:
+            if not self._ensure_pcd_loaded(source_id):
+                Log(f"[LoopClosure] 无法加载子图 {source_id} 的点云，跳过 ICP")
+                return np.identity(4), np.identity(6), False
+            if not self._ensure_pcd_loaded(target_id):
+                Log(f"[LoopClosure] 无法加载子图 {target_id} 的点云，跳过 ICP")
+                return np.identity(4), np.identity(6), False
+
+            source_pcd = self.submap_pcds[source_id]
+            target_pcd = self.submap_pcds[target_id]
+
+            # source -> target 的先验
+            init_guess = (
+                    np.linalg.inv(current_pose_guesses[target_id]) @
+                    current_pose_guesses[source_id]
+            )
+
+            coarse_icp = o3d.pipelines.registration.registration_icp(
+                source_pcd, target_pcd,
+                max_correspondence_distance=self.voxel_size * 8.0,
+                init=init_guess,
+                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
+                    max_iteration=60, relative_fitness=1e-6, relative_rmse=1e-6
+                )
+            )
+
+            medium_icp = o3d.pipelines.registration.registration_icp(
+                source_pcd, target_pcd,
+                max_correspondence_distance=self.voxel_size * 4.0,
+                init=coarse_icp.transformation,
+                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
+                    max_iteration=100, relative_fitness=1e-7, relative_rmse=1e-7
+                )
+            )
+
+            fine_icp = o3d.pipelines.registration.registration_icp(
+                source_pcd, target_pcd,
+                max_correspondence_distance=self.voxel_size * 2.0,
+                init=medium_icp.transformation,
+                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
+                    max_iteration=150, relative_fitness=1e-8, relative_rmse=1e-8
+                )
+            )
+
+            icp_result = fine_icp
+
+            if icp_result.fitness < self.icp_fitness_threshold or icp_result.inlier_rmse > 0.04:
+                Log(f"[!] ICP 配准失败: 子图 {source_id}->{target_id} "
+                    f"(Fitness: {icp_result.fitness:.3f}, RMSE: {icp_result.inlier_rmse:.3f}m)")
+                return np.identity(4), np.identity(6), False
+
+            transformation = np.array(icp_result.transformation, dtype=np.float64)
+
+            # 与先验做一致性校验
+            delta = transformation @ np.linalg.inv(init_guess)
+            delta_t = np.linalg.norm(delta[:3, 3])
+            delta_r = self._rotation_error_deg(transformation, init_guess)
+
+            max_loop_delta_t = self.config.get("LoopClosure", {}).get("max_loop_delta_translation", 0.80)
+            max_loop_delta_r = self.config.get("LoopClosure", {}).get("max_loop_delta_rotation_deg", 45.0)
+
+            if delta_t > max_loop_delta_t or delta_r > max_loop_delta_r:
+                Log(
+                    f"[!] LOOP 一致性校验失败: 子图 {source_id}->{target_id} | "
+                    f"delta_t={delta_t:.3f}m, delta_r={delta_r:.2f}deg | 拒绝该闭环边"
+                )
+                return np.identity(4), np.identity(6), False
+
+            information = o3d.pipelines.registration.get_information_matrix_from_point_clouds(
+                source_pcd,
+                target_pcd,
+                self.voxel_size * 2.0,
+                transformation
+            )
+
+            confidence_scale = float(np.clip(icp_result.fitness, 0.1, 1.0))
+            information = information * confidence_scale
+
+            Log(
+                f"[ICP] 子图 {source_id}->{target_id} 配准成功! "
+                f"(Fitness: {icp_result.fitness:.3f}, RMSE: {icp_result.inlier_rmse:.3f}m, "
+                f"delta_t={delta_t:.3f}m, delta_r={delta_r:.2f}deg)"
+            )
+
+            return transformation, information, True
+
+        except Exception as e:
+            Log(f"[LoopClosure] ICP 异常: {source_id}->{target_id}: {e}")
+            return np.identity(4), np.identity(6), False
+
+    #refine_adjacent_submap_edge() -> self.submap_dense_pcds相邻 refine 用 dense cloud，提供更多点对支持更精细的配准。函数内部会自动判断当前边是相邻 refine 还是非相邻 loop ICP，并选择对应的点云和更严格的门槛进行配准和一致性校验。refine_adjacent_submap_edge 专门针对相邻子图边进行精炼，使用更严格的 ICP 门槛和更密集的点云（dense cloud）来提升配准精度，同时引入偏差校验和降权机制，确保只有高质量的相邻边被写回并参与后续优化。
     def refine_adjacent_submap_edge(self, curr_sid):
         if curr_sid <= 0:
             return False
@@ -750,14 +768,14 @@ class LoopClosureProcess(mp.Process):
         all_ids = sorted(self.submap_records.keys())
         _, current_pose_guesses = self._build_current_pose_guesses(all_ids)
 
-        # source = curr, target = prev
         init_guess = (
                 np.linalg.inv(current_pose_guesses[prev_sid]) @
                 current_pose_guesses[curr_sid]
         )
 
-        source_pcd = self.submap_pcds[curr_sid]
-        target_pcd = self.submap_pcds[prev_sid]
+        # 改这里：相邻 refine 用 dense cloud
+        source_pcd = self.submap_dense_pcds[curr_sid]
+        target_pcd = self.submap_dense_pcds[prev_sid]
 
         coarse = o3d.pipelines.registration.registration_icp(
             source_pcd,
@@ -819,9 +837,11 @@ class LoopClosureProcess(mp.Process):
             refined,
         )
 
-        # 用 fitness / rmse 再做一次置信度缩放
-        confidence = float(np.clip(fine.fitness / max(fine.inlier_rmse, 1e-3), 1.0, 30.0))
-        info = np.array(info, dtype=np.float64) * confidence
+        raw_conf = fine.fitness / max(fine.inlier_rmse, 1e-3)
+        conf = float(np.clip(raw_conf, self.adjacent_info_min_scale, self.adjacent_info_max_scale))
+
+        # 核心：相邻边降权
+        info = np.array(info, dtype=np.float64) * conf * float(self.adjacent_edge_weight)
 
         ckpt_path = self.submap_records[curr_sid]
         ckpt = torch.load(ckpt_path, map_location="cpu")
@@ -832,13 +852,16 @@ class LoopClosureProcess(mp.Process):
             "rmse": float(fine.inlier_rmse),
             "delta_t": float(delta_t),
             "delta_r": float(delta_r),
+            "raw_conf": float(raw_conf),
+            "edge_weight": float(self.adjacent_edge_weight),
         }
         torch.save(ckpt, ckpt_path)
 
         Log(
             f"[AdjacentOdom] 已写回子图 {curr_sid} 的 refined prev edge | "
             f"fitness={fine.fitness:.3f}, rmse={fine.inlier_rmse:.3f}, "
-            f"delta_t={delta_t:.3f}, delta_r={delta_r:.2f}"
+            f"delta_t={delta_t:.3f}, delta_r={delta_r:.2f}, "
+            f"raw_conf={raw_conf:.3f}, edge_weight={self.adjacent_edge_weight:.3f}"
         )
         return True
 
@@ -906,6 +929,31 @@ class LoopClosureProcess(mp.Process):
 
         return correction_list
 
+    def cleanup_old_submaps(self):
+        """
+        LRU 策略清理旧子图的点云缓存，只保留最近的 N 个。
+        【关键改进】：只清理点云（占内存大），保留特征向量和阈值（占内存极小）。
+        被清理的子图仍然可以参与回环检测（视觉粗筛），如果 ICP 需要其点云，
+        会通过 _ensure_pcd_loaded 从磁盘自动重新加载。
+        """
+        if len(self.submap_access_order) > self.max_cached_submaps:
+            to_evict = self.submap_access_order[:-self.max_cached_submaps]
+
+            for submap_id in to_evict:
+                if submap_id in self.submap_pcds:
+                    del self.submap_pcds[submap_id]
+                if submap_id in self.submap_dense_pcds:
+                    del self.submap_dense_pcds[submap_id]
+                Log(f"[LoopClosure] LRU 清理子图 {submap_id} 的 dense/feature 点云缓存（视觉特征保留）")
+
+            self.submap_access_order = self.submap_access_order[-self.max_cached_submaps:]
+            torch.cuda.empty_cache()
+            Log(
+                f"[LoopClosure] 点云缓存清理完毕，当前缓存: "
+                f"{len(self.submap_access_order)} 个子图 dense/feature 点云, "
+                f"{len(self.submap_features)} 个子图特征"
+            )
+
     def apply_correction_to_submaps(self, correction_list):
         """将 PGO 优化后的修正矩阵写回子图 ckpt 文件"""
         for correction in correction_list:
@@ -943,8 +991,9 @@ class LoopClosureProcess(mp.Process):
 
                     # 提取并缓存点云
                     Log(f"[LoopClosure] 提取并缓存子图 {submap_id} 的 3D 点云与特征...")
-                    pcd = self.extract_pcd_from_2dgs_ckpt(ckpt_path)
-                    self.submap_pcds[submap_id] = pcd
+                    dense_pcd, feature_pcd = self.extract_pcd_from_2dgs_ckpt(ckpt_path)
+                    self.submap_dense_pcds[submap_id] = dense_pcd
+                    self.submap_pcds[submap_id] = feature_pcd
 
                     # 批量提取 CosPlace 特征并计算每帧的动态阈值
                     submap_desc, thresholds = self.extract_submap_features_and_threshold(img_paths)

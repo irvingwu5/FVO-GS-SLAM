@@ -73,6 +73,7 @@ Submap:
   seed_prior_weight_trans: 0.10
   seed_prior_weight_rot: 0.05
 
+
 # 【改进】：显存管理参数
 MemoryManagement:
   # 每次子图切分后强制释放显存缓存
@@ -91,8 +92,9 @@ LoopClosure:
   max_loop_delta_rotation_deg: 60.0
   icp_fitness_threshold: 0.40
 
-  adjacent_icp_fitness_threshold: 0.45
-  adjacent_icp_rmse_threshold: 0.03
+  adjacent_icp_fitness_threshold: 0.35
+  adjacent_icp_rmse_threshold: 0.05
+  adjacent_confidence_scale: 1.0        # Scale for confidence in edge weighting
   max_adjacent_delta_translation: 0.25
   max_adjacent_delta_rotation_deg: 12.0
   default_odom_info_scale: 120.0
@@ -103,7 +105,12 @@ LoopClosure:
 
   pgo_edge_prune_thres: 0.25
   min_interval: 2
-  voxel_size: 0.05
+  voxel_size: 0.025
+
+  adjacent_edge_weight: 0.35
+  adjacent_info_min_scale: 0.5
+  adjacent_info_max_scale: 8.0
+  feature_keep_ratio: 0.30
 
 ## 3DGS default parameters
 opt_params:

@@ -118,6 +118,11 @@ LoopClosure:
   min_interval: 3
   voxel_size: 0.05
 
+  adjacent_edge_weight: 0.25
+  adjacent_info_min_scale: 0.5
+  adjacent_info_max_scale: 8.0
+  feature_keep_ratio: 0.30
+
 opt_params:
   iterations: 30000
   position_lr_init: 0.00016
