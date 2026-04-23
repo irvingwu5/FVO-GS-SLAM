@@ -120,63 +120,111 @@ class GaussianModel:
         cam = cam_info
         image_ab = (torch.exp(cam.exposure_a)) * cam.original_image + cam.exposure_b
         image_ab = torch.clamp(image_ab, 0.0, 1.0)
-        rgb_raw = (image_ab * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy()
-        # 【新增：读取消融开关】
+
+        rgb_raw = (
+            (image_ab * 255)
+            .byte()
+            .permute(1, 2, 0)
+            .contiguous()
+            .cpu()
+            .numpy()
+        )
+
         use_fft_mask = self.config.get("Ablation", {}).get("use_fft_mask", True)
         use_error_mask = self.config.get("Ablation", {}).get("use_error_mask", True)
+
+        # ==============================================================
+        # 统一准备 depth_raw
+        # ==============================================================
         if depthmap is not None:
-            rgb = o3d.geometry.Image(rgb_raw.astype(np.uint8))
-            depth = o3d.geometry.Image(depthmap.astype(np.float32))
+            depth_raw = np.asarray(depthmap, dtype=np.float32)
         else:
             depth_raw = cam.depth
             if depth_raw is None:
-                depth_raw = np.empty((cam.image_height, cam.image_width))
+                depth_raw = np.empty((cam.image_height, cam.image_width), dtype=np.float32)
+            else:
+                depth_raw = np.asarray(depth_raw, dtype=np.float32)
 
             if self.config["Dataset"]["sensor_type"] == "monocular":
                 depth_raw = (
-                    np.ones_like(depth_raw)
-                    + (np.random.randn(depth_raw.shape[0], depth_raw.shape[1]) - 0.5)
-                    * 0.05
-                ) * scale
+                                    np.ones_like(depth_raw)
+                                    + (np.random.randn(depth_raw.shape[0], depth_raw.shape[1]) - 0.5) * 0.05
+                            ) * scale
 
-            # ==============================================================
-            # 【掩膜融合机制初始化】默认所有深度像素都有效
-            # ==============================================================
-            # ==============================================================
-            # 【机制 1：FFT 掩膜密度控制】(力量 B：控制高频密、低频稀)
-            H, W = depth_raw.shape
-            # 默认掩膜全 True（即不进行任何过滤采样）
+        if depth_raw.ndim == 3:
+            depth_raw = np.squeeze(depth_raw, axis=0)
+
+        depth_raw = depth_raw.copy()
+        H, W = depth_raw.shape
+
+        has_observed_depth = (
+                depthmap is not None
+                or (
+                        self.config["Dataset"]["sensor_type"] != "monocular"
+                        and cam.depth is not None
+                )
+        )
+
+        if has_observed_depth:
+            valid_mask = depth_raw > 0.0
+        else:
             valid_mask = np.ones((H, W), dtype=bool)
 
-            # ==============================================================
-            # 【机制 1：FFT 频率掩膜应用】,
-            # ==============================================================
-            if use_fft_mask and hasattr(cam, 'freq_mask'):
-                freq_mask_np = cam.freq_mask.cpu().numpy() #读取频率掩膜，True表示高频区域，False表示低频区域
-                downsample_low = 3
-                low_freq_grid = np.zeros((H, W), dtype=bool) #低频区域保留网格状稀疏像素
-                low_freq_grid[::downsample_low, ::downsample_low] = True
+        raw_valid_mask = valid_mask.copy()
 
-                # 高频全保，低频抽稀
-                freq_valid = freq_mask_np | low_freq_grid
-                valid_mask = valid_mask & freq_valid
+        # ==============================================================
+        # 机制 1：FFT 掩膜
+        # ==============================================================
+        if use_fft_mask and hasattr(cam, "freq_mask") and cam.freq_mask is not None:
+            freq_mask_np = cam.freq_mask.detach().cpu().numpy().astype(bool)
+            if freq_mask_np.ndim == 3:
+                freq_mask_np = np.squeeze(freq_mask_np, axis=0)
 
-            # ==============================================================
-            # 【机制 2：渲染误差掩膜应用】
-            # ==============================================================
-            if use_error_mask and hasattr(cam, 'error_mask'):
-                error_mask_np = cam.error_mask.cpu().numpy()
-                # 仅在误差大的地方采样
-                valid_mask = valid_mask & error_mask_np
+            downsample_low = 3
+            low_freq_grid = np.zeros((H, W), dtype=bool)
+            low_freq_grid[::downsample_low, ::downsample_low] = True
 
-            # 应用最终融合的掩膜
-            depth_raw[~valid_mask] = 0.0 #强行把其余低频像素深度设为0
-            rgb = o3d.geometry.Image(rgb_raw.astype(np.uint8))
-            depth = o3d.geometry.Image(depth_raw.astype(np.float32))
+            freq_valid = freq_mask_np | low_freq_grid
+            valid_mask = valid_mask & freq_valid
 
-        return self.create_pcd_from_image_and_depth(cam, rgb, depth, init)
+        # ==============================================================
+        # 机制 2：误差掩膜
+        # 初始化阶段不建议启用 error_mask；它本来就是“渲染误差补点”语义
+        # ==============================================================
+        if (
+                (not init)
+                and use_error_mask
+                and hasattr(cam, "error_mask")
+                and cam.error_mask is not None
+        ):
+            error_mask_np = cam.error_mask.detach().cpu().numpy().astype(bool)
+            if error_mask_np.ndim == 3:
+                error_mask_np = np.squeeze(error_mask_np, axis=0)
 
-    def create_pcd_from_image_and_depth(self, cam, rgb, depth, init=False):
+            valid_mask = valid_mask & error_mask_np
+
+        # ==============================================================
+        # 防止首帧 / seed 帧被筛得过空
+        # ==============================================================
+        if has_observed_depth:
+            min_keep = 64 if init else 16
+            if int(valid_mask.sum()) < min_keep:
+                valid_mask = raw_valid_mask
+
+        depth_raw[~valid_mask] = 0.0
+
+        rgb = o3d.geometry.Image(rgb_raw.astype(np.uint8))
+        depth = o3d.geometry.Image(depth_raw.astype(np.float32))
+
+        return self.create_pcd_from_image_and_depth(
+            cam,
+            rgb,
+            depth,
+            init=init,
+            depth_np=depth_raw,  # 关键：把“真正用于反投影的深度支持域”传下去
+        )
+
+    def create_pcd_from_image_and_depth(self, cam, rgb, depth, init=False, depth_np=None):
         low_freq_scale_multiplier = self.config["Training"].get("low_freq_scale_multiplier", 1.05)
         min_init_gaussian_scale = self.config["Training"].get("min_init_gaussian_scale", 0.002)
         max_init_gaussian_scale = self.config["Training"].get("max_init_gaussian_scale", 0.06)
@@ -185,10 +233,23 @@ class GaussianModel:
             downsample_factor = self.config["Dataset"]["pcd_downsample_init"]
         else:
             downsample_factor = self.config["Dataset"]["pcd_downsample"]
-        point_size = self.config["Dataset"]["point_size"] #point_size->dist2(每个点到最近邻距离平方)->log(sqrt(dist2))->scales
+
+        point_size = self.config["Dataset"]["point_size"]
+
+        if depth_np is None:
+            depth_np = np.asarray(depth, dtype=np.float32)
+        else:
+            depth_np = np.asarray(depth_np, dtype=np.float32)
+
+        if depth_np.ndim == 3:
+            depth_np = np.squeeze(depth_np, axis=0)
+
         if "adaptive_pointsize" in self.config["Dataset"]:
             if self.config["Dataset"]["adaptive_pointsize"]:
-                point_size = min(0.05, point_size * np.median(depth)) #按场景尺度把初始像素/单位大小转成与深度相匹配的实际尺度（深度通常以米为单位），这样远处场景会产生更大的投影半径，近处则更小。
+                valid_depth_vals = depth_np[depth_np > 0]
+                if valid_depth_vals.size > 0:
+                    point_size = min(0.05, point_size * np.median(valid_depth_vals))
+
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
             rgb,
             depth,
@@ -197,8 +258,7 @@ class GaussianModel:
             convert_rgb_to_intensity=False,
         )
 
-        W2C = cam.T.cpu().numpy() #这里的cam.T是estimated的w2c
-
+        W2C = cam.T.cpu().numpy()
         pcd_tmp = o3d.geometry.PointCloud.create_from_rgbd_image(
             rgbd,
             o3d.camera.PinholeCameraIntrinsic(
@@ -209,109 +269,140 @@ class GaussianModel:
                 cam.cx,
                 cam.cy,
             ),
-            extrinsic=W2C, #传入相机的外参矩阵world2camera
+            extrinsic=W2C,
             project_valid_depth_only=True,
-        ) #rgb+depth通过内参pinhole反投影得到相机坐标系下点云，为了将这些点放到真实世界下，open3d这里的函数内部做了一次变换，将这些点从相机坐标系下转到世界坐标系下，标准接口规定传入相机外参矩阵，函数内部会进行求逆
-        #这里的核心是将相机坐标系下的法向量 (normal_raw) 转换到世界坐标系 (normal_global)，以便与点云 (_xyz) 在同一坐标系下。
-        if cam.normal_raw is not None: #把相机坐标系下的法线变换到全局（世界）坐标系并赋给点云。
-            valid_normal = cam.normal_raw[cam.depth > 0]
-            valid_normal[np.abs(valid_normal) < 1e-9] = 1e-9
-            normal_global = (
-                    cam.T[0:3, 0:3].cpu().numpy().T @ valid_normal.transpose()
-            ).transpose() #将法线从相机坐标系旋转到世界坐标系下，纯旋转为刚体变换，求逆等于转置、平移对法线无影响
-            pcd_tmp.normals = o3d.utility.Vector3dVector(
-                normal_global.astype(np.float32)
+        )
+
+        if len(pcd_tmp.points) == 0:
+            raise RuntimeError(
+                "[create_pcd_from_image_and_depth] 0 points were generated. "
+                "Current depth mask is too aggressive."
             )
 
+        # ==============================================================
+        # 关键修复：
+        # 法向必须按“真正送进 RGBD 反投影的 depth_np”取，而不是 cam.depth
+        # ==============================================================
+        normals_assigned = False
+        if cam.normal_raw is not None:
+            depth_valid_mask = depth_np > 0
+            valid_normal = cam.normal_raw[depth_valid_mask]
+
+            if valid_normal.shape[0] == len(pcd_tmp.points) and valid_normal.shape[0] > 0:
+                valid_normal = valid_normal.copy()
+                valid_normal[np.abs(valid_normal) < 1e-9] = 1e-9
+
+                normal_global = (
+                        cam.T[0:3, 0:3].cpu().numpy().T @ valid_normal.transpose()
+                ).transpose()
+
+                pcd_tmp.normals = o3d.utility.Vector3dVector(
+                    normal_global.astype(np.float32)
+                )
+                normals_assigned = True
+
+        # 如果法向因为掩膜/长度不一致没法安全赋值，就退回 Open3D 估法向
+        if not normals_assigned:
+            pcd_tmp.estimate_normals(
+                search_param=o3d.geometry.KDTreeSearchParamKNN(knn=20)
+            )
+            pcd_tmp.normalize_normals()
+
         pcd_tmp = pcd_tmp.random_down_sample(1.0 / downsample_factor)
+
         new_xyz = np.asarray(pcd_tmp.points)
         new_rgb = np.asarray(pcd_tmp.colors)
-        # ==============================================================
-        # 【新增机制 2】：反投影 3D 点获取频率属性，动态调整 2DGS 初始尺度
-        # ==============================================================
-        # 【新增：读取开关】
+        normals_np = np.asarray(pcd_tmp.normals)
+
+        if new_xyz.shape[0] == 0:
+            raise RuntimeError(
+                "[create_pcd_from_image_and_depth] 0 points remain after downsampling."
+            )
+
         use_fft_mask = self.config.get("Ablation", {}).get("use_fft_mask", True)
         is_high_freq = np.ones(new_xyz.shape[0], dtype=bool)
-        # ==============================================================
-        # 【修改：仅在开关开启且有数据时，才根据频率查表】反投影到像素的 3D 点，是否属于高频区域，从而决定是否保留或更密集地采样这些点。
-        # ==============================================================
-        if use_fft_mask and hasattr(cam, 'freq_mask'):
-            freq_mask_np = cam.freq_mask.cpu().numpy()
+
+        if use_fft_mask and hasattr(cam, "freq_mask") and cam.freq_mask is not None:
+            freq_mask_np = cam.freq_mask.detach().cpu().numpy().astype(bool)
+            if freq_mask_np.ndim == 3:
+                freq_mask_np = np.squeeze(freq_mask_np, axis=0)
+
             W2C = cam.T.cpu().numpy()
             H, W = cam.image_height, cam.image_width
 
-            # (反投影查表逻辑...)
-            pts_in_cam = (W2C[:3, :3] @ new_xyz.T).T + W2C[:3, 3] #pts_cam = R * X_world + t，由于从open3d得到的点云已经是世界坐标系下的，所以这里直接用相机外参矩阵的旋转部分乘以点云位置，再加上平移部分，得到相机坐标系下的点位置
-            u = np.round((pts_in_cam[:, 0] * cam.fx / pts_in_cam[:, 2]) + cam.cx).astype(int)
-            v = np.round((pts_in_cam[:, 1] * cam.fy / pts_in_cam[:, 2]) + cam.cy).astype(int)
+            pts_in_cam = (W2C[:3, :3] @ new_xyz.T).T + W2C[:3, 3]
+            z = np.clip(pts_in_cam[:, 2], 1e-6, None)
+
+            u = np.round((pts_in_cam[:, 0] * cam.fx / z) + cam.cx).astype(int)
+            v = np.round((pts_in_cam[:, 1] * cam.fy / z) + cam.cy).astype(int)
+
             u = np.clip(u, 0, W - 1)
             v = np.clip(v, 0, H - 1)
+
             is_high_freq = freq_mask_np[v, u]
 
         pcd = BasicPointCloud(
-            points=new_xyz, colors=new_rgb, normals=np.zeros((new_xyz.shape[0], 3))
+            points=new_xyz,
+            colors=new_rgb,
+            normals=np.zeros((new_xyz.shape[0], 3)),
         )
+
         self.ply_input = pcd
 
-        fused_point_cloud = torch.from_numpy(np.asarray(pcd.points)).float().cuda() # 将点云转为tensor并送入GPU
-        fused_color = RGB2SH(torch.from_numpy(np.asarray(pcd.colors)).float().cuda()) # 将点云的RGB颜色转换为球谐系数
+        fused_point_cloud = torch.from_numpy(np.asarray(pcd.points)).float().cuda()
+        fused_color = RGB2SH(torch.from_numpy(np.asarray(pcd.colors)).float().cuda())
+
         features = (
             torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2))
             .float()
             .cuda()
-        )# 创建一个全零的三维张量，用于存储球谐系数特征。张量的形状为 (点云颜色数量, 3, (最大球谐函数阶数 + 1) ** 2)
-        features[:, :3, 0] = fused_color # 将点云的 RGB 颜色值赋值给 features 张量的第一个球谐系数，将 features 张量的第一个维度的所有元素，第二个维度的前三个元素，最后一个维度的所有元素设置为 0.0
-        features[:, 3:, 1:] = 0.0 # 将 features 张量的第一个维度的所有元素:，第二个维度的第三个元素之后3:的所有元素，第三个维度的第二个元素1:之后的所有元素设置为 0.0
-        # 调用 distCUDA2 函数计算点之间的距离平方。torch.clamp_min 函数确保距离的最小值为 0.0000001，避免出现零距离
-        dist2 = (
-            torch.clamp_min(
-                distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()),
-                0.0000001,
-            )
-            * point_size
         )
-        # 你的 2DGS 原始尺度
+        features[:, :3, 0] = fused_color
+        features[:, 3:, 1:] = 0.0
+
+        dist2 = (
+                torch.clamp_min(
+                    distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()),
+                    1e-7,
+                )
+                * point_size
+        )
+
         base_scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 2)
 
-        # ==============================================================
-        # 根据频率属性分配缩放倍率
-        # ==============================================================
         is_high_freq_tensor = torch.from_numpy(is_high_freq).bool().cuda()
         scale_multiplier = torch.ones(new_xyz.shape[0], device="cuda")
-
-        # 对低频区域（例如白墙）的点进行尺度放大，倍率设为 2.5 (可在此处微调 2.0~3.0)
-        # 这能让少量稀疏的 2D 盘覆盖住大面积空白，且配合法线 FDN 约束变得极度平滑
         scale_multiplier[~is_high_freq_tensor] = low_freq_scale_multiplier
 
-        # 因为 base_scales 在对数域，依据对数乘法原理：log(A * B) = log(A) + log(B)
         scales = base_scales + torch.log(scale_multiplier.unsqueeze(-1))
-        # 直接在初始化阶段做尺度硬裁剪，避免近景大幕布
         scales = torch.clamp(
             scales,
             min=np.log(min_init_gaussian_scale),
             max=np.log(max_init_gaussian_scale),
         )
-        # ==============================================================
-        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda") # 存储每个点的四元数表示
-        rots[:, 0] = 1 # 将每个四元数的第一个元素设置为 1，其他元素保持为 0。这相当于将所有四元数初始化为单位四元数 [1, 0, 0, 0]，表示没有旋转
-        #rots = torch.rand((fused_point_cloud.shape[0], 4), device="cuda") # 2dgs原代码随机初始化四元数
-        #normals_tmp 是目标法向量 $n$。函数 find_orthonormal_vectors_batch 会通过数学方法（通常是取与非共线向量的叉积）找到两个向量 $u_1, u_2$，使得 $u_1 \perp u_2 \perp n$，构成一个局部正交坐标系（切空间）。
-        normals_tmp = torch.from_numpy(np.asarray(pcd_tmp.normals)).float()
-        u1, u2 = find_orthonormal_vectors_batch(normals_tmp) #2D 高斯被定义为局部切平面上的圆盘（XY 平面），其局部 Z 轴对应于表面的法向量。为了将这个圆盘旋转到正确的朝向，代码需要构建一个旋转矩阵。
-        #将这三个轴组装成旋转矩阵，并转换为四元数存储
-        # 构建旋转矩阵 R = [u1, u2, n]
-        # 第1列是局部X，第2列是局部Y，第3列是局部Z（即法向量）
-        R = torch.stack([u1, u2, normals_tmp], dim=2) # (N,3,3)
-        rots = transforms.matrix_to_quaternion(R).cuda() # 将旋转矩阵转换为四元数表示(N,4)
 
-        # 生成的张量的每个元素都为0.1经过逆sigmoid变换得到真实不透明度 [0,1]->inv_sig->[-inf,inf]
+        # ==============================================================
+        # 再加一层保护：即便 normals 为空，也保证 rots 和 xyz 长度一致
+        # ==============================================================
+        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        rots[:, 0] = 1.0
+
+        if normals_np.shape[0] == fused_point_cloud.shape[0] and normals_np.shape[0] > 0:
+            normals_tmp = torch.from_numpy(normals_np).float()
+            u1, u2 = find_orthonormal_vectors_batch(normals_tmp)
+            R = torch.stack([u1, u2, normals_tmp], dim=2)
+            rots = transforms.matrix_to_quaternion(R).cuda()
+
         opacities = inverse_sigmoid(
-            0.1
-            * torch.ones(
-                (fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"
-            )
+            0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda")
         )
-        #(N,3)、(N,3,1)、(N,2)、(N,4)、(N,1)
+
+        N = fused_point_cloud.shape[0]
+        assert features.shape[0] == N
+        assert scales.shape[0] == N
+        assert rots.shape[0] == N
+        assert opacities.shape[0] == N
+
         return fused_point_cloud, features, scales, rots, opacities
 
     def init_lr(self, spatial_lr_scale):
