@@ -488,9 +488,14 @@ class BackEnd(mp.Process):
                     self.config, image, depth, viewpoint
                 )
                 #新子图 seed 在初始化阶段就不是完全自由漂，而是“默认贴近局部原点”。
-                seed_prior_loss = self.compute_seed_pose_prior_loss(viewpoint)
-                if seed_prior_loss is not None:
-                    loss_view = loss_view + seed_prior_loss
+                if getattr(viewpoint, "is_submap_seed", False) and getattr(viewpoint, "seed_relax_steps_left", 0) > 0:
+                    w_t = float(self.config.get("Submap", {}).get("seed_prior_weight_trans", 0.02))
+                    w_r = float(self.config.get("Submap", {}).get("seed_prior_weight_rot", 0.01))
+
+                    # 让 seed 只做“小范围回弹”，而不是完全自由漂
+                    loss_view = loss_view \
+                                + w_t * torch.norm(viewpoint.cam_trans_delta, p=2) \
+                                + w_r * torch.norm(viewpoint.cam_rot_delta, p=2)
 
                 if self.use_fdn and viewpoint.normal is not None:
                     rend_normal = render_pkg["rend_normal"]
@@ -662,7 +667,12 @@ class BackEnd(mp.Process):
                     self.gaussians.optimizer.step()
                     self.gaussians.optimizer.zero_grad(set_to_none=True)
                     self.gaussians.update_learning_rate(self.iteration_count)
-
+            # 【核心】检查并减少 seed_relax_steps_left
+            for viewpoint in keyframes_opt:
+                if getattr(viewpoint, "is_submap_seed", False) and getattr(viewpoint, "seed_relax_steps_left",0) > 0:
+                    viewpoint.seed_relax_steps_left -= 1
+                    if viewpoint.seed_relax_steps_left <= 0:
+                        viewpoint.is_submap_seed = False
         return gaussian_split
 
     def finalize_submap_before_freeze(self):
@@ -887,6 +897,15 @@ class BackEnd(mp.Process):
                         init_iters = self.init_itr_num
 
                     self.initialize_map(cur_frame_idx, viewpoint, iters=init_iters)
+                    # initialize_map 完成后
+                    if self.true_independent_submap and self.current_submap_id > 0:
+                        viewpoint.is_submap_seed = True
+                        viewpoint.seed_relax_steps_left = self.config.get("Submap", {}).get("seed_relax_kf_count", 4)
+
+                        # 初始化阶段结束后，允许 seed 在后续 BA 中轻微优化
+                        viewpoint.fixed_pose = False
+                        viewpoint.cam_rot_delta.requires_grad_(True)
+                        viewpoint.cam_trans_delta.requires_grad_(True)
                     self.push_to_frontend("init")
                 # 接收前端发送的新关键帧，将其纳入后端优化体系
                 # 添加新关键帧 -> 扩展地图 (add_next_kf) -> 配置关键帧位姿优化器 -> 执行特定迭代次数的建图优化 (map)
@@ -918,20 +937,23 @@ class BackEnd(mp.Process):
                             Log("Performing initial BA for initialization")
                         else:
                             iter_per_kf = self.mapping_itr_num
+                    #新子图前若干关键帧阶段，除了最新几帧，还强制把 seed 一起优化
+                    seed_uid = self.current_window[-1]  # current_window 通常是最新在前，seed 在最后
+                    warmup_kf_count = self.config.get("Submap", {}).get("submap_warmup_kfs", 5)
+                    in_new_submap_warmup = len(self.current_window) <= warmup_kf_count
+
                     for cam_idx in range(len(self.current_window)):
                         viewpoint = self.viewpoints[current_window[cam_idx]]
+                        # 判断是否优化的条件
+                        should_opt = (cam_idx < frames_to_optimize)
 
-                        is_fixed_pose = getattr(viewpoint, "fixed_pose", False)
-                        is_seed_pose = getattr(viewpoint, "is_submap_seed", False)
+                        # 在新子图的暖启动阶段，强制优化 seed
+                        if in_new_submap_warmup and viewpoint.uid == seed_uid:
+                            should_opt = True
 
-                        if cam_idx < frames_to_optimize and ((not is_fixed_pose) or is_seed_pose):
+                        if should_opt and not getattr(viewpoint, "fixed_pose", False):
                             rot_lr = self.config["Training"]["lr"]["cam_rot_delta"] * 0.5
                             trans_lr = self.config["Training"]["lr"]["cam_trans_delta"] * 0.5
-
-                            # seed 帧允许优化，但学习率稍微小一点
-                            if is_seed_pose:
-                                rot_lr *= 0.25
-                                trans_lr *= 0.25
 
                             opt_params.append({
                                 "params": [viewpoint.cam_rot_delta],

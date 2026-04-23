@@ -25,7 +25,7 @@ Training:
   init_gaussian_extent: 30
   # Tracking and Mapping
   tracking_itr_num: 100
-  mapping_itr_num: 150
+  mapping_itr_num: 180
   gaussian_update_every: 150
   gaussian_update_offset: 50
   gaussian_th: 0.7
@@ -33,8 +33,8 @@ Training:
   gaussian_reset: 2001
   size_threshold: 20
   kf_interval: 5
-  window_size: 8
-  pose_window: 3
+  window_size: 10
+  pose_window: 5
   edge_threshold: 1.1
   rgb_boundary_threshold: 0.01
   alpha: 0.9
@@ -54,8 +54,8 @@ Training:
   max_init_gaussian_scale: 0.06
 
 Submap:
-  trans_thre: 1.50
-  rot_thre: 60.0
+  trans_thre: 1.80
+  rot_thre: 75.0
   # ========== 新增：真正独立子图模式 ==========
   true_independent_submap: True   # true=彻底清空旧地图，false=保留部分旧点（流式）
   # ===========================================
@@ -66,9 +66,9 @@ Submap:
   num_spatial_clusters: 10
   seed_init_iters: 700
   enable_cut_local_ba: true
-  cut_local_ba_iters: 40
-  cut_local_prune_iters: 8
-  cut_refine_iters: 20
+  cut_local_ba_iters: 80
+  cut_local_prune_iters: 0
+  cut_refine_iters: 40
   #微调子图第一帧而不是固定死
   seed_prior_weight_trans: 0.10
   seed_prior_weight_rot: 0.05
@@ -92,11 +92,11 @@ LoopClosure:
   max_loop_delta_rotation_deg: 60.0
   icp_fitness_threshold: 0.40
 
-  adjacent_icp_fitness_threshold: 0.35
-  adjacent_icp_rmse_threshold: 0.05
+  adjacent_icp_fitness_threshold: 0.55
+  adjacent_icp_rmse_threshold: 0.03
   adjacent_confidence_scale: 1.0        # Scale for confidence in edge weighting
-  max_adjacent_delta_translation: 0.25
-  max_adjacent_delta_rotation_deg: 12.0
+  max_adjacent_delta_translation: 0.10
+  max_adjacent_delta_rotation_deg: 5.0
   default_odom_info_scale: 120.0
 
   enable_chain_pgo_without_loop: true
@@ -105,7 +105,7 @@ LoopClosure:
 
   pgo_edge_prune_thres: 0.25
   min_interval: 2
-  voxel_size: 0.025
+  voxel_size: 0.02
 
   adjacent_edge_weight: 0.35
   adjacent_info_min_scale: 0.5
