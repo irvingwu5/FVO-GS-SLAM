@@ -54,9 +54,6 @@ class BackEnd(mp.Process):
         self.current_submap_id = 0
         # 【新增】：读取显存管理参数
         self.empty_cache_on_submap_cut = self.config.get("MemoryManagement", {}).get("empty_cache_on_submap_cut", True)
-        self.reuse_render_tensors = self.config.get("MemoryManagement", {}).get("reuse_render_tensors", True)
-        self.keyframe_window_size = self.config.get("MemoryManagement", {}).get("keyframe_window_size", 10)
-        self.gradient_accumulation_frames = self.config.get("MemoryManagement", {}).get("gradient_accumulation_frames",5)
         # ===== submap cut 前的局部收紧 =====
         self.enable_cut_local_ba = self.config.get("Submap", {}).get("enable_cut_local_ba", True)
         self.cut_local_ba_iters = self.config.get("Submap", {}).get("cut_local_ba_iters", 40)

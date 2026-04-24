@@ -67,6 +67,19 @@ Training:
 Submap:
   trans_thre: 1.5
   rot_thre: 60
+  #修改子图切图策略相关参数，增加了重叠度的判断，避免过早切图导致的地图碎片化和漂移
+  min_frames: 20            # 一个子图至少先跑这么多帧
+  min_kfs: 6                # 一个子图至少先积累这么多关键帧
+
+  recent_kfs: 3             # 用最近 3 个关键帧检查与旧子图的重叠
+  cut_overlap: 0.40         # 最近关键帧最大重叠低于它，才算“真的要离开旧子图”
+  cut_overlap_hard: 0.25    # 极低重叠，用于非关键帧情况下的强 novel 保护
+  cut_confirm_frames: 2     # 连续满足 2 次再切，防止单帧噪声误切
+  cancel_overlap: 0.65      # 如果重叠又回来了，就取消 pending cut
+
+  hard_trans_mult: 1.35     # 平移远超阈值时允许更快切图
+  hard_rot_mult: 1.20       # 旋转远超阈值时进入“强旋转模式”
+  rot_only_overlap_guard: 0.55  # 纯旋转切图时必须仍然要求 overlap 不高
   # ========== 新增：真正独立子图模式 ==========
   true_independent_submap: true   # true=彻底清空旧地图，false=保留部分旧点（流式）
   # ===========================================
@@ -88,24 +101,18 @@ Submap:
 MemoryManagement:
   # 每次子图切分后强制释放显存缓存
   empty_cache_on_submap_cut: true
-  # 渲染时的临时张量复用策略
-  reuse_render_tensors: true
-  # 关键帧窗口大小（影响显存占用）
-  keyframe_window_size: 10  # 推荐 5-15
-  # 梯度累积窗口（影响显存占用）
-  gradient_accumulation_frames: 5
 
 LoopClosure:
   # 【新增】：流式回环检测参数
-  streaming_mode: true           # 启用流式处理
-  max_search_range: 5            # 只与最近 5 个子图比较
   keep_recent_submaps: 3         # 显存中只保留最近 3 个子图
-  # 【现有参数】
-  icp_fitness_threshold: 0.60
+  #===============================
   max_loop_delta_translation: 0.80
   max_loop_delta_rotation_deg: 45.0
+  icp_fitness_threshold: 0.60
+
   adjacent_icp_fitness_threshold: 0.45
   adjacent_icp_rmse_threshold: 0.03
+  adjacent_confidence_scale: 1.0
   max_adjacent_delta_translation: 0.25
   max_adjacent_delta_rotation_deg: 12.0
   default_odom_info_scale: 120.0
@@ -133,8 +140,8 @@ opt_params:
   opacity_lr: 0.05
   scaling_lr: 0.001
   rotation_lr: 0.001
-  percent_dense: 0.01 #0.01->0.03
-  lambda_sensor_normal: 0.001 #
+  percent_dense: 0.01
+  lambda_sensor_normal: 0.001
   lambda_dssim: 0.2
   densification_interval: 100
   opacity_reset_interval: 3000

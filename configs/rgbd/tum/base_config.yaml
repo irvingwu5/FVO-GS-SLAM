@@ -91,16 +91,12 @@ Submap:
 MemoryManagement:
   # 每次子图切分后强制释放显存缓存
   empty_cache_on_submap_cut: true
-  # 渲染时的临时张量复用策略
-  reuse_render_tensors: true
-  # 关键帧窗口大小（影响显存占用）
-  keyframe_window_size: 10  # 推荐 5-15
-  # 梯度累积窗口（影响显存占用）
-  gradient_accumulation_frames: 5
 
 
 LoopClosure:
-  max_search_range: 5 #限制参与位姿图优化（PGO）的最近子图数量，控制搜索范围、计算量和内存占用
+  # 【新增】：流式回环检测参数
+  keep_recent_submaps: 3         # 显存中只保留最近 3 个子图
+  #===============================
   max_loop_delta_translation: 1.5
   max_loop_delta_rotation_deg: 60.0
   icp_fitness_threshold: 0.40
