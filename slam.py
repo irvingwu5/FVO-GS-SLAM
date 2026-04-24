@@ -697,8 +697,8 @@ if __name__ == "__main__":
         Log("Following config will be overriden")
         Log("\tsave_results=True")
         config["Results"]["save_results"] = True
-        Log("\tuse_gui=False")
-        config["Results"]["use_gui"] = False
+        Log("\tuse_gui=True")
+        config["Results"]["use_gui"] = True
         Log("\teval_rendering=True")
         config["Results"]["eval_rendering"] = True
         Log("\tuse_wandb=False")

@@ -80,6 +80,11 @@ class FrontEnd(mp.Process):
         self.submap_start_frame_idx = 0
         self.submap_cut_pending = False
         self.submap_cut_pending_count = 0
+        # ===== true-independent + global-seed 模式下的更严格切图保护 =====
+        # 只有当当前视野已经明显脱离旧子图时，才允许真的切图并清空旧地图。
+        self.indep_cut_overlap_guard = self.config.get("Submap", {}).get("indep_cut_overlap_guard", 0.75)
+        self.indep_cut_hard_overlap_guard = self.config.get("Submap", {}).get("indep_cut_hard_overlap_guard", 0.60)
+        self.indep_cancel_overlap = self.config.get("Submap", {}).get("indep_cancel_overlap", 0.80)
         # ====================================
         self.fft_filter = None  # <--- 新增这行：频域滤波器实例
         # 【新增：读取消融实验开关，兼容旧版配置防止报错】
@@ -704,31 +709,64 @@ class FrontEnd(mp.Process):
             self.submap_cut_pending_count = 0
             return False, metrics
 
-        low_overlap = metrics["max_recent_overlap"] < self.submap_cut_overlap
-        hard_low_overlap = metrics["max_recent_overlap"] < self.submap_cut_overlap_hard
+        max_overlap = metrics["max_recent_overlap"]
+
+        # 默认 overlap 判据（兼容旧逻辑）
+        low_overlap = max_overlap < self.submap_cut_overlap
+        hard_low_overlap = max_overlap < self.submap_cut_overlap_hard
+        cancel_overlap = self.submap_cancel_overlap
+
+        # ==========================================================
+        # 关键修复：
+        # true-independent + global-seed 模式下，切图后 backend 会清空旧地图。
+        # 因此只有在“视野明显离开旧子图”时才允许切图。
+        # 不能再因为纯 translation 大就硬切。
+        # ==========================================================
+        strict_independent_mode = (
+                self.true_independent_submap
+                and self.use_global_seed_submap
+        )
+
+        if strict_independent_mode:
+            low_overlap = max_overlap < self.indep_cut_overlap_guard
+            hard_low_overlap = max_overlap < self.indep_cut_hard_overlap_guard
+            cancel_overlap = self.indep_cancel_overlap
 
         # 3) 不在普通 tracking 帧上硬切，除非 overlap 已经非常低
         if (not create_kf) and (not hard_low_overlap):
             return False, metrics
 
         # 4) 真正“非常离开旧子图”时，允许更快切
-        hard_translation = metrics["translation"] > (self.submap_trans_thre * self.submap_hard_trans_mult)
+        hard_translation = metrics["translation"] > (
+                self.submap_trans_thre * self.submap_hard_trans_mult
+        )
         hard_rotation = (
                 metrics["rotation_deg"] > (self.submap_rot_thre * self.submap_hard_rot_mult)
-                and metrics["max_recent_overlap"] < self.submap_rot_only_overlap_guard
+                and max_overlap < self.submap_rot_only_overlap_guard
         )
 
-        if create_kf and (hard_translation or (hard_rotation and low_overlap)):
-            self.submap_cut_pending = False
-            self.submap_cut_pending_count = 0
-            return True, metrics
+        # ----------------------------------------------------------
+        # 关键修复：
+        # true-independent 模式下，即使 hard_translation 成立，
+        # 只要 overlap 还很高，也绝不允许硬切。
+        # ----------------------------------------------------------
+        if strict_independent_mode:
+            if create_kf and hard_low_overlap and (hard_translation or hard_rotation):
+                self.submap_cut_pending = False
+                self.submap_cut_pending_count = 0
+                return True, metrics
+        else:
+            if create_kf and (hard_translation or (hard_rotation and low_overlap)):
+                self.submap_cut_pending = False
+                self.submap_cut_pending_count = 0
+                return True, metrics
 
         # 5) 连续确认，防抖
         if create_kf and low_overlap:
             self.submap_cut_pending = True
             self.submap_cut_pending_count += 1
         else:
-            if metrics["max_recent_overlap"] > self.submap_cancel_overlap:
+            if max_overlap > cancel_overlap:
                 self.submap_cut_pending = False
                 self.submap_cut_pending_count = 0
 
@@ -848,7 +886,7 @@ class FrontEnd(mp.Process):
             self.submap_start_frame_idx = cur_frame_idx
             self.submap_cut_pending = False
             self.submap_cut_pending_count = 0
-            self.is_first_frame_of_submap = False
+            self.is_first_frame_of_submap = True
 
             # ------------------------------------------------------------
             # 5) 用当前 seed 帧初始化新子图。
@@ -1110,6 +1148,7 @@ class FrontEnd(mp.Process):
                         monocular=self.monocular,
                         frame_to_submap=self.frame_to_submap if self.true_independent_submap else None,
                         submap_anchor_poses=self.submap_anchor_poses if self.true_independent_submap else None,
+                        cameras_already_global=True,
                     )
                 toc.record()
                 torch.cuda.synchronize()

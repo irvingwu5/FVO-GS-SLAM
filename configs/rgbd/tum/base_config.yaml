@@ -72,6 +72,9 @@ Submap:
   # ========== 新增：真正独立子图模式 ==========
   true_independent_submap: True   # true=彻底清空旧地图，false=保留部分旧点（流式）
   use_global_seed_submap: true
+  indep_cut_overlap_guard: 0.75
+  indep_cut_hard_overlap_guard: 0.60
+  indep_cancel_overlap: 0.80
   # ===========================================
   # 以下参数仅在 true_independent_submap: false 时生效
   use_critical_point_selection: true

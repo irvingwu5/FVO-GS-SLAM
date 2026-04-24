@@ -333,6 +333,35 @@ class BackEnd(mp.Process):
             submap_keyframe_poses[int(kf_idx)] = c2w.astype(np.float64)
 
         return submap_keyframe_poses
+
+    def prepare_seed_viewpoint_for_backend_init(self, viewpoint):
+        """
+        后端统一接管 seed 视点状态，避免依赖前端传来的临时字段。
+        global-seed 模式下，seed 的 viewpoint.T 已经是全局 w2c，
+        这里要做的是：固定它、清零 pose delta、设置 pose prior。
+        """
+        viewpoint.is_submap_seed = True
+        viewpoint.fixed_pose = True
+
+        viewpoint.reset_pose_deltas()
+        viewpoint.cam_rot_delta.requires_grad_(False)
+        viewpoint.cam_trans_delta.requires_grad_(False)
+
+        # 关键：seed_pose_prior 必须等于当前 seed 自己的位姿，
+        # 不能是单位阵，也不能缺失。
+        viewpoint.seed_pose_prior = viewpoint.T.detach().clone()
+
+        # 如果后面你还想做“弱松弛”，就保留这两个权重；
+        # 当前这版 permanent fixed 下，即使存在也不会真的优化 pose。
+        viewpoint.seed_prior_weight_trans = self.config.get("Submap", {}).get(
+            "seed_prior_weight_trans", 0.10
+        )
+        viewpoint.seed_prior_weight_rot = self.config.get("Submap", {}).get(
+            "seed_prior_weight_rot", 0.05
+        )
+
+        # 当前你想要的是：seed 永久固定，不做后续放松
+        viewpoint.seed_relax_steps_left = 0
     '''
     ------------------初始建图模块(Initialization)------------------
     作用: 处理系统启动时的第一帧数据。
@@ -669,9 +698,9 @@ class BackEnd(mp.Process):
                         viewpoint = viewpoint_stack[cam_idx]
 
                         is_fixed_pose = getattr(viewpoint, "fixed_pose", False)
-                        is_seed_pose = getattr(viewpoint, "is_submap_seed", False)
 
-                        if is_fixed_pose and (not is_seed_pose):
+                        # global-seed 模式下，所有 fixed_pose 的相机都不允许再更新
+                        if is_fixed_pose:
                             viewpoint.reset_pose_deltas()
                             continue
 
@@ -779,9 +808,18 @@ class BackEnd(mp.Process):
     def push_to_frontend(self, tag=None):
         self.last_sent = 0
         keyframes = []
-        for kf_idx in self.current_window:
-            kf = self.viewpoints[kf_idx]
-            keyframes.append((kf_idx, kf.T.clone()))
+
+        if len(self.current_window) > 0:
+            for kf_idx in self.current_window:
+                if kf_idx in self.viewpoints:
+                    kf = self.viewpoints[kf_idx]
+                    keyframes.append((kf_idx, kf.T.clone()))
+        else:
+            # 兜底：如果窗口还没建好，但至少有一个 viewpoint，也回传最新 seed
+            if len(self.viewpoints) > 0:
+                latest_kf_idx = sorted(self.viewpoints.keys())[-1]
+                kf = self.viewpoints[latest_kf_idx]
+                keyframes.append((latest_kf_idx, kf.T.clone()))
         if tag is None:
             tag = "sync_backend"
         msg = [tag, clone_obj(self.gaussians), self.occ_aware_visibility, keyframes]
@@ -890,12 +928,21 @@ class BackEnd(mp.Process):
                     cur_frame_idx = data[1]
                     viewpoint = data[2]
                     depth_map = data[3]
-                    # 第 0 个子图冷启动时，记录全局 seed 位姿。
-                    # 后续子图的 seed 位姿会在 new_submap 消息里传入。
+
+                    # 当前收到的 viewpoint.T 就是 seed 的全局 w2c
+                    seed_global_c2w_from_viewpoint = (
+                        torch.linalg.inv(viewpoint.T.detach()).cpu().numpy().astype(np.float64)
+                    )
+
+                    # 冷启动时，用当前 viewpoint 直接写入
                     if self.current_submap_id == 0 and len(self.viewpoints) == 0:
-                        self.current_submap_seed_global_c2w = (
-                            torch.linalg.inv(viewpoint.T.detach()).cpu().numpy().astype(np.float64)
-                        )
+                        self.current_submap_seed_global_c2w = seed_global_c2w_from_viewpoint.copy()
+
+                    # true-independent 模式下，new_submap 分支应该已经写过一次；
+                    # 这里再做一次兜底，保证 backend 内部状态一定正确。
+                    elif self.true_independent_submap:
+                        self.current_submap_seed_global_c2w = seed_global_c2w_from_viewpoint.copy()
+
                     if self.true_independent_submap and len(self.gaussians._xyz) == 0 and self.current_submap_id > 0:
                         # 子图切换后的初始化：状态已在 new_submap 中清空，无需再 reset
                         Log("Initializing new submap from seed frame (state already clean)")
@@ -910,9 +957,14 @@ class BackEnd(mp.Process):
                         Log("Resetting the system")
                         self.reset()
 
+                    # 后端统一接管 seed 视点状态
+                    self.prepare_seed_viewpoint_for_backend_init(viewpoint)
+
                     self.viewpoints[cur_frame_idx] = viewpoint
-                    if getattr(viewpoint, "fixed_pose", False):
-                        viewpoint.reset_pose_deltas()
+
+                    # 关键：新子图初始化后，backend 自己的窗口必须立刻建立
+                    # 否则 push_to_frontend("init") 时 keyframes 为空，后续状态也不一致。
+                    self.current_window = [cur_frame_idx]
                     self.add_next_kf(
                         cur_frame_idx, viewpoint, depth_map=depth_map, init=True
                     )
@@ -924,14 +976,7 @@ class BackEnd(mp.Process):
                         init_iters = self.init_itr_num
 
                     self.initialize_map(cur_frame_idx, viewpoint, iters=init_iters)
-                    # initialize_map 完成后
-                    if self.true_independent_submap and self.current_submap_id > 0:
-                        viewpoint.is_submap_seed = True
-                        viewpoint.seed_relax_steps_left = 0  # 先彻底关闭“后续放松”
-                        viewpoint.fixed_pose = True  # 关键：seed 永久固定
-                        viewpoint.reset_pose_deltas()
-                        viewpoint.cam_rot_delta.requires_grad_(False)
-                        viewpoint.cam_trans_delta.requires_grad_(False)
+
                     self.push_to_frontend("init")
                 # 接收前端发送的新关键帧，将其纳入后端优化体系
                 # 添加新关键帧 -> 扩展地图 (add_next_kf) -> 配置关键帧位姿优化器 -> 执行特定迭代次数的建图优化 (map)
@@ -1024,6 +1069,8 @@ class BackEnd(mp.Process):
                         self.current_submap_seed_global_c2w, dtype=np.float64
                     )
                     self.current_submap_id = completed_submap_id + 1
+                    # 关键修复：true-independent 和流式两种模式都要更新
+                    self.current_submap_seed_global_c2w = new_seed_global_c2w.copy()
                     Log(f"==> Backend received new_submap signal. Freezing submap {completed_submap_id}...")
                     # ===== 新增：先对子图边界做一次局部收紧，再冻结 =====
                     self.finalize_submap_before_freeze()
@@ -1139,8 +1186,7 @@ class BackEnd(mp.Process):
 
                         if self.empty_cache_on_submap_cut:
                             torch.cuda.empty_cache()
-                        # 后续 init 接收到的新子图 seed，就属于这个全局 seed
-                        self.current_submap_seed_global_c2w = new_seed_global_c2w
+
                         self.push_to_frontend("new_submap")
         # =======================================================
         # 【核心修复】：使用 get_nowait 替代阻塞的 get()
