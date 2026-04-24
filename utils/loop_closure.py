@@ -247,14 +247,28 @@ class LoopClosureProcess(mp.Process):
         self.max_adjacent_delta_translation = self.config.get("LoopClosure", {}).get("max_adjacent_delta_translation", 0.25)
         self.max_adjacent_delta_rotation_deg = self.config.get("LoopClosure", {}).get("max_adjacent_delta_rotation_deg", 12.0)
         self.default_odom_info_scale = self.config.get("LoopClosure", {}).get("default_odom_info_scale", 120.0)
+        # ========== Global-seed submap mode ==========
+        # 如果前端切图时不再把 seed 帧重置为单位阵，而是继承 tracking 后的全局 c2w，
+        # 那么每个子图 ckpt 中的 2DGS 点云已经处在同一个全局坐标系。
+        # 此时 loop_closure 不能再按“局部子图 + relative_pose 串 anchor”的旧逻辑做 ChainPGO。
+        self.use_global_seed_submap = self.config.get("Submap", {}).get("use_global_seed_submap", False)
+        # global seed 模式下，没有真实非相邻闭环时，默认禁止 ChainPGO。
+        default_enable_chain_pgo = False if self.use_global_seed_submap else True
+        self.enable_chain_pgo_without_loop = self.config.get("LoopClosure", {}).get("enable_chain_pgo_without_loop", default_enable_chain_pgo)
+        # global seed 模式下，没有 refined adjacent edge 时，只给极弱 odom 稳定项。
+        self.global_seed_default_odom_info_scale = self.config.get("LoopClosure", {}).get("global_seed_default_odom_info_scale", 1e-3)
+
         # 新增：相邻边降权参数
         self.adjacent_edge_weight = self.config.get("LoopClosure", {}).get("adjacent_edge_weight", 0.25)
         self.adjacent_info_min_scale = self.config.get("LoopClosure", {}).get("adjacent_info_min_scale", 0.5)
         self.adjacent_info_max_scale = self.config.get("LoopClosure", {}).get("adjacent_info_max_scale", 8.0)
 
-        # ===== 每次切图后的局部链式 PGO =====local ba in submap，在每次切图后，至少对最近 N 个子图做一次局部链式 PGO
-        self.enable_chain_pgo_without_loop = self.config.get("LoopClosure", {}).get("enable_chain_pgo_without_loop", True)
         self.chain_pgo_window = self.config.get("LoopClosure", {}).get("chain_pgo_window", 4)
+
+        Log(
+            f"[LoopClosure] use_global_seed_submap={self.use_global_seed_submap}, "
+            f"enable_chain_pgo_without_loop={self.enable_chain_pgo_without_loop}"
+        )
 
         # 回环边用feature cloud 新增：feature cloud 保留比例（建议保留 top 30% 曲率点）
         self.feature_keep_ratio = self.config.get("LoopClosure", {}).get("feature_keep_ratio", 0.30)
@@ -558,17 +572,31 @@ class LoopClosureProcess(mp.Process):
 
     def _build_open_loop_anchors(self, all_submap_ids):
         """
-        anchors[sid]: 子图 sid 的开环全局位姿（local -> global）
+        anchors[sid]: 子图 sid 的 open-loop anchor。
+
+        旧模式：
+            子图内部是局部坐标，需要用 relative_pose 串 anchor。
+
+        global seed 模式：
+            子图内部的高斯点和关键帧位姿已经是全局坐标，
+            所以每个子图的 open-loop anchor 都应该是 I。
         """
         anchors = {}
+
         if len(all_submap_ids) == 0:
             return anchors
 
-        anchors[all_submap_ids[0]] = np.eye(4)
+        if self.use_global_seed_submap:
+            for sid in all_submap_ids:
+                anchors[sid] = np.eye(4, dtype=np.float64)
+            return anchors
+
+        anchors[all_submap_ids[0]] = np.eye(4, dtype=np.float64)
 
         for i in range(1, len(all_submap_ids)):
             prev_sid = all_submap_ids[i - 1]
             curr_sid = all_submap_ids[i]
+
             rel_prev_from_curr = self._load_prev_to_curr_transition(prev_sid, curr_sid)
             anchors[curr_sid] = anchors[prev_sid] @ rel_prev_from_curr
 
@@ -604,59 +632,103 @@ class LoopClosureProcess(mp.Process):
         trace_val = np.clip((np.trace(R) - 1.0) * 0.5, -1.0, 1.0)
         return np.degrees(np.arccos(trace_val))
 
+    def _clear_refined_adjacent_edge(self, curr_sid):
+        """
+        相邻 ICP 失败时，必须清掉 curr.ckpt 中可能残留的 refined edge。
+        否则后续 PGO 可能继续读取旧的 prev_submap_tsfm_refined，
+        造成位姿链路被错误边污染。
+        """
+        ckpt_path = self.submap_records.get(curr_sid)
+        if ckpt_path is None or not os.path.exists(ckpt_path):
+            return
+
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+
+        dirty = False
+        for key in [
+            "prev_submap_tsfm_refined",
+            "prev_submap_info_matrix",
+            "prev_submap_metrics",
+        ]:
+            if key in ckpt:
+                del ckpt[key]
+                dirty = True
+
+        if dirty:
+            torch.save(ckpt, ckpt_path)
+            Log(f"[AdjacentOdom] 已清理子图 {curr_sid} 的无效 refined adjacent edge")
+
     def _load_prev_to_curr_transition(self, prev_sid, curr_sid):
         """
-        返回 T_prev<-curr
+        返回 curr -> prev 的相邻边变换。
 
-        优先级：
-        1) curr.ckpt 中的 prev_submap_tsfm_refined
-        2) prev.ckpt 中的 next_submap_relative_pose
-        3) 兼容旧字段 prev.ckpt["relative_pose"]
+        旧局部子图模式：
+            可以从 relative_pose 串接子图 anchor。
+
+        global seed 模式：
+            2DGS 点云已经在全局坐标中；
+            如果没有 ICP refined edge，就返回 I。
         """
-        # 1) 优先读取 curr.ckpt 中“curr -> prev”的精炼结果
+
         curr_ckpt_path = self.submap_records.get(curr_sid)
+
+        # 1) 优先读取 curr.ckpt 中 refine 后的 curr -> prev
         if curr_ckpt_path is not None and os.path.exists(curr_ckpt_path):
             curr_ckpt = torch.load(curr_ckpt_path, map_location="cpu")
+
             if "prev_submap_tsfm_refined" in curr_ckpt:
                 rel = curr_ckpt["prev_submap_tsfm_refined"]
                 if isinstance(rel, torch.Tensor):
                     rel = rel.numpy()
                 return np.array(rel, dtype=np.float64)
 
-        # 2) 读取 prev.ckpt 中“next submap pose in prev frame”
+        # 2) global seed 模式下，没有 refined edge 就返回 I
+        if self.use_global_seed_submap:
+            return np.eye(4, dtype=np.float64)
+
+        # 3) 旧模式兼容：读取 prev.ckpt 中的 relative pose
         prev_ckpt_path = self.submap_records.get(prev_sid)
         if prev_ckpt_path is not None and os.path.exists(prev_ckpt_path):
             prev_ckpt = torch.load(prev_ckpt_path, map_location="cpu")
+
             rel = prev_ckpt.get(
                 "next_submap_relative_pose",
-                prev_ckpt.get("relative_pose", np.eye(4))
+                prev_ckpt.get("relative_pose", np.eye(4, dtype=np.float64)),
             )
+
             if isinstance(rel, torch.Tensor):
                 rel = rel.numpy()
+
             return np.array(rel, dtype=np.float64)
 
-        return np.eye(4)
+        return np.eye(4, dtype=np.float64)
 
     def _load_prev_to_curr_information(self, prev_sid, curr_sid):
         """
-        返回 curr -> prev 这条相邻边对应的 6x6 information matrix。
-        优先读 curr.ckpt 里 refine 后保存的信息矩阵；
-        如果没有，就退化成固定权重。
-        """
-        default_info = np.identity(6, dtype=np.float64) * (
-                float(self.default_odom_info_scale) * float(self.adjacent_edge_weight)
-        )
+        返回 curr -> prev 这条相邻边的信息矩阵。
 
+        global seed 模式下：
+            如果相邻 ICP 没成功，就只给极弱默认边，不能让失败边强约束 PGO。
+        """
         curr_ckpt_path = self.submap_records.get(curr_sid)
+
         if curr_ckpt_path is not None and os.path.exists(curr_ckpt_path):
             curr_ckpt = torch.load(curr_ckpt_path, map_location="cpu")
             info = curr_ckpt.get("prev_submap_info_matrix", None)
+
             if info is not None:
                 if isinstance(info, torch.Tensor):
                     info = info.numpy()
                 return np.array(info, dtype=np.float64)
 
-        return default_info
+        if self.use_global_seed_submap:
+            return np.identity(6, dtype=np.float64) * float(
+                self.global_seed_default_odom_info_scale
+            )
+
+        return np.identity(6, dtype=np.float64) * (
+                float(self.default_odom_info_scale) * float(self.adjacent_edge_weight)
+        )
 
     # compute_relative_transform()  -> self.submap_pcds回环边ICP用的点云是feature cloud，特征点云更稀疏但更稳定，适合非相邻子图的粗匹配；相邻子图的 refine 则用 dense cloud，提供更多点对支持更精细的配准。函数内部会自动判断当前边是相邻 refine 还是非相邻 loop ICP，并选择对应的点云和更严格的门槛进行配准和一致性校验。
     def compute_relative_transform(self, source_id, target_id, current_pose_guesses):
@@ -815,6 +887,7 @@ class LoopClosureProcess(mp.Process):
                 f"[AdjacentOdom] 相邻子图 {curr_sid}->{prev_sid} 精炼失败 "
                 f"(fitness={fine.fitness:.3f}, rmse={fine.inlier_rmse:.3f})"
             )
+            self._clear_refined_adjacent_edge(curr_sid)
             return False
 
         refined = np.array(fine.transformation, dtype=np.float64)
@@ -886,6 +959,18 @@ class LoopClosureProcess(mp.Process):
         只对最近若干个子图做链式 PGO。
         没有真实闭环也允许优化，核心是把 refined adjacent edge 真正传播成 correction。
         """
+        """
+            只对最近若干个子图做链式 PGO。
+
+            注意：
+            global seed submap 模式下禁用该函数。
+            因为此时子图已经是全局坐标，不能再用 relative_pose 链式传播 correction。
+            """
+
+        if self.use_global_seed_submap:
+            Log("[ChainPGO] global-seed 子图模式下禁用无回环链式 PGO")
+            return []
+
         if len(chain_submap_ids) < 2:
             return []
 
@@ -971,23 +1056,91 @@ class LoopClosureProcess(mp.Process):
             )
 
     def apply_correction_to_submaps(self, correction_list):
-        """将 PGO 优化后的修正矩阵写回子图 ckpt 文件"""
+        """
+        将 PGO correction 真正刚性应用到整个子图：
+        1) 更新 gaussian_params['_xyz'] / '_rotation' / '_normal'
+        2) 更新该子图内所有关键帧 c2w
+        3) 写回 correct_tsfm
+        4) 清空该子图点云缓存，避免 ICP 继续用旧点云
+        """
         for correction in correction_list:
-            submap_id = correction['submap_id']
-            correct_tsfm = correction['correct_tsfm']
-
-            # 跳过接近单位阵的修正（无需写盘）
-            if np.allclose(correct_tsfm, np.eye(4), atol=1e-4):
-                continue
+            submap_id = correction["submap_id"]
+            new_correct_tsfm = np.array(correction["correct_tsfm"], dtype=np.float64)
 
             ckpt_path = self.submap_records.get(submap_id)
             if not ckpt_path or not os.path.exists(ckpt_path):
                 continue
 
-            Log(f"[LoopClosure] 记录子图 {submap_id} 的 PGO 修正矩阵...")
             submap_ckpt = torch.load(ckpt_path, map_location="cpu")
-            submap_ckpt["correct_tsfm"] = correct_tsfm
+
+            prev_correct_tsfm = submap_ckpt.get(
+                "correct_tsfm", np.eye(4, dtype=np.float64)
+            )
+            if isinstance(prev_correct_tsfm, torch.Tensor):
+                prev_correct_tsfm = prev_correct_tsfm.cpu().numpy()
+            prev_correct_tsfm = np.array(prev_correct_tsfm, dtype=np.float64)
+
+            # 关键：如果之前已经应用过 correction，这次只能应用增量 delta，
+            # 否则会重复变换整个子图。
+            delta_tsfm = new_correct_tsfm @ np.linalg.inv(prev_correct_tsfm)
+
+            if np.allclose(delta_tsfm, np.eye(4), atol=1e-6):
+                submap_ckpt["correct_tsfm"] = new_correct_tsfm
+                torch.save(submap_ckpt, ckpt_path)
+                continue
+
+            Log(
+                f"[LoopClosure] Apply rigid correction to submap {submap_id}: "
+                f"delta_t={np.linalg.norm(delta_tsfm[:3, 3]):.4f}m"
+            )
+
+            # 1) 整体刚性修正 2DGS 高斯地图
+            gaussian_params = submap_ckpt["gaussian_params"]
+
+            # rigid_transform_2dgs 内部会把矩阵转到 cuda；
+            # 如果你的 loop closure 进程跑在 CPU 环境，需要把该函数里的 .cuda()
+            # 改成根据 gaussian_params['_xyz'].device 自适应。
+            device = gaussian_params["_xyz"].device
+            gaussian_params = {
+                k: (v.cuda() if torch.is_tensor(v) else v)
+                for k, v in gaussian_params.items()
+            }
+
+            gaussian_params = rigid_transform_2dgs(gaussian_params, delta_tsfm)
+
+            # 保存回 CPU，避免 ckpt 过度占 GPU 显存
+            gaussian_params = {
+                k: (v.detach().cpu() if torch.is_tensor(v) else v)
+                for k, v in gaussian_params.items()
+            }
+            submap_ckpt["gaussian_params"] = gaussian_params
+
+            # 2) 整体刚性修正该子图内所有关键帧 c2w
+            kf_poses = submap_ckpt.get("submap_keyframe_poses", {})
+            new_kf_poses = {}
+
+            for kf_id, c2w in kf_poses.items():
+                if isinstance(c2w, torch.Tensor):
+                    c2w = c2w.cpu().numpy()
+                c2w = np.array(c2w, dtype=np.float64)
+
+                # correction 左乘到 c2w
+                new_kf_poses[int(kf_id)] = (delta_tsfm @ c2w).astype(np.float64)
+
+            submap_ckpt["submap_keyframe_poses"] = new_kf_poses
+
+            # 3) 写入新的累计 correction
+            submap_ckpt["correct_tsfm"] = new_correct_tsfm
+
             torch.save(submap_ckpt, ckpt_path)
+
+            # 4) 清空缓存，防止后续 ICP 使用变换前的旧点云
+            self.submap_pcds.pop(submap_id, None)
+            self.submap_dense_pcds.pop(submap_id, None)
+
+            if submap_id in self.submap_access_order:
+                self.submap_access_order.remove(submap_id)
+
 
     def run(self):
         Log("Loop Closure 进程已启动，后台静默监听中...")
@@ -1024,7 +1177,7 @@ class LoopClosureProcess(mp.Process):
                     self.submap_access_order.append(submap_id)
 
                     # 1) 先精炼相邻子图边
-                    if submap_id > 0:
+                    if submap_id > 0 and self.config.get("LoopClosure", {}).get("enable_adjacent_odom", False):
                         self.refine_adjacent_submap_edge(submap_id)
 
                     # 2) 即使没有真实闭环，也先对最近几段子图链做一次局部 PGO

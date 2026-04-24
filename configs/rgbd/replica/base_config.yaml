@@ -82,6 +82,7 @@ Submap:
   rot_only_overlap_guard: 0.55  # 纯旋转切图时必须仍然要求 overlap 不高
   # ========== 新增：真正独立子图模式 ==========
   true_independent_submap: true   # true=彻底清空旧地图，false=保留部分旧点（流式）
+  use_global_seed_submap: true
   # ===========================================
   # 以下参数仅在 true_independent_submap: false 时生效
   use_critical_point_selection: true

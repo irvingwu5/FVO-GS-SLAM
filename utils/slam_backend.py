@@ -67,6 +67,9 @@ class BackEnd(mp.Process):
         # 在 __init__ 中，约第 61 行后新增：
         self.true_independent_submap = self.config.get("Submap", {}).get("true_independent_submap", False)
         self.seed_init_iters = self.config.get("Submap", {}).get("seed_init_iters", 500)
+        # 当前正在构建的子图 seed 全局 c2w。
+        # 第 0 个子图会在第一次 init 时根据 viewpoint.T 写入。
+        self.current_submap_seed_global_c2w = np.eye(4, dtype=np.float64)
 
     def set_hyperparams(self):
         self.save_results = self.config["Results"]["save_results"]
@@ -316,6 +319,20 @@ class BackEnd(mp.Process):
         except Exception as e:
             Log(f"[Error] 简化关键点选择失败: {str(e)}")
             return None
+
+    def pack_submap_keyframe_poses(self):
+        """
+        保存当前子图内所有关键帧的 c2w。
+        注意：这里保存的是相机到世界 c2w，后续 PGO 修正时直接左乘 correction。
+        """
+        submap_keyframe_poses = {}
+
+        for kf_idx, viewpoint in self.viewpoints.items():
+            with torch.no_grad():
+                c2w = torch.linalg.inv(viewpoint.T.detach()).cpu().numpy()
+            submap_keyframe_poses[int(kf_idx)] = c2w.astype(np.float64)
+
+        return submap_keyframe_poses
     '''
     ------------------初始建图模块(Initialization)------------------
     作用: 处理系统启动时的第一帧数据。
@@ -830,7 +847,15 @@ class BackEnd(mp.Process):
                     ckpt_data = {
                         "gaussian_params": gaussian_params,
                         "submap_keyframes": submap_keyframes,
-                        "correct_tsfm": np.eye(4)
+                        # 当前子图 seed 的全局位姿
+                        "seed_global_c2w": self.current_submap_seed_global_c2w,
+                        # 当前子图内所有关键帧的 c2w，PGO 后整体刚性修正用
+                        "submap_keyframe_poses": self.pack_submap_keyframe_poses(),
+                        # 与前一子图的 transition。最后一个子图 stop 时没有新 transition，
+                        # 若之前 new_submap 已写入过则会在该子图自己的 ckpt 中保存。
+                        "relative_pose": np.eye(4, dtype=np.float64),
+                        # 已累计应用到该子图的 PGO correction
+                        "correct_tsfm": np.eye(4, dtype=np.float64),
                     }
                     ckpt_path = os.path.join(submaps_dir, f"{self.current_submap_id:06d}.ckpt")
                     torch.save(ckpt_data, ckpt_path)
@@ -865,6 +890,12 @@ class BackEnd(mp.Process):
                     cur_frame_idx = data[1]
                     viewpoint = data[2]
                     depth_map = data[3]
+                    # 第 0 个子图冷启动时，记录全局 seed 位姿。
+                    # 后续子图的 seed 位姿会在 new_submap 消息里传入。
+                    if self.current_submap_id == 0 and len(self.viewpoints) == 0:
+                        self.current_submap_seed_global_c2w = (
+                            torch.linalg.inv(viewpoint.T.detach()).cpu().numpy().astype(np.float64)
+                        )
                     if self.true_independent_submap and len(self.gaussians._xyz) == 0 and self.current_submap_id > 0:
                         # 子图切换后的初始化：状态已在 new_submap 中清空，无需再 reset
                         Log("Initializing new submap from seed frame (state already clean)")
@@ -979,12 +1010,20 @@ class BackEnd(mp.Process):
 
                 #在真正独立子图模式下，后端只需保存旧子图并彻底清空状态，不再做智能选择和关键帧保留。新子图的初始化将由随后到来的 "init" 消息触发
                 elif data[0] == "new_submap":
-                    #前端backend_queue.put(["new_submap"
-                    completed_submap_id = data[1] #已经完成的子图id
-                    # 接收前端传来的相对位姿（如果是第一个子图，可能没有这个参数，默认为单位阵）
-                    relative_pose = data[2] if len(data) > 2 else np.eye(4)
-
-                    self.current_submap_id = completed_submap_id + 1 #更新当前子图 ID，为下一个子图做准备
+                    completed_submap_id = data[1]
+                    relative_pose = data[2] if len(data) > 2 else np.eye(4, dtype=np.float64)
+                    relative_pose = np.array(relative_pose, dtype=np.float64)
+                    # 新子图 seed 的全局 c2w，由前端 perform_submap_cut() 传入
+                    new_seed_global_c2w = (
+                        data[3] if len(data) > 3 else np.eye(4, dtype=np.float64)
+                    )
+                    new_seed_global_c2w = np.array(new_seed_global_c2w, dtype=np.float64)
+                    # 当前正在冻结的是 completed_submap_id，
+                    # 它自己的 seed 是 self.current_submap_seed_global_c2w。
+                    completed_seed_global_c2w = np.array(
+                        self.current_submap_seed_global_c2w, dtype=np.float64
+                    )
+                    self.current_submap_id = completed_submap_id + 1
                     Log(f"==> Backend received new_submap signal. Freezing submap {completed_submap_id}...")
                     # ===== 新增：先对子图边界做一次局部收紧，再冻结 =====
                     self.finalize_submap_before_freeze()
@@ -997,14 +1036,14 @@ class BackEnd(mp.Process):
                     ckpt_data = {
                         "gaussian_params": gaussian_params,
                         "submap_keyframes": submap_keyframes,
-                        # PGO 修正矩阵
-                        "correct_tsfm": np.eye(4),
-                        # 兼容旧逻辑：保留旧字段
+                        # 被冻结的旧子图 seed 全局位姿
+                        "seed_global_c2w": completed_seed_global_c2w,
+                        # 旧子图内所有关键帧 c2w
+                        "submap_keyframe_poses": self.pack_submap_keyframe_poses(),
+                        # old_seed -> new_seed 的 transition，给相邻 ICP/PGO 开环链路使用
                         "relative_pose": relative_pose,
-                        # 新字段：明确语义
-                        # 这是“下一子图 seed 帧在当前(已完成)子图坐标系下”的位姿
-                        # 也就是 T_prev<-next
-                        "next_submap_relative_pose": relative_pose,
+                        # PGO correction 初始为单位阵，后续由 loop_closure.py 刚性写回
+                        "correct_tsfm": np.eye(4, dtype=np.float64),
                     }
 
                     ckpt_path = os.path.join(submaps_dir, f"{completed_submap_id:06d}.ckpt")
@@ -1100,7 +1139,8 @@ class BackEnd(mp.Process):
 
                         if self.empty_cache_on_submap_cut:
                             torch.cuda.empty_cache()
-
+                        # 后续 init 接收到的新子图 seed，就属于这个全局 seed
+                        self.current_submap_seed_global_c2w = new_seed_global_c2w
                         self.push_to_frontend("new_submap")
         # =======================================================
         # 【核心修复】：使用 get_nowait 替代阻塞的 get()

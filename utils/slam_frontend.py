@@ -51,6 +51,13 @@ class FrontEnd(mp.Process):
         self.submap_trans_thre = self.config["Submap"]["trans_thre"]
         self.submap_rot_thre = self.config["Submap"]["rot_thre"]
         self.frame_to_submap = {}  # <--- 新增这行：记录每帧属于哪个子图
+        # ========== LoopSplat-style submap handoff ==========
+        # 新子图 seed 帧不再重置到单位阵，而是继承旧子图 tracking 后的全局估计位姿。
+        self.use_global_seed_submap = self.config.get("Submap", {}).get("use_global_seed_submap", True)
+        # 每个子图 seed 的全局 c2w，用于保存子图间 transition 和后续 PGO。
+        self.submap_seed_global_c2w = {0: np.eye(4, dtype=np.float64)}
+        self.last_submap_seed_global_c2w = None
+        # ================================================
         self.is_first_frame_of_submap = False  # <--- 新增这行：标记当前帧是否为子图的第一帧
         self.true_independent_submap = self.config.get("Submap", {}).get("true_independent_submap", False)
         # ★★★ 新增这一行，修复 AttributeError ★★★
@@ -93,19 +100,25 @@ class FrontEnd(mp.Process):
         self.window_size = self.config["Training"]["window_size"] # 滑动窗口大小，限制同时优化的关键帧数量，当关键帧数量超过此值时，会根据重叠度等策略移除旧的关键帧
         self.single_thread = self.config["Training"]["single_thread"] # 如果为 True，前端在请求关键帧或初始化后会主动等待（sleep），直到后端处理完成，表现为串行执行；否则前端和后端并行工作。
 
-    # 加一个“给显示/评估用的全局化相机拷贝”函数，不改原始 self.cameras，只给 GUI 用
     def _camera_to_global_copy(self, cam):
         cam_g = clone_obj(cam)
 
+        # 新模式：viewpoint.T 本身就是全局 w2c，不再做 anchor_c2w @ local_c2w
+        if self.config.get("Submap", {}).get("use_global_seed_submap", True):
+            return cam_g
+
+        # 兼容旧模式：每个子图局部原点重置时，才需要 anchor 还原全局位姿
         sid = self.frame_to_submap.get(cam.uid, self.current_submap_id)
         anchor_c2w = self.submap_anchor_poses.get(sid, np.eye(4))
 
         if isinstance(anchor_c2w, torch.Tensor):
             anchor_c2w = anchor_c2w.cpu().numpy()
+
         anchor_c2w = np.array(anchor_c2w, dtype=np.float64)
 
         local_w2c = cam.T.detach().cpu().numpy()
         local_c2w = np.linalg.inv(local_w2c)
+
         global_c2w = anchor_c2w @ local_c2w
         global_w2c = np.linalg.inv(global_c2w)
 
@@ -257,40 +270,21 @@ class FrontEnd(mp.Process):
     逻辑: 基于当前帧与上一关键帧的相对位移（kf_translation）、视锥体重叠度（kf_overlap）以及可见性掩码来综合判断
     '''
     def tracking(self, cur_frame_idx, viewpoint):
-        # 如果是子图的第一帧
+        # 子图第一帧已经在旧子图上完成 tracking，并在 perform_submap_cut()
+        # 中作为 seed 送给后端初始化；这里绝不能再把位姿重置成单位阵。
         if self.is_first_frame_of_submap:
             Log(f"[DEBUG] tracking() consumed first-frame flag at frame {cur_frame_idx}")
 
-            eye4 = torch.eye(4, device=viewpoint.T.device, dtype=viewpoint.T.dtype)
-            viewpoint.T = eye4
-
-            viewpoint.fixed_pose = False
-            viewpoint.is_submap_seed = True
-            viewpoint.seed_pose_prior = eye4.clone()
-
-            viewpoint.seed_prior_weight_trans = self.config.get("Submap", {}).get(
-                "seed_prior_weight_trans", 0.10
-            )
-            viewpoint.seed_prior_weight_rot = self.config.get("Submap", {}).get(
-                "seed_prior_weight_rot", 0.05
-            )
-
+            viewpoint.fixed_pose = True
             viewpoint.reset_pose_deltas()
-            viewpoint.cam_rot_delta.requires_grad_(True)
-            viewpoint.cam_trans_delta.requires_grad_(True)
+            viewpoint.cam_rot_delta.requires_grad_(False)
+            viewpoint.cam_trans_delta.requires_grad_(False)
 
             self.is_first_frame_of_submap = False
         else:
             prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
             viewpoint.T = prev.T.clone()
             viewpoint.fixed_pose = False
-
-            # 普通帧不是 seed
-            viewpoint.is_submap_seed = False
-            viewpoint.seed_pose_prior = None
-            viewpoint.seed_prior_weight_trans = 0.0
-            viewpoint.seed_prior_weight_rot = 0.0
-
             viewpoint.cam_rot_delta.requires_grad_(True)
             viewpoint.cam_trans_delta.requires_grad_(True)
         # 优化参数与优化器构建
@@ -771,70 +765,102 @@ class FrontEnd(mp.Process):
             f"max_overlap={cut_metrics['max_recent_overlap']:.3f}, "
             f"submap_kfs={cut_metrics['num_submap_kfs']} <=="
         )
+
         self.save_submap_cut_info(current_c2w, cut_metrics)
 
         if self.true_independent_submap:
+            # ------------------------------------------------------------
+            # 1) 当前帧已经在旧子图上完成 tracking；
+            #    这里只允许小步 refine，不能重置位姿。
+            # ------------------------------------------------------------
             cut_refine_iters = self.config.get("Submap", {}).get("cut_refine_iters", 20)
             if cut_refine_iters > 0:
-                self.refine_cut_frame_pose(viewpoint, extra_iters=cut_refine_iters, lr_scale=0.25)
+                self.refine_cut_frame_pose(
+                    viewpoint,
+                    extra_iters=cut_refine_iters,
+                    lr_scale=0.25,
+                )
                 current_c2w = torch.linalg.inv(viewpoint.T)
 
-            relative_pose = current_c2w.detach().cpu().numpy()
-            prev_anchor = np.array(
-                self.submap_anchor_poses[self.current_submap_id],
-                dtype=np.float64
+            seed_global_c2w = current_c2w.detach().cpu().numpy().astype(np.float64)
+
+            # ------------------------------------------------------------
+            # 2) 保存子图间 transition：prev_seed -> new_seed
+            #    注意：这是给 ICP/PGO 的初值和开环链路用的，
+            #    不是用来重置当前相机位姿。
+            # ------------------------------------------------------------
+            if self.last_submap_seed_global_c2w is None:
+                self.last_submap_seed_global_c2w = seed_global_c2w.copy()
+
+            relative_pose = (
+                    np.linalg.inv(self.last_submap_seed_global_c2w) @ seed_global_c2w
+            ).astype(np.float64)
+
+            completed_submap_id = self.current_submap_id
+            new_submap_id = completed_submap_id + 1
+
+            self.submap_seed_global_c2w[new_submap_id] = seed_global_c2w.copy()
+            self.last_submap_seed_global_c2w = seed_global_c2w.copy()
+
+            # 新模式下 viewpoint.T 本身已经是全局位姿；
+            # 这里 anchor 只作为兼容字段保存，不再参与 GUI/eval 二次变换。
+            self.submap_anchor_poses[new_submap_id] = np.eye(4, dtype=np.float64)
+            self.cumulative_anchor_c2w = np.eye(4, dtype=np.float64)
+
+            # ------------------------------------------------------------
+            # 3) 通知后端冻结旧子图。
+            #    多传一个 seed_global_c2w，后端保存 ckpt 和 PGO 用。
+            # ------------------------------------------------------------
+            self.backend_queue.put(
+                [
+                    "new_submap",
+                    completed_submap_id,
+                    relative_pose,
+                    seed_global_c2w,
+                ]
             )
-            new_submap_id = self.current_submap_id + 1
-            new_anchor = prev_anchor @ relative_pose
 
-            self.submap_anchor_poses[new_submap_id] = new_anchor
-            self.cumulative_anchor_c2w = new_anchor.copy()
-
-            self.backend_queue.put(["new_submap", self.current_submap_id, relative_pose])
             self.current_submap_id = new_submap_id
             self.frame_to_submap[cur_frame_idx] = self.current_submap_id
 
             Log(
-                f"[DEBUG] cut frame {cur_frame_idx} reassigned to submap "
-                f"{self.frame_to_submap[cur_frame_idx]}"
+                f"[DEBUG] cut frame {cur_frame_idx} inherited global pose into "
+                f"submap {self.current_submap_id}"
             )
 
+            # ------------------------------------------------------------
+            # 4) 清空当前子图窗口，但不要改 viewpoint.T。
+            #    seed 帧必须固定在 tracking 后的位姿上。
+            # ------------------------------------------------------------
             self.current_window = []
             self.occ_aware_visibility = {}
             self.initialized = False
 
-            for cam in self.cameras.values():
-                if cam.cam_rot_delta is not None:
-                    cam.cam_rot_delta.data.fill_(0)
-                if cam.cam_trans_delta is not None:
-                    cam.cam_trans_delta.data.fill_(0)
-
-            eye4 = torch.eye(4, device=viewpoint.T.device, dtype=viewpoint.T.dtype)
-            viewpoint.T = eye4
-            viewpoint.fixed_pose = False
+            viewpoint.fixed_pose = True
             viewpoint.is_submap_seed = True
-            viewpoint.seed_pose_prior = eye4.clone()
-            viewpoint.seed_prior_weight_trans = self.config.get("Submap", {}).get(
-                "seed_prior_weight_trans", 0.10
-            )
-            viewpoint.seed_prior_weight_rot = self.config.get("Submap", {}).get(
-                "seed_prior_weight_rot", 0.05
-            )
+            viewpoint.seed_global_c2w = seed_global_c2w.copy()
             viewpoint.reset_pose_deltas()
-            viewpoint.cam_rot_delta.requires_grad_(True)
-            viewpoint.cam_trans_delta.requires_grad_(True)
+            viewpoint.cam_rot_delta.requires_grad_(False)
+            viewpoint.cam_trans_delta.requires_grad_(False)
 
-            self.submap_anchor_pose = eye4.clone()
+            # 新子图运动监控锚点就是 seed 的全局位姿
+            self.submap_anchor_pose = current_c2w.clone()
             self.submap_start_frame_idx = cur_frame_idx
             self.submap_cut_pending = False
             self.submap_cut_pending_count = 0
             self.is_first_frame_of_submap = False
 
+            # ------------------------------------------------------------
+            # 5) 用当前 seed 帧初始化新子图。
+            #    这里 add_new_keyframe/request_init 都不再重置 pose。
+            # ------------------------------------------------------------
             depth_map = self.add_new_keyframe(cur_frame_idx, init=True)
             self.request_init(cur_frame_idx, viewpoint, depth_map)
             self.current_window.append(cur_frame_idx)
+
             return True
 
+        # 非 true_independent_submap 的旧逻辑可以保留
         self.backend_queue.put(["new_submap", self.current_submap_id])
         self.current_submap_id += 1
         self.submap_anchor_pose = current_c2w.clone()
@@ -932,8 +958,12 @@ class FrontEnd(mp.Process):
 
                 current_c2w = torch.linalg.inv(viewpoint.T)
 
-                if self.submap_anchor_pose is None: #运动监控锚点，用来判断是否切图，初始为 None，第一帧处理时会被设置为当前帧的估计位姿
+                if self.submap_anchor_pose is None:
                     self.submap_anchor_pose = current_c2w.clone()
+
+                    seed_np = current_c2w.detach().cpu().numpy().astype(np.float64)
+                    self.last_submap_seed_global_c2w = seed_np.copy()
+                    self.submap_seed_global_c2w[self.current_submap_id] = seed_np.copy()
 
                 # 窗口维护作用: 维护一个固定大小的滑动窗口（current_window），用于限制优化规模
                 if self.use_gui:
