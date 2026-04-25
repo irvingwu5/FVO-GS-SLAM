@@ -17,3 +17,5 @@ runtime_results
 wandb
 weights
 result*
+CLAUDE.md
+.claude/

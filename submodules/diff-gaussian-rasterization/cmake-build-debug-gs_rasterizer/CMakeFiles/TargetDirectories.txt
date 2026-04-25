@@ -1,3 +1,0 @@
-/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/submodules/diff-gaussian-rasterization/cmake-build-debug-gs_rasterizer/CMakeFiles/CudaRasterizer.dir
-/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/submodules/diff-gaussian-rasterization/cmake-build-debug-gs_rasterizer/CMakeFiles/edit_cache.dir
-/home/wuxiangyu/Documents/PycharmProjects/SA-GS-SLAM/submodules/diff-gaussian-rasterization/cmake-build-debug-gs_rasterizer/CMakeFiles/rebuild_cache.dir
