@@ -74,7 +74,41 @@ class FrontEnd(mp.Process):
         # ===== FFT VO 初值模块 =====
         self.use_fft_vo_init = self.config.get("FFTVO", {}).get("use_fft_vo_init", False)
         self.fft_vo = FFTGuidedRGBDVO(self.config) if self.use_fft_vo_init else None
-        self.fft_vo_stats = {"success": 0, "fail": 0, "selected": 0, "rejected_by_loss": 0}
+
+        # ===== FFTVO 候选控制开关 (EAGS 风格) =====
+        fftvo_cfg = self.config.get("FFTVO", {})
+        self.use_previous_candidate = fftvo_cfg.get("use_previous_candidate", True)
+        self.use_const_speed_candidate = fftvo_cfg.get("use_const_speed_candidate", False)
+        self.use_fft_vo_candidate = fftvo_cfg.get("use_fft_vo_candidate", True)
+        self.allow_fft_vo_override_pose = fftvo_cfg.get("allow_fft_vo_override_pose", True)
+        self.log_candidate_losses = fftvo_cfg.get("log_candidate_losses", False)
+
+        # ===== FFTVO 子图启动保护期 =====
+        self.disable_fftvo_after_submap_start = fftvo_cfg.get(
+            "disable_fftvo_after_submap_start", True
+        )
+        self.fftvo_warmup_frames_after_submap_start = int(
+            fftvo_cfg.get("fftvo_warmup_frames_after_submap_start", 10)
+        )
+
+        # ===== FFTVO 严格质量门控 =====
+        self.fftvo_min_improvement_ratio = float(
+            fftvo_cfg.get("fftvo_min_improvement_ratio", 0.75)
+        )
+        self.fftvo_max_delta_t = float(fftvo_cfg.get("fftvo_max_delta_t", 0.025))
+        self.fftvo_max_delta_deg = float(fftvo_cfg.get("fftvo_max_delta_deg", 2.0))
+        self.fftvo_min_inliers = int(fftvo_cfg.get("fftvo_min_inliers", 250))
+        self.fftvo_min_inlier_ratio = float(fftvo_cfg.get("fftvo_min_inlier_ratio", 0.70))
+
+        # ===== FFTVO refined pose feedback (EAGS 风格) =====
+        self.enable_pose_feedback = fftvo_cfg.get("enable_pose_feedback", True)
+
+        self.fft_vo_stats = {
+            "success": 0, "fail": 0,
+            "rejected_by_loss": 0, "rejected_by_quality": 0,
+            "selected_previous": 0, "selected_const_speed": 0,
+            "selected_fft_vo": 0,
+        }
 
     # ========================================================================
     # 2. Hyperparameters
@@ -228,14 +262,14 @@ class FrontEnd(mp.Process):
         if prev is None or prev_prev is None:
             return None
 
-        # T 是 w2c: T_prev_w, T_prev_prev_w
-        # 恒速假设: delta = T_prev_w @ inv(T_prev_prev_w)  (prev帧 相对 prev_prev帧 的运动)
-        T_prev_w = prev.T.detach().clone()
-        T_prev_prev_w = prev_prev.T.detach().clone()
-        delta = T_prev_w @ torch.linalg.inv(T_prev_prev_w)
-        # 应用到当前帧: T_cur_w = delta @ T_prev_w
-        const_w2c = delta @ T_prev_w
-        return const_w2c
+        # 转到 c2w 空间做外推，避免 w2c 空间的公式歧义
+        prev_w2c = prev.T.detach().clone()
+        prev_prev_w2c = prev_prev.T.detach().clone()
+        prev_c2w = torch.linalg.inv(prev_w2c)
+        prev_prev_c2w = torch.linalg.inv(prev_prev_w2c)
+        delta_c2w = prev_c2w @ torch.linalg.inv(prev_prev_c2w)
+        cur_c2w_pred = delta_c2w @ prev_c2w
+        return torch.linalg.inv(cur_c2w_pred)
 
     def evaluate_tracking_init_loss(self, viewpoint, candidate_w2c):
         """用候选 w2c 渲染一次并计算 tracking loss。不修改原始状态。"""
@@ -270,59 +304,125 @@ class FrontEnd(mp.Process):
         return loss.item()
 
     def select_best_tracking_init(self, cur_frame_idx, viewpoint):
-        """构造候选初值，通过 render loss 评估选择最优。
+        """构造候选初值，EAGS 风格保守选择：默认 previous；FFTVO 只在明显优于
+        previous 且通过严格质量门控时才被接受。子图 warmup 期 FFTVO 只诊断不接管。
         返回 (best_name, best_w2c)。"""
         prev_cam = self.cameras.get(cur_frame_idx - 1)
         prev_w2c = prev_cam.T.clone() if prev_cam is not None else torch.eye(4, device=self.device)
 
-        # 候选 A: 上一帧位姿 (previous)
-        candidates = [("previous", prev_w2c)]
+        # ---- 判断是否在子图启动保护期 ----
+        in_warmup = (
+            self.disable_fftvo_after_submap_start
+            and (cur_frame_idx - self.submap_start_frame_idx) < self.fftvo_warmup_frames_after_submap_start
+        )
 
-        # 候选 B: 恒速模型 (const_speed)
-        const_w2c = self.build_const_speed_w2c(cur_frame_idx)
-        if const_w2c is not None:
-            candidates.append(("const_speed", const_w2c))
+        # ---- 候选 A: 上一帧位姿 (previous) ----
+        candidates = []
+        if self.use_previous_candidate:
+            candidates.append(("previous", prev_w2c))
 
-        # 候选 C: FFT VO
-        if self.fft_vo is not None and prev_cam is not None:
-            prev_c2w = torch.linalg.inv(prev_w2c)  # w2c → c2w
-            vo_success, vo_c2w, vo_info = self.fft_vo.estimate(prev_cam, viewpoint, prev_c2w)
-            if vo_success:
-                self.fft_vo_stats["success"] += 1
-                vo_w2c = torch.linalg.inv(vo_c2w)  # c2w → w2c
-                candidates.append(("fft_vo", vo_w2c))
-                if self.fft_vo.debug_log:
-                    Log(f"[FFTVO] frame {cur_frame_idx}: success, "
-                        f"n_prev={vo_info.get('n_prev', 0)}, "
-                        f"n_tracked={vo_info.get('n_tracked', 0)}, "
-                        f"n_inliers={vo_info.get('n_inliers', 0)}, "
-                        f"delta_t={vo_info.get('delta_t', 0):.3f}m, "
-                        f"delta_deg={vo_info.get('delta_deg', 0):.1f}°")
+        # ---- 候选 B: 恒速模型 (const_speed，默认关闭) ----
+        if self.use_const_speed_candidate:
+            const_w2c = self.build_const_speed_w2c(cur_frame_idx)
+            if const_w2c is not None:
+                candidates.append(("const_speed", const_w2c))
+
+        # ---- 候选 C: FFT VO ----
+        fft_vo_w2c = None
+        fft_vo_info = None
+        fft_vo_reject_reason = None
+
+        if self.use_fft_vo_candidate and self.fft_vo is not None and prev_cam is not None:
+            if in_warmup:
+                # warmup 期：运行 FFTVO 收集诊断，但不参与候选
+                prev_c2w = torch.linalg.inv(prev_w2c)
+                vo_success, vo_c2w, vo_info = self.fft_vo.estimate(prev_cam, viewpoint, prev_c2w)
+                if vo_success:
+                    self.fft_vo_stats["success"] += 1
+                    if self.fft_vo.debug_log:
+                        Log(f"[FFTVO] frame {cur_frame_idx}: skipped (submap warmup, "
+                            f"submap_start={self.submap_start_frame_idx}, "
+                            f"warmup={self.fftvo_warmup_frames_after_submap_start}), "
+                            f"obs n_inliers={vo_info.get('n_inliers', 0)}, "
+                            f"delta_t={vo_info.get('delta_t', 0):.3f}m")
+                else:
+                    self.fft_vo_stats["fail"] += 1
+                fft_vo_reject_reason = "warmup"
             else:
-                self.fft_vo_stats["fail"] += 1
+                prev_c2w = torch.linalg.inv(prev_w2c)
+                vo_success, vo_c2w, vo_info = self.fft_vo.estimate(prev_cam, viewpoint, prev_c2w)
+                if vo_success:
+                    self.fft_vo_stats["success"] += 1
+                    fft_vo_w2c = torch.linalg.inv(vo_c2w)
+                    fft_vo_info = vo_info
+                    candidates.append(("fft_vo", fft_vo_w2c))
+                    if self.fft_vo.debug_log:
+                        Log(f"[FFTVO] frame {cur_frame_idx}: success, "
+                            f"n_prev={vo_info.get('n_prev', 0)}, "
+                            f"n_tracked={vo_info.get('n_tracked', 0)}, "
+                            f"n_inliers={vo_info.get('n_inliers', 0)}, "
+                            f"inlier_ratio={vo_info.get('inlier_ratio', 0):.3f}, "
+                            f"delta_t={vo_info.get('delta_t', 0):.3f}m, "
+                            f"delta_deg={vo_info.get('delta_deg', 0):.1f}°")
+                else:
+                    self.fft_vo_stats["fail"] += 1
 
-        # 评估所有候选的 render loss
-        best_name = None
-        best_w2c = None
-        best_loss = float("inf")
-
+        # ---- 评估所有候选的 render loss ----
+        losses = {}
         for name, w2c in candidates:
-            loss_val = self.evaluate_tracking_init_loss(viewpoint, w2c)
-            if loss_val < best_loss:
-                best_loss = loss_val
-                best_name = name
-                best_w2c = w2c
+            losses[name] = self.evaluate_tracking_init_loss(viewpoint, w2c)
 
-        # 若 fft_vo 成功但 loss 差于 previous，拒绝 fft_vo
-        fft_in_candidates = any(name == "fft_vo" for name, _ in candidates)
-        if fft_in_candidates and best_name != "fft_vo":
-            self.fft_vo_stats["rejected_by_loss"] += 1
-            if self.fft_vo.debug_log:
-                Log(f"[FFTVO] frame {cur_frame_idx}: fft_vo REJECTED "
-                    f"(best={best_name}, best_loss={best_loss:.4f})")
+        # ---- 保守选择策略：默认 previous ----
+        best_name = "previous"
+        best_w2c = prev_w2c
+        reason = fft_vo_reject_reason if fft_vo_reject_reason else "default"
+        prev_loss = losses.get("previous", float("inf"))
 
-        if best_name == "fft_vo":
-            self.fft_vo_stats["selected"] += 1
+        # fft_vo: 必须通过严格质量门控 + 明显优于 previous
+        if "fft_vo" in losses and fft_vo_info is not None:
+            fft_loss = losses["fft_vo"]
+            current_best_loss = losses.get(best_name, prev_loss)
+
+            n_inliers = fft_vo_info.get("n_inliers", 0)
+            inlier_ratio = fft_vo_info.get("inlier_ratio", 0)
+            delta_t = fft_vo_info.get("delta_t", 0)
+            delta_deg = fft_vo_info.get("delta_deg", 0)
+
+            if not self.allow_fft_vo_override_pose:
+                fft_vo_reject_reason = "override_disabled"
+            elif n_inliers < self.fftvo_min_inliers:
+                fft_vo_reject_reason = "insufficient_inliers"
+            elif inlier_ratio < self.fftvo_min_inlier_ratio:
+                fft_vo_reject_reason = "low_inlier_ratio"
+            elif delta_t > self.fftvo_max_delta_t or delta_deg > self.fftvo_max_delta_deg:
+                fft_vo_reject_reason = "large_motion"
+            elif fft_loss >= current_best_loss * self.fftvo_min_improvement_ratio:
+                fft_vo_reject_reason = "weak_improvement"
+            else:
+                best_name = "fft_vo"
+                best_w2c = fft_vo_w2c
+                reason = (f"fft_loss={fft_loss:.4f} < best_loss={current_best_loss:.4f}"
+                          f"*{self.fftvo_min_improvement_ratio}")
+
+            if best_name != "fft_vo":
+                key = "rejected_by_loss" if fft_vo_reject_reason == "weak_improvement" else "rejected_by_quality"
+                self.fft_vo_stats[key] += 1
+                if self.fft_vo.debug_log:
+                    Log(f"[FFTVO] frame {cur_frame_idx}: rejected ({fft_vo_reject_reason}) "
+                        f"n_inliers={n_inliers}, inlier_ratio={inlier_ratio:.3f}, "
+                        f"delta_t={delta_t:.3f}m, delta_deg={delta_deg:.1f}°, "
+                        f"fft_loss={fft_loss:.4f}, best_loss={current_best_loss:.4f}")
+
+        # ---- 统计 ----
+        if best_name == "previous":
+            self.fft_vo_stats["selected_previous"] += 1
+        elif best_name == "fft_vo":
+            self.fft_vo_stats["selected_fft_vo"] += 1
+
+        # ---- 候选 loss 日志 ----
+        if self.log_candidate_losses:
+            loss_str = " ".join(f"{n}={v:.4f}" for n, v in losses.items())
+            Log(f"[InitLoss] frame={cur_frame_idx} {loss_str} selected={best_name} reason={reason}")
 
         return best_name, best_w2c
 
@@ -330,22 +430,22 @@ class FrontEnd(mp.Process):
     # 5. Tracking (per-frame pose estimation)
     # ========================================================================
     def tracking(self, cur_frame_idx, viewpoint):
-        # 子图第一帧已经在旧子图上完成 tracking，并在 perform_submap_cut()
-        # 中作为 seed 送给后端初始化；这里绝不能再把位姿重置成单位阵。
+        # perform_submap_cut() 已用切图帧完成初始化，切图帧不会再次进入 tracking()
+        # 如果当前帧不是 seed 帧，说明是过期 flag，忽略并正常 tracking
         if self.is_first_frame_of_submap:
-            Log(f"[DEBUG] tracking() consumed first-frame flag at frame {cur_frame_idx}")
+            if cur_frame_idx == self.submap_start_frame_idx:
+                Log(f"[DEBUG] tracking() consumed first-frame flag at seed frame {cur_frame_idx}")
+                viewpoint.fixed_pose = True
+                viewpoint.reset_pose_deltas()
+                viewpoint.cam_rot_delta.requires_grad_(False)
+                viewpoint.cam_trans_delta.requires_grad_(False)
+                self.is_first_frame_of_submap = False
+            else:
+                Log(f"[Warning] stale first-frame flag ignored at frame {cur_frame_idx}; "
+                    f"submap_start_frame_idx={self.submap_start_frame_idx}")
+                self.is_first_frame_of_submap = False
 
-            # 从切图帧继承全局位姿，防止新子图第一帧从单位阵开始导致轨迹跳变
-            prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
-            viewpoint.T = prev.T.clone()
-
-            viewpoint.fixed_pose = True
-            viewpoint.reset_pose_deltas()
-            viewpoint.cam_rot_delta.requires_grad_(False)
-            viewpoint.cam_trans_delta.requires_grad_(False)
-
-            self.is_first_frame_of_submap = False
-        else:
+        if not viewpoint.fixed_pose:
             # 选择最优 tracking 初值（FFT VO / const_speed / previous）
             if self.use_fft_vo_init and self.fft_vo is not None:
                 best_name, best_w2c = self.select_best_tracking_init(cur_frame_idx, viewpoint)
@@ -392,6 +492,10 @@ class FrontEnd(mp.Process):
         )
 
         pose_optimizer = torch.optim.Adam(opt_params)
+        # EAGS 风格：保存 min loss 对应的 pose
+        best_T = None
+        best_loss = float("inf")
+        best_render_pkg = None
         for tracking_itr in range(self.tracking_itr_num):
             render_pkg = render(
                 viewpoint, self.gaussians, self.pipeline_params, self.background, surf=False
@@ -414,6 +518,18 @@ class FrontEnd(mp.Process):
                     converged = True
                 else:
                     converged = update_pose(viewpoint)
+
+                current_loss = loss_tracking.item()
+                if current_loss < best_loss:
+                    best_loss = current_loss
+                    best_T = viewpoint.T.clone()
+                    best_render_pkg = {
+                        "render": image.detach().clone(),
+                        "depth": depth.detach().clone(),
+                        "opacity": opacity.detach().clone(),
+                        "n_touched": render_pkg.get("n_touched", None),
+                    }
+
             if self.use_gui and tracking_itr % 10 == 0:
                 self.q_main2vis.put(
                     gui_utils.GaussianPacket(
@@ -426,7 +542,13 @@ class FrontEnd(mp.Process):
                 )
             if converged:
                 break
+
+        if best_T is not None and not viewpoint.fixed_pose:
+            viewpoint.T = best_T.clone()
+
         self.median_depth = get_median_depth(depth, opacity)
+        if best_render_pkg is not None:
+            return best_render_pkg
         return render_pkg
 
     # ========================================================================
@@ -867,6 +989,10 @@ class FrontEnd(mp.Process):
 
                 current_c2w = torch.linalg.inv(viewpoint.T)
 
+                # EAGS 风格：tracking 完成后把 refined pose 写回 FFTVO
+                if self.enable_pose_feedback and self.fft_vo is not None:
+                    self.fft_vo.update_pose(cur_frame_idx, current_c2w)
+
                 if self.submap_anchor_pose is None:
                     self.submap_anchor_pose = current_c2w.clone()
 
@@ -1032,6 +1158,9 @@ class FrontEnd(mp.Process):
                     if self.use_fft_vo_init:
                         s = self.fft_vo_stats
                         Log(f"[FFTVO] Stats: success={s['success']}, fail={s['fail']}, "
-                            f"selected={s['selected']}, rejected_by_loss={s['rejected_by_loss']}")
+                            f"selected_fft_vo={s['selected_fft_vo']}, "
+                            f"rejected_by_loss={s['rejected_by_loss']}, "
+                            f"rejected_by_quality={s['rejected_by_quality']}, "
+                            f"selected_previous={s['selected_previous']}")
                     Log("Frontend Stopped.")
                     break

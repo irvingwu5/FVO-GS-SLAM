@@ -244,17 +244,26 @@ class LoopClosureProcess(mp.Process):
         self.default_odom_info_scale = self.config.get("LoopClosure", {}).get("default_odom_info_scale", 120.0)
         self.global_seed_default_odom_info_scale = self.config.get("LoopClosure", {}).get("global_seed_default_odom_info_scale", 1.0e-3)
         self.use_global_seed_submap = self.config.get("Submap", {}).get("use_global_seed_submap", False)
-        default_enable_chain_pgo = False if self.use_global_seed_submap else True
-        self.enable_chain_pgo_without_loop = self.config.get("LoopClosure", {}).get("enable_chain_pgo_without_loop", default_enable_chain_pgo)
-        self.chain_pgo_window = self.config.get("LoopClosure", {}).get("chain_pgo_window", 4)
-
-        Log(
-            f"[LoopClosure] use_global_seed_submap={self.use_global_seed_submap}, "
-            f"enable_chain_pgo_without_loop={self.enable_chain_pgo_without_loop}"
-        )
 
         # ===== Feature cloud 保留比例 =====
         self.feature_keep_ratio = self.config.get("LoopClosure", {}).get("feature_keep_ratio", 0.30)
+
+        # ===== PGO 保护参数 (EAGS 风格) =====
+        self.debug_disable_pgo_for_fftvo_test = self.config.get("LoopClosure", {}).get(
+            "debug_disable_pgo_for_fftvo_test", False
+        )
+        self.min_loop_fitness_for_pgo = self.config.get("LoopClosure", {}).get(
+            "min_loop_fitness_for_pgo", 0.40
+        )
+        self.max_loop_rmse_for_pgo = self.config.get("LoopClosure", {}).get(
+            "max_loop_rmse_for_pgo", 0.04
+        )
+        self.max_loop_delta_t_for_pgo = self.config.get("LoopClosure", {}).get(
+            "max_loop_delta_t_for_pgo", 1.5
+        )
+        self.max_loop_delta_r_for_pgo = self.config.get("LoopClosure", {}).get(
+            "max_loop_delta_r_for_pgo", 45.0
+        )
 
     # ========================================================================
     # 4.2 Feature Extraction
@@ -453,10 +462,10 @@ class LoopClosureProcess(mp.Process):
         try:
             if not self._ensure_pcd_loaded(source_id):
                 Log(f"[LoopClosure] 无法加载子图 {source_id} 的点云，跳过 ICP")
-                return np.identity(4), np.identity(6), False
+                return np.identity(4), np.identity(6), False, {}
             if not self._ensure_pcd_loaded(target_id):
                 Log(f"[LoopClosure] 无法加载子图 {target_id} 的点云，跳过 ICP")
-                return np.identity(4), np.identity(6), False
+                return np.identity(4), np.identity(6), False, {}
 
             source_pcd = self.submap_pcds[source_id]
             target_pcd = self.submap_pcds[target_id]
@@ -501,7 +510,7 @@ class LoopClosureProcess(mp.Process):
             if icp_result.fitness < self.icp_fitness_threshold or icp_result.inlier_rmse > 0.04:
                 Log(f"[!] ICP 配准失败: 子图 {source_id}->{target_id} "
                     f"(Fitness: {icp_result.fitness:.3f}, RMSE: {icp_result.inlier_rmse:.3f}m)")
-                return np.identity(4), np.identity(6), False
+                return np.identity(4), np.identity(6), False, {}
 
             transformation = np.array(icp_result.transformation, dtype=np.float64)
 
@@ -514,7 +523,7 @@ class LoopClosureProcess(mp.Process):
                     f"[!] LOOP 一致性校验失败: 子图 {source_id}->{target_id} | "
                     f"delta_t={delta_t:.3f}m, delta_r={delta_r:.2f}deg | 拒绝该闭环边"
                 )
-                return np.identity(4), np.identity(6), False
+                return np.identity(4), np.identity(6), False, {}
 
             information = o3d.pipelines.registration.get_information_matrix_from_point_clouds(
                 source_pcd,
@@ -532,11 +541,17 @@ class LoopClosureProcess(mp.Process):
                 f"delta_t={delta_t:.3f}m, delta_r={delta_r:.2f}deg)"
             )
 
-            return transformation, information, True
+            metrics = {
+                "fitness": float(icp_result.fitness),
+                "rmse": float(icp_result.inlier_rmse),
+                "delta_t": float(delta_t),
+                "delta_r": float(delta_r),
+            }
+            return transformation, information, True, metrics
 
         except Exception as e:
             Log(f"[LoopClosure] ICP 异常: {source_id}->{target_id}: {e}")
-            return np.identity(4), np.identity(6), False
+            return np.identity(4), np.identity(6), False, {}
 
     # ========================================================================
     # 4.6 Adjacent Submap Edge Refinement
@@ -849,22 +864,40 @@ class LoopClosureProcess(mp.Process):
                 if abs(query_id - target_id) < self.min_interval:
                     continue
 
-                trans, info_loop, success = self.compute_relative_transform(
+                trans, info_loop, success, metrics = self.compute_relative_transform(
                     query_id, target_id, current_pose_guesses
                 )
 
                 if success:
-                    pose_graph.edges.append(
-                        o3d.pipelines.registration.PoseGraphEdge(
-                            id_mapping[query_id],
-                            id_mapping[target_id],
-                            trans,
-                            info_loop,
-                            uncertain=True,
+                    fitness = metrics.get("fitness", 0)
+                    rmse = metrics.get("rmse", 99)
+                    delta_t = metrics.get("delta_t", 99)
+                    delta_r = metrics.get("delta_r", 999)
+
+                    if fitness < self.min_loop_fitness_for_pgo:
+                        Log(f"[LoopClosure] 回环边 {query_id}<->{target_id} PGO过滤: "
+                            f"fitness={fitness:.3f} < {self.min_loop_fitness_for_pgo}")
+                    elif rmse > self.max_loop_rmse_for_pgo:
+                        Log(f"[LoopClosure] 回环边 {query_id}<->{target_id} PGO过滤: "
+                            f"rmse={rmse:.4f} > {self.max_loop_rmse_for_pgo}")
+                    elif delta_t > self.max_loop_delta_t_for_pgo:
+                        Log(f"[LoopClosure] 回环边 {query_id}<->{target_id} PGO过滤: "
+                            f"delta_t={delta_t:.3f}m > {self.max_loop_delta_t_for_pgo}")
+                    elif delta_r > self.max_loop_delta_r_for_pgo:
+                        Log(f"[LoopClosure] 回环边 {query_id}<->{target_id} PGO过滤: "
+                            f"delta_r={delta_r:.2f}deg > {self.max_loop_delta_r_for_pgo}")
+                    else:
+                        pose_graph.edges.append(
+                            o3d.pipelines.registration.PoseGraphEdge(
+                                id_mapping[query_id],
+                                id_mapping[target_id],
+                                trans,
+                                info_loop,
+                                uncertain=True,
+                            )
                         )
-                    )
-                    loop_found = True
-                    Log(f"[LoopClosure] 添加回环边: 子图 {query_id} <-> {target_id}")
+                        loop_found = True
+                        Log(f"[LoopClosure] 添加回环边: 子图 {query_id} <-> {target_id}")
 
         if not loop_found:
             Log("[LoopClosure] 当前无有效非相邻闭环，跳过 full-graph PGO")
@@ -899,74 +932,7 @@ class LoopClosureProcess(mp.Process):
         return correction_list
 
     # ========================================================================
-    # 4.8 Pose Graph Optimization — Chain (no loop)
-    # ========================================================================
-    def optimize_submap_chain(self, chain_submap_ids):
-        if self.use_global_seed_submap:
-            Log("[ChainPGO] global-seed 子图模式下禁用无回环链式 PGO")
-            return []
-
-        if len(chain_submap_ids) < 2:
-            return []
-
-        all_submap_ids = sorted(self.submap_records.keys())
-        open_loop_anchors, current_pose_guesses = self._build_current_pose_guesses(all_submap_ids)
-
-        pose_graph = o3d.pipelines.registration.PoseGraph()
-        id_mapping = {sid: i for i, sid in enumerate(chain_submap_ids)}
-
-        for sid in chain_submap_ids:
-            pose_graph.nodes.append(
-                o3d.pipelines.registration.PoseGraphNode(
-                    np.array(current_pose_guesses[sid], dtype=np.float64)
-                )
-            )
-
-        for i in range(1, len(chain_submap_ids)):
-            prev_sid = chain_submap_ids[i - 1]
-            curr_sid = chain_submap_ids[i]
-
-            rel_prev_from_curr = self._load_prev_to_curr_transition(prev_sid, curr_sid)
-            odom_source_to_target = np.linalg.inv(rel_prev_from_curr)
-            info_odom = self._load_prev_to_curr_information(prev_sid, curr_sid)
-
-            pose_graph.edges.append(
-                o3d.pipelines.registration.PoseGraphEdge(
-                    i - 1,
-                    i,
-                    odom_source_to_target,
-                    info_odom,
-                    uncertain=False,
-                )
-            )
-
-        option = o3d.pipelines.registration.GlobalOptimizationOption(
-            max_correspondence_distance=self.voxel_size * 1.5,
-            edge_prune_threshold=0.25,
-            reference_node=0,
-        )
-
-        o3d.pipelines.registration.global_optimization(
-            pose_graph,
-            o3d.pipelines.registration.GlobalOptimizationLevenbergMarquardt(),
-            o3d.pipelines.registration.GlobalOptimizationConvergenceCriteria(),
-            option,
-        )
-
-        correction_list = []
-        for i, sid in enumerate(chain_submap_ids):
-            optimized_pose = np.array(pose_graph.nodes[i].pose, dtype=np.float64)
-            anchor_pose = open_loop_anchors[sid]
-            correction = optimized_pose @ np.linalg.inv(anchor_pose)
-            correction_list.append({
-                "submap_id": sid,
-                "correct_tsfm": correction,
-            })
-
-        return correction_list
-
-    # ========================================================================
-    # 4.9 Apply Correction to Submaps
+    # 4.8 Apply Correction to Submaps
     # ========================================================================
     def apply_correction_to_submaps(self, correction_list):
         for correction in correction_list:
@@ -1037,7 +1003,7 @@ class LoopClosureProcess(mp.Process):
                 self.submap_access_order.remove(submap_id)
 
     # ========================================================================
-    # 4.10 Main Loop
+    # 4.9 Main Loop
     # ========================================================================
     def run(self):
         Log("Loop Closure 进程已启动，后台静默监听中...")
@@ -1074,19 +1040,16 @@ class LoopClosureProcess(mp.Process):
                     if submap_id > 0 and self.config.get("LoopClosure", {}).get("enable_adjacent_odom", False):
                         self.refine_adjacent_submap_edge(submap_id)
 
-                    # 2) 即使没有真实闭环，也先对最近几段子图链做一次局部 PGO
-                    if self.enable_chain_pgo_without_loop:
-                        chain_ids = sorted(self.submap_records.keys())[-self.chain_pgo_window:]
-                        local_chain_corr = self.optimize_submap_chain(chain_ids)
-                        if len(local_chain_corr) > 0:
-                            self.apply_correction_to_submaps(local_chain_corr)
-                            Log(f"[ChainPGO] 已对最近 {len(chain_ids)} 个子图执行局部链式 PGO")
-
-                    # 3) 再尝试真正的闭环 PGO
-                    correction_list = self.construct_and_optimize_pose_graph()
-                    if len(correction_list) > 0:
-                        self.apply_correction_to_submaps(correction_list)
-                        Log("==> PGO 闭环校正及硬盘回写完毕！ <==")
+                    if self.debug_disable_pgo_for_fftvo_test:
+                        Log("[LoopClosure] PGO disabled for FFTVO ablation test")
+                        # 仍运行回环检测（仅日志输出）
+                        self.detect_closure(submap_id)
+                    else:
+                        # 2) 尝试闭环 PGO
+                        correction_list = self.construct_and_optimize_pose_graph()
+                        if len(correction_list) > 0:
+                            self.apply_correction_to_submaps(correction_list)
+                            Log("==> PGO 闭环校正及硬盘回写完毕！ <==")
 
                     # 清理旧子图缓存
                     self.cleanup_old_submaps()

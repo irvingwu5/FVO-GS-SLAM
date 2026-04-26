@@ -23,6 +23,7 @@ class FFTGuidedRGBDVO:
         # ---- 光流与 PnP 参数 ----
         self.min_tracked = int(fft_cfg.get("min_tracked", 40))
         self.min_inliers = int(fft_cfg.get("min_inliers", 25))
+        self.min_inlier_ratio = float(fft_cfg.get("min_inlier_ratio", 0.45))
         self.min_depth = float(fft_cfg.get("min_depth", 0.1))
         self.max_depth = float(fft_cfg.get("max_depth", 5.0))
         self.ransac_reproj_error = float(fft_cfg.get("ransac_reproj_error", 3.0))
@@ -35,6 +36,20 @@ class FFTGuidedRGBDVO:
         self.lk_criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01)
         # 最小特征值阈值，过滤低纹理角点
         self.lk_min_eig_threshold = 0.001
+
+        # ---- 畸变参数（PnP 可选使用） ----
+        calib = config.get("Dataset", {}).get("Calibration", {})
+        self.use_distortion_in_pnp = fft_cfg.get(
+            "use_distortion_in_pnp", calib.get("distorted", False)
+        )
+        if self.use_distortion_in_pnp:
+            self.dist_coeffs = np.array([
+                calib.get("k1", 0.0), calib.get("k2", 0.0),
+                calib.get("p1", 0.0), calib.get("p2", 0.0),
+                calib.get("k3", 0.0),
+            ], dtype=np.float64)
+        else:
+            self.dist_coeffs = None
 
         # ---- 一致性检查参数 ----
         self.max_init_translation = float(fft_cfg.get("max_init_translation", 0.35))
@@ -50,9 +65,26 @@ class FFTGuidedRGBDVO:
         self._prev_kp_pts = None   # [N, 2] float32, 上一帧在 FFT mask 内的角点像素坐标
         self._prev_gray = None     # 上一帧灰度图
 
+        # ---- EAGS 风格：refined pose cache ----
+        self.pose_cache = {}       # frame_id → c2w tensor [4, 4] on CUDA
+
     # ========================================================================
     # 对外接口
     # ========================================================================
+    def update_pose(self, frame_id, refined_c2w):
+        """EAGS 风格：保存 render tracking refinement 后的最终 pose。
+        FFTVO 后续估计必须优先使用 refined pose 作为上一帧全局位姿基准。
+        """
+        if isinstance(refined_c2w, np.ndarray):
+            refined_c2w = torch.from_numpy(refined_c2w.astype(np.float32))
+        self.pose_cache[frame_id] = refined_c2w.float().cuda().detach()
+        if self.debug_log:
+            Log(f"[FFTVO] pose feedback updated: frame={frame_id}")
+        # 限制缓存大小
+        if len(self.pose_cache) > 100:
+            oldest = min(self.pose_cache.keys())
+            del self.pose_cache[oldest]
+
     def estimate(self, prev_cam, cur_cam, prev_c2w):
         """
         输入:
@@ -65,10 +97,15 @@ class FFTGuidedRGBDVO:
             init_c2w: torch.Tensor, shape [4, 4], float32, on CUDA
             info: dict
         """
-        # ---- 0. 类型统一 ----
+        # ---- 0. 类型统一 + EAGS 风格 refined pose feedback ----
         if isinstance(prev_c2w, np.ndarray):
             prev_c2w = torch.from_numpy(prev_c2w.astype(np.float32))
         prev_c2w = prev_c2w.float().cuda()
+
+        # 优先使用 render tracking feedback 的 refined pose
+        prev_uid = getattr(prev_cam, "uid", -1)
+        if prev_uid >= 0 and prev_uid in self.pose_cache:
+            prev_c2w = self.pose_cache[prev_uid].clone()
 
         # ---- 1. 读取 RGB 图像 ----
         rgb_prev_np = self._camera_rgb_to_numpy(prev_cam)
@@ -169,7 +206,7 @@ class FFTGuidedRGBDVO:
         K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
 
         success_pnp, rvec, tvec, inliers = cv2.solvePnPRansac(
-            pts_3d_ok, pts_cur_ok, K, None,
+            pts_3d_ok, pts_cur_ok, K, self.dist_coeffs,
             reprojectionError=self.ransac_reproj_error,
             confidence=self.ransac_confidence,
             iterationsCount=self.ransac_iterations,
@@ -183,11 +220,22 @@ class FFTGuidedRGBDVO:
             }
 
         n_inliers = len(inliers)
+        inlier_ratio = n_inliers / max(1, n_valid_3d)
+
         if n_inliers < self.min_inliers:
             return False, torch.eye(4, device="cuda"), {
                 "error": "too_few_inliers",
                 "n_inliers": n_inliers,
                 "n_3d": n_valid_3d,
+                "inlier_ratio": inlier_ratio,
+            }
+
+        if inlier_ratio < self.min_inlier_ratio:
+            return False, torch.eye(4, device="cuda"), {
+                "error": "low_inlier_ratio",
+                "n_inliers": n_inliers,
+                "n_3d": n_valid_3d,
+                "inlier_ratio": inlier_ratio,
             }
 
         # ---- 9. 构造 T_cur_prev ----
@@ -222,6 +270,7 @@ class FFTGuidedRGBDVO:
             "n_tracked": n_tracked,
             "n_3d": n_valid_3d,
             "n_inliers": n_inliers,
+            "inlier_ratio": inlier_ratio,
             "delta_t": float(delta_t),
             "delta_deg": float(delta_deg),
         }

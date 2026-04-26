@@ -122,8 +122,6 @@ LoopClosure:
 
   # ===== PGO Parameters =====
   default_odom_info_scale: 120.0
-  enable_chain_pgo_without_loop: true
-  chain_pgo_window: 4
   recent_query_submaps: 2
   pgo_edge_prune_thres: 0.25
 

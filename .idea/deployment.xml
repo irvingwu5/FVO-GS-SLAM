@@ -5,7 +5,7 @@
       <paths name="my2dgsslam@10.23.71.63:22 password">
         <serverdata>
           <mappings>
-            <mapping deploy="/home/wuxiangyu/Documents/PycharmProjects/SubGS-SLAM/" local="$PROJECT_DIR$" web="/" />
+            <mapping deploy="/home/wuxiangyu/Documents/PycharmProjects/FVO-GS-SLAM" local="$PROJECT_DIR$" web="/" />
           </mappings>
         </serverdata>
       </paths>

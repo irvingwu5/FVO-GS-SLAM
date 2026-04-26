@@ -73,6 +73,43 @@ Training:
   max_init_gaussian_scale: 0.06
 
 # ============================================================
+# FFT VO Configuration
+# ============================================================
+FFTVO:
+  use_fft_vo_init: true
+  use_const_speed_candidate: false
+  use_previous_candidate: true
+  use_fft_vo_candidate: true
+  allow_fft_vo_override_pose: true
+  disable_fftvo_after_submap_start: true
+  fftvo_warmup_frames_after_submap_start: 10
+  fftvo_min_improvement_ratio: 0.75
+  fftvo_max_delta_t: 0.025
+  fftvo_max_delta_deg: 2.0
+  fftvo_min_inliers: 250
+  fftvo_min_inlier_ratio: 0.70
+  enable_pose_feedback: true
+  reduce_tracking_iters_when_selected: false
+  max_features: 1200
+  min_features: 120
+  min_tracked: 120
+  min_inliers: 100
+  min_inlier_ratio: 0.45
+  min_depth: 0.1
+  max_depth: 5.0
+  ransac_reproj_error: 1.5
+  ransac_confidence: 0.999
+  ransac_iterations: 100
+  max_init_translation: 0.08
+  max_init_rotation_deg: 5.0
+  use_distortion_in_pnp: true
+  debug_log: true
+  log_candidate_losses: true
+  # Tracking iteration control
+  selected_tracking_itr_ratio: 0.7
+  min_tracking_itr_num: 30
+
+# ============================================================
 # Submap Configuration
 # ============================================================
 Submap:
@@ -109,10 +146,16 @@ LoopClosure:
   # ===== PGO Parameters =====
   default_odom_info_scale: 120.0
   global_seed_default_odom_info_scale: 1.0e-3
-  enable_chain_pgo_without_loop: false
-  chain_pgo_window: 4
   recent_query_submaps: 4
   pgo_edge_prune_thres: 0.25
+
+  # PGO protection
+  debug_disable_pgo_for_fftvo_test: true
+  min_loop_fitness_for_pgo: 0.40
+  max_loop_rmse_for_pgo: 0.04
+  max_loop_delta_t_for_pgo: 1.5
+  max_loop_delta_r_for_pgo: 45.0
+
 
 # ============================================================
 # Gaussian Optimization Parameters
