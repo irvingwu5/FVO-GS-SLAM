@@ -76,27 +76,10 @@ Training:
 # Submap Configuration
 # ============================================================
 Submap:
-  # ===== Basic Thresholds =====
-  trans_thre: 1.80
-  rot_thre: 100.0
-
-  # ===== Protection Parameters =====
-  min_frames: 20            # 一个子图至少先跑这么多帧
-  min_kfs: 6                # 一个子图至少先积累这么多关键帧
-  recent_kfs: 3             # 用最近 3 个关键帧检查与旧子图的重叠
-  cut_overlap: 0.40         # 最近关键帧最大重叠低于它，才算"真的要离开旧子图"
-  cut_overlap_hard: 0.25    # 极低重叠，用于非关键帧情况下的强 novel 保护
-  cut_confirm_frames: 2     # 连续满足 2 次再切，防止单帧噪声误切
-  cancel_overlap: 0.65      # 如果重叠又回来了，就取消 pending cut
-
-  # ===== Mode Parameters =====
-  hard_trans_mult: 1.35     # 平移远超阈值时允许更快切图
-  hard_rot_mult: 1.20       # 旋转远超阈值时进入"强旋转模式"
-  rot_only_overlap_guard: 0.55  # 纯旋转切图时必须仍然要求 overlap 不高
+  # ===== Submap Cut Thresholds (motion-only, relative to submap start frame) =====
+  trans_thre: 0.5
+  rot_thre: 50
   use_global_seed_submap: true
-  indep_cut_overlap_guard: 0.75
-  indep_cut_hard_overlap_guard: 0.60
-  indep_cancel_overlap: 0.80
 
 # ============================================================
 # Loop Closure Configuration

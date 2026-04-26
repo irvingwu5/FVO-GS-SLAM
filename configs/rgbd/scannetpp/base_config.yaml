@@ -88,11 +88,12 @@ Training:
 # Submap Configuration
 # ============================================================
 Submap:
-  # ===== Basic Thresholds =====
-  trans_thre: 1.0     # 平移切图阈值(米)
-  rot_thre: 45           # 旋转切图阈值(度)
+  # ===== Submap Cut Thresholds (motion-only, relative to submap start frame) =====
+  trans_thre: 0.5
+  rot_thre: 50
 
-  # ===== Mode Parameters =====
+  # ===== Backend Submap Parameters =====
+  seed_init_iters: 700
   enable_cut_local_ba: true
   cut_local_ba_iters: 40
   cut_local_prune_iters: 8

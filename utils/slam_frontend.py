@@ -63,29 +63,7 @@ class FrontEnd(mp.Process):
         self.is_first_frame_of_submap = False  # 标记当前帧是否为子图的第一帧
         self.submap_anchor_pose = None #运动监控锚点
         self.cut_refine_iters = self.config.get("Submap", {}).get("cut_refine_iters", 0)
-        # ===== 更稳的切图策略参数 =====
-        self.submap_min_frames = self.config.get("Submap", {}).get("min_frames", 20)
-        self.submap_min_kfs = self.config.get("Submap", {}).get("min_kfs", 6)
-        self.submap_recent_kfs = self.config.get("Submap", {}).get("recent_kfs", 3)
-
-        self.submap_cut_overlap = self.config.get("Submap", {}).get("cut_overlap", 0.40)
-        self.submap_cut_overlap_hard = self.config.get("Submap", {}).get("cut_overlap_hard", 0.25)
-        self.submap_cut_confirm_frames = self.config.get("Submap", {}).get("cut_confirm_frames", 2)
-        self.submap_cancel_overlap = self.config.get("Submap", {}).get("cancel_overlap", 0.65)
-
-        self.submap_hard_trans_mult = self.config.get("Submap", {}).get("hard_trans_mult", 1.35)
-        self.submap_hard_rot_mult = self.config.get("Submap", {}).get("hard_rot_mult", 1.20)
-        self.submap_rot_only_overlap_guard = self.config.get("Submap", {}).get("rot_only_overlap_guard", 0.55)
-
         self.submap_start_frame_idx = 0
-        self.submap_cut_pending = False
-        self.submap_cut_pending_count = 0
-        # ===== true-independent + global-seed 模式下的更严格切图保护 =====
-        # 只有当当前视野已经明显脱离旧子图时，才允许真的切图并清空旧地图。
-        self.indep_cut_overlap_guard = self.config.get("Submap", {}).get("indep_cut_overlap_guard", 0.75)
-        self.indep_cut_hard_overlap_guard = self.config.get("Submap", {}).get("indep_cut_hard_overlap_guard", 0.60)
-        self.indep_cancel_overlap = self.config.get("Submap", {}).get("indep_cancel_overlap", 0.80)
-        # ====================================
         self.fft_filter = None  # 频域滤波器实例
         # 消融实验开关
         self.use_submap = self.config.get("Ablation", {}).get("use_submap", True)
@@ -115,11 +93,7 @@ class FrontEnd(mp.Process):
         self.iteration_count = 0
         self.occ_aware_visibility = {}
         self.current_window = []
-        #========= 子图切换策略相关状态重置 ==========
         self.submap_start_frame_idx = cur_frame_idx
-        self.submap_cut_pending = False
-        self.submap_cut_pending_count = 0
-        #===========================================
         # remove everything from the queues
         while not self.backend_queue.empty():
             self.backend_queue.get()
@@ -449,7 +423,7 @@ class FrontEnd(mp.Process):
         return window, removed_frame
 
     # ========================================================================
-    # 8. Submap Cutting — Motion & Visibility Utilities
+    # 8. Submap Cutting — Motion Utility
     # ========================================================================
     def compute_submap_motion(self, current_c2w, anchor_c2w):
         if anchor_c2w is None:
@@ -465,153 +439,26 @@ class FrontEnd(mp.Process):
         angle_deg = angle_rad * 180.0 / np.pi
         return translation, angle_deg
 
-    def compute_visibility_overlap(self, vis_a, vis_b, mode="simpson"):
-        if vis_a is None or vis_b is None:
-            return 1.0
-
-        intersection = torch.logical_and(vis_a, vis_b).count_nonzero().float()
-        if mode == "iou":
-            denom = torch.logical_or(vis_a, vis_b).count_nonzero().float()
-        else:
-            denom = torch.minimum(
-                vis_a.count_nonzero().float(),
-                vis_b.count_nonzero().float(),
-            )
-
-        if denom.item() <= 0:
-            return 0.0
-        return (intersection / denom).item()
-
-    def get_recent_submap_keyframes(self):
-        recent_kfs = []
-        for kf_idx in self.current_window:
-            if self.frame_to_submap.get(kf_idx, self.current_submap_id) != self.current_submap_id:
-                continue
-            recent_kfs.append(kf_idx)
-            if len(recent_kfs) >= self.submap_recent_kfs:
-                break
-        return recent_kfs
-
-    def compute_submap_cut_metrics(self, cur_frame_idx, current_c2w, curr_visibility):
-        translation, angle_deg = self.compute_submap_motion(current_c2w, self.submap_anchor_pose)
-
-        recent_kfs = self.get_recent_submap_keyframes()
-        overlap_scores = []
-        for kf_idx in recent_kfs:
-            kf_visibility = self.occ_aware_visibility.get(kf_idx, None)
-            if kf_visibility is None:
-                continue
-            overlap_scores.append(
-                self.compute_visibility_overlap(curr_visibility, kf_visibility, mode="simpson")
-            )
-
-        max_recent_overlap = max(overlap_scores) if len(overlap_scores) > 0 else 1.0
-        last_kf_overlap = overlap_scores[0] if len(overlap_scores) > 0 else 1.0
-        num_submap_kfs = sum(
-            1
-            for kf_idx in self.current_window
-            if self.frame_to_submap.get(kf_idx, self.current_submap_id) == self.current_submap_id
-        )
-
-        return {
-            "translation": translation,
-            "rotation_deg": angle_deg,
-            "max_recent_overlap": max_recent_overlap,
-            "last_kf_overlap": last_kf_overlap,
-            "num_submap_kfs": num_submap_kfs,
-            "frames_since_anchor": cur_frame_idx - self.submap_start_frame_idx,
-            "recent_kfs": recent_kfs,
-        }
-
     # ========================================================================
-    # 9. Submap Cutting — Decision
+    # 9. Submap Cutting — Decision (motion-only)
     # ========================================================================
-    def should_start_new_submap(self, cur_frame_idx, current_c2w, curr_visibility, create_kf):
+    def should_start_new_submap(self, current_c2w):
         if not self.use_submap:
             return False, None
 
         if self.submap_anchor_pose is None:
             return False, None
 
-        metrics = self.compute_submap_cut_metrics(cur_frame_idx, current_c2w, curr_visibility)
+        translation, angle_deg = self.compute_submap_motion(current_c2w, self.submap_anchor_pose)
 
-        # 1) 子图先要"长大"
-        mature_enough = (
-                metrics["frames_since_anchor"] >= self.submap_min_frames
-                and metrics["num_submap_kfs"] >= self.submap_min_kfs
-        )
-        if not mature_enough:
-            self.submap_cut_pending = False
-            self.submap_cut_pending_count = 0
-            return False, metrics
-
-        # 2) 先看运动是否达到预触发
-        soft_motion = (
-                metrics["translation"] > self.submap_trans_thre
-                or metrics["rotation_deg"] > self.submap_rot_thre
-        )
-        if not soft_motion:
-            self.submap_cut_pending = False
-            self.submap_cut_pending_count = 0
-            return False, metrics
-
-        max_overlap = metrics["max_recent_overlap"]
-
-        # 默认 overlap 判据（兼容旧逻辑）
-        low_overlap = max_overlap < self.submap_cut_overlap
-        hard_low_overlap = max_overlap < self.submap_cut_overlap_hard
-        cancel_overlap = self.submap_cancel_overlap
-
-        # true-independent + global-seed 模式下，切图后 backend 会清空旧地图。
-        # 因此只有在"视野明显离开旧子图"时才允许切图。
-        strict_independent_mode = self.use_global_seed_submap
-
-        if strict_independent_mode:
-            low_overlap = max_overlap < self.indep_cut_overlap_guard
-            hard_low_overlap = max_overlap < self.indep_cut_hard_overlap_guard
-            cancel_overlap = self.indep_cancel_overlap
-
-        # 3) 不在普通 tracking 帧上硬切，除非 overlap 已经非常低
-        if (not create_kf) and (not hard_low_overlap):
-            return False, metrics
-
-        # 4) 真正"非常离开旧子图"时，允许更快切
-        hard_translation = metrics["translation"] > (
-                self.submap_trans_thre * self.submap_hard_trans_mult
-        )
-        hard_rotation = (
-                metrics["rotation_deg"] > (self.submap_rot_thre * self.submap_hard_rot_mult)
-                and max_overlap < self.submap_rot_only_overlap_guard
-        )
-
-        # true-independent 模式下，即使 hard_translation 成立，
-        # 只要 overlap 还很高，也绝不允许硬切。
-        if strict_independent_mode:
-            if create_kf and hard_low_overlap and (hard_translation or hard_rotation):
-                self.submap_cut_pending = False
-                self.submap_cut_pending_count = 0
-                return True, metrics
-        else:
-            if create_kf and (hard_translation or (hard_rotation and low_overlap)):
-                self.submap_cut_pending = False
-                self.submap_cut_pending_count = 0
-                return True, metrics
-
-        # 5) 连续确认，防抖
-        if create_kf and low_overlap:
-            self.submap_cut_pending = True
-            self.submap_cut_pending_count += 1
-        else:
-            if max_overlap > cancel_overlap:
-                self.submap_cut_pending = False
-                self.submap_cut_pending_count = 0
-
-        if self.submap_cut_pending and self.submap_cut_pending_count >= self.submap_cut_confirm_frames:
-            self.submap_cut_pending = False
-            self.submap_cut_pending_count = 0
+        if translation > self.submap_trans_thre or angle_deg > self.submap_rot_thre:
+            metrics = {
+                "translation": translation,
+                "rotation_deg": angle_deg,
+            }
             return True, metrics
 
-        return False, metrics
+        return False, None
 
     # ========================================================================
     # 10. Submap Cutting — Execution
@@ -623,10 +470,6 @@ class FrontEnd(mp.Process):
             "cut_pose_c2w": current_c2w.detach().cpu().numpy(),
             "translation": cut_metrics["translation"],
             "rotation_deg": cut_metrics["rotation_deg"],
-            "max_recent_overlap": cut_metrics["max_recent_overlap"],
-            "last_kf_overlap": cut_metrics["last_kf_overlap"],
-            "num_submap_kfs": cut_metrics["num_submap_kfs"],
-            "frames_since_anchor": cut_metrics["frames_since_anchor"],
         }
         cut_info_path = os.path.join(
             self.config["Results"]["save_dir"],
@@ -686,9 +529,7 @@ class FrontEnd(mp.Process):
         Log(
             f"==> 启动新子图 (ID: {self.current_submap_id + 1}) | "
             f"trans={cut_metrics['translation']:.3f}m, "
-            f"rot={cut_metrics['rotation_deg']:.1f}°, "
-            f"max_overlap={cut_metrics['max_recent_overlap']:.3f}, "
-            f"submap_kfs={cut_metrics['num_submap_kfs']} <=="
+            f"rot={cut_metrics['rotation_deg']:.1f}° <=="
         )
 
         self.save_submap_cut_info(current_c2w, cut_metrics)
@@ -755,8 +596,6 @@ class FrontEnd(mp.Process):
         # 新子图运动监控锚点就是 seed 的全局位姿
         self.submap_anchor_pose = current_c2w.clone()
         self.submap_start_frame_idx = cur_frame_idx
-        self.submap_cut_pending = False
-        self.submap_cut_pending_count = 0
         self.is_first_frame_of_submap = True
 
         # 5) 用当前 seed 帧初始化新子图。
@@ -979,12 +818,7 @@ class FrontEnd(mp.Process):
                     create_kf = check_time and create_kf
 
                 # Submap cut decision
-                should_cut_submap, cut_metrics = self.should_start_new_submap(
-                    cur_frame_idx,
-                    current_c2w,
-                    curr_visibility,
-                    create_kf,
-                )
+                should_cut_submap, cut_metrics = self.should_start_new_submap(current_c2w)
 
                 if should_cut_submap:
                     did_cut = self.perform_submap_cut(
