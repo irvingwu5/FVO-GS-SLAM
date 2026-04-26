@@ -1,4 +1,6 @@
-## SLAM parameters
+# ============================================================
+# Results Configuration
+# ============================================================
 Results:
   save_results: True
   save_dir: "tum_results"
@@ -8,6 +10,9 @@ Results:
   eval_rendering: False
   use_wandb: False
 
+# ============================================================
+# Dataset Configuration
+# ============================================================
 Dataset:
   type: 'tum'
   sensor_type: 'depth'
@@ -16,15 +21,21 @@ Dataset:
   adaptive_pointsize: True
   point_size: 0.01
 
+# ============================================================
+# Training Configuration
+# ============================================================
 Training:
-  #Initialization
+  # ===== Initialization Parameters =====
   init_itr_num: 1050
   init_gaussian_update: 100
   init_gaussian_reset: 500
   init_gaussian_th: 0.005
   init_gaussian_extent: 30
-  # Tracking and Mapping
+
+  # ===== Tracking Parameters =====
   tracking_itr_num: 100
+
+  # ===== Mapping Parameters =====
   mapping_itr_num: 180
   gaussian_update_every: 150
   gaussian_update_offset: 50
@@ -32,106 +43,106 @@ Training:
   gaussian_extent: 1.0
   gaussian_reset: 2001
   size_threshold: 20
+
+  # ===== Keyframe Parameters =====
   kf_interval: 5
-  window_size: 10
-  pose_window: 5
-  edge_threshold: 1.1
-  rgb_boundary_threshold: 0.01
-  alpha: 0.9
   kf_translation: 0.08
   kf_min_translation: 0.05
   kf_overlap: 0.9
   kf_cutoff: 0.3
-  prune_mode: 'slam'
-  single_thread: False
-  spherical_harmonics: False
+
+  # ===== Window Parameters =====
+  window_size: 10
+  pose_window: 5
+
+  # ===== Learning Rate =====
   lr:
     cam_rot_delta: 0.003
     cam_trans_delta: 0.001
+
+  # ===== Other Training Parameters =====
+  edge_threshold: 1.1
+  rgb_boundary_threshold: 0.01
+  alpha: 0.9
+  prune_mode: 'slam'
+  single_thread: False
+  spherical_harmonics: False
   #近景幕布gs+雾片挡相机，限制gs尺寸
   low_freq_scale_multiplier: 1.05
   min_init_gaussian_scale: 0.002
   max_init_gaussian_scale: 0.06
 
+# ============================================================
+# Submap Configuration
+# ============================================================
 Submap:
+  # ===== Basic Thresholds =====
   trans_thre: 1.80
   rot_thre: 100.0
-  #修改子图切图策略相关参数，增加了重叠度的判断，避免过早切图导致的地图碎片化和漂移
+
+  # ===== Protection Parameters =====
   min_frames: 20            # 一个子图至少先跑这么多帧
   min_kfs: 6                # 一个子图至少先积累这么多关键帧
-
   recent_kfs: 3             # 用最近 3 个关键帧检查与旧子图的重叠
-  cut_overlap: 0.40         # 最近关键帧最大重叠低于它，才算“真的要离开旧子图”
+  cut_overlap: 0.40         # 最近关键帧最大重叠低于它，才算"真的要离开旧子图"
   cut_overlap_hard: 0.25    # 极低重叠，用于非关键帧情况下的强 novel 保护
   cut_confirm_frames: 2     # 连续满足 2 次再切，防止单帧噪声误切
   cancel_overlap: 0.65      # 如果重叠又回来了，就取消 pending cut
 
+  # ===== Mode Parameters =====
   hard_trans_mult: 1.35     # 平移远超阈值时允许更快切图
-  hard_rot_mult: 1.20       # 旋转远超阈值时进入“强旋转模式”
+  hard_rot_mult: 1.20       # 旋转远超阈值时进入"强旋转模式"
   rot_only_overlap_guard: 0.55  # 纯旋转切图时必须仍然要求 overlap 不高
-  # ========== 新增：真正独立子图模式 ==========
-  true_independent_submap: True   # true=彻底清空旧地图，false=保留部分旧点（流式）
   use_global_seed_submap: true
   indep_cut_overlap_guard: 0.75
   indep_cut_hard_overlap_guard: 0.60
   indep_cancel_overlap: 0.80
-  # ===========================================
-  # 以下参数仅在 true_independent_submap: false 时生效
-  use_critical_point_selection: true
-  selection_strategy: simple
-  retention_ratio: 0.30
-  num_spatial_clusters: 10
-  seed_init_iters: 700
-  enable_cut_local_ba: true
-  cut_local_ba_iters: 80
-  cut_local_prune_iters: 0
-  cut_refine_iters: 40
-  #微调子图第一帧而不是固定死，0为固定
-  seed_prior_weight_trans: 0.0
-  seed_prior_weight_rot: 0.0
 
-
-# 【改进】：显存管理参数
-MemoryManagement:
-  # 每次子图切分后强制释放显存缓存
-  empty_cache_on_submap_cut: true
-
-
+# ============================================================
+# Loop Closure Configuration
+# ============================================================
 LoopClosure:
+  # ===== Basic Parameters =====
   enable_adjacent_odom: false
-  # 【新增】：流式回环检测参数
   keep_recent_submaps: 3         # 显存中只保留最近 3 个子图
-  #===============================
+  min_interval: 3
+  voxel_size: 0.02
+  feature_keep_ratio: 0.30
+
+  # ===== Loop Detection Thresholds =====
   max_loop_delta_translation: 1.5
   max_loop_delta_rotation_deg: 60.0
   icp_fitness_threshold: 0.40
 
+  # ===== Adjacent Submap Constraints =====
   adjacent_icp_fitness_threshold: 0.20
   adjacent_icp_rmse_threshold: 0.04
-  adjacent_confidence_scale: 1.0        # Scale for confidence in edge weighting
   max_adjacent_delta_translation: 0.10
   max_adjacent_delta_rotation_deg: 5.0
-  default_odom_info_scale: 120.0
-
-  enable_chain_pgo_without_loop: false
-  chain_pgo_window: 4
-  recent_query_submaps: 4
-
-  pgo_edge_prune_thres: 0.25
-  min_interval: 3
-  voxel_size: 0.02
-
   adjacent_edge_weight: 0.35
   adjacent_info_min_scale: 0.5
   adjacent_info_max_scale: 8.0
-  feature_keep_ratio: 0.30
 
-  # global seed 模式下，未精炼相邻边只给极弱约束
+  # ===== PGO Parameters =====
+  default_odom_info_scale: 120.0
   global_seed_default_odom_info_scale: 1.0e-3
+  enable_chain_pgo_without_loop: false
+  chain_pgo_window: 4
+  recent_query_submaps: 4
+  pgo_edge_prune_thres: 0.25
 
-## 3DGS default parameters
+# ============================================================
+# Gaussian Optimization Parameters
+# ============================================================
 opt_params:
+  # ===== Iteration Parameters =====
   iterations: 30000
+  densify_from_iter: 500
+  densify_until_iter: 15000
+  densification_interval: 100
+  opacity_reset_interval: 3000
+
+  # ===== Learning Rates =====
   position_lr_init: 0.00016
   position_lr_final: 0.0000016
   position_lr_delay_mult: 0.01
@@ -140,15 +151,18 @@ opt_params:
   opacity_lr: 0.05
   scaling_lr: 0.001
   rotation_lr: 0.001
+
+  # ===== Densification Parameters =====
   percent_dense: 0.01
-  lambda_sensor_normal: 0.001
-  lambda_dssim: 0.2
-  densification_interval: 100
-  opacity_reset_interval: 3000
-  densify_from_iter: 500
-  densify_until_iter: 15000
   densify_grad_threshold: 0.0002
 
+  # ===== Loss Parameters =====
+  lambda_sensor_normal: 0.001
+  lambda_dssim: 0.2
+
+# ============================================================
+# Model Parameters
+# ============================================================
 model_params:
   sh_degree: 0
   source_path: ""
@@ -157,6 +171,9 @@ model_params:
   white_background: False
   data_device: "cuda"
 
+# ============================================================
+# Pipeline Parameters
+# ============================================================
 pipeline_params:
   convert_SHs_python: False
   compute_cov3D_python: False
@@ -165,6 +182,10 @@ pipeline_params:
   # surf depth is either median or expected by setting depth_ratio to 1 or 0
   # for bounded scene, use median depth, i.e., depth_ratio = 1;
   # for unbounded scene, use expected depth, i.e., depth_ration = 0, to reduce disk anliasing.
+
+# ============================================================
+# Ablation Switches
+# ============================================================
 Ablation:
   use_submap: True         # (2) 是否开启子图切图策略 (关闭时退化为全局单地图)
   use_loop_closure: True    # (3)&(4) 是否开启回环检测与全局 PGO 修正

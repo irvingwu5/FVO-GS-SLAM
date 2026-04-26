@@ -1,3 +1,6 @@
+# ============================================================
+# Results Configuration
+# ============================================================
 Results:
   save_results: True
   save_dir: "scannetpp_results"
@@ -7,13 +10,16 @@ Results:
   eval_rendering: False
   use_wandb: False
 
+# ============================================================
+# Dataset Configuration
+# ============================================================
 Dataset:
+  type: 'scannetpp'
   sensor_type: 'depth'
   pcd_downsample: 64 #其他阶段下采样因子，保留1/64%点云
   pcd_downsample_init: 32 #初始阶段下采样因子
   adaptive_pointsize: True #点大小乘中值深度得到场景中点的实际大小，限制最小为0.05
   point_size: 0.05 # 影响scales的初始化
-  type: 'scannetpp'
   Calibration:
     fx: 1427.94375 #190.3925
     fy: 1427.94375 #190.3925
@@ -29,14 +35,21 @@ Dataset:
     depth_scale: 1000.0
     distorted: False
 
-
+# ============================================================
+# Training Configuration
+# ============================================================
 Training:
+  # ===== Initialization Parameters =====
   init_itr_num: 1050 # 首帧初始化时优化的迭代次数
   init_gaussian_update: 100 #每隔多少次进行一次gs密化和修剪
   init_gaussian_reset: 500 #当总迭代次数iter_count达到该值时，把gs不透明度重置为0.01
   init_gaussian_th: 0.005 #该值设置必须小于0.01，由于reset opacity为0.01<0.02，则全员gs被剪枝，0.005->0.02
   init_gaussian_extent: 30 #对densify的影响:值越大倾向于clone,值越小倾向于split,对prune的影响:值越大浮空伪影无法被剔除，值越小容易过度剔除，背景空洞
+
+  # ===== Tracking Parameters =====
   tracking_itr_num: 100 #每帧跟踪优化的迭代次数
+
+  # ===== Mapping Parameters =====
   mapping_itr_num: 150 #建图阶段每处理一个新关键帧时的优化迭代次数150->4dtam 5
   gaussian_update_every: 150 #每隔多少次进行一次gs密化和修剪,
   gaussian_update_offset: 50 #当总迭代次数为50、50+150、50+2*150、50+3*150...时进行gs密化和修剪
@@ -44,66 +57,87 @@ Training:
   gaussian_extent: 1.0 #4dtam 30.0 #gs的scaling>该值*camera_extent*0.1时被剔除
   gaussian_reset: 2001 #当总迭代次数iter_count达到该值时，把gs不透明度重置为0.01
   size_threshold: 20 #20->50, 如果max_radii2d(好像全0)>投影gs尺寸阈值，则被剔除
-  kf_interval: 4 #4->5，创建关键帧的间隔帧数
-  window_size: 10 #关键帧滑动窗口
-  pose_window: 5 #5->4dtam 3,只更新滑动窗口中位姿优化窗口内的相机位姿
-  edge_threshold: 4 #4->4dtam 1.1
-  rgb_boundary_threshold: 0.01
 
+  # ===== Keyframe Parameters =====
+  kf_interval: 4 #4->5，创建关键帧的间隔帧数
   kf_translation: 0.04
   kf_min_translation: 0.02 #0.02->4dtam 0.05
   kf_overlap: 0.95 #0.95->4dtam 0.9
-  prune_mode: 'slam'
-  single_thread: False
-  spherical_harmonics: False
+
+  # ===== Window Parameters =====
+  window_size: 10 #关键帧滑动窗口
+  pose_window: 5 #5->4dtam 3,只更新滑动窗口中位姿优化窗口内的相机位姿
+
+  # ===== Learning Rate =====
   lr:
     cam_rot_delta: 0.003
     cam_trans_delta: 0.001
+
+  # ===== Other Training Parameters =====
+  edge_threshold: 4 #4->4dtam 1.1
+  rgb_boundary_threshold: 0.01
+  prune_mode: 'slam'
+  single_thread: False
+  spherical_harmonics: False
   #近景幕布gs+雾片挡相机，限制gs尺寸
   low_freq_scale_multiplier: 1.05
   min_init_gaussian_scale: 0.002
   max_init_gaussian_scale: 0.06
 
-
+# ============================================================
+# Submap Configuration
+# ============================================================
 Submap:
+  # ===== Basic Thresholds =====
   trans_thre: 1.0     # 平移切图阈值(米)
   rot_thre: 45           # 旋转切图阈值(度)
-  # ========== 新增：真正独立子图模式 ==========
-  true_independent_submap: True   # true=彻底清空旧地图，false=保留部分旧点（流式）
-  # ===========================================
-  # 以下参数仅在 true_independent_submap: false 时生效
-  use_critical_point_selection: true
-  selection_strategy: simple
-  retention_ratio: 0.30
-  num_spatial_clusters: 10
-  seed_init_iters: 700
+
+  # ===== Mode Parameters =====
   enable_cut_local_ba: true
   cut_local_ba_iters: 40
   cut_local_prune_iters: 8
   cut_refine_iters: 20
+  seed_init_iters: 700
 
+# ============================================================
+# Loop Closure Configuration
+# ============================================================
 LoopClosure:
+  # ===== Basic Parameters =====
+  min_interval: 3
+  voxel_size: 0.05
   max_search_range: 5 #限制参与位姿图优化（PGO）的最近子图数量，控制搜索范围、计算量和内存占用
+
+  # ===== Loop Detection Thresholds =====
   max_loop_delta_translation: 0.80
   max_loop_delta_rotation_deg: 45.0
   icp_fitness_threshold: 0.60
 
+  # ===== Adjacent Submap Constraints =====
   adjacent_icp_fitness_threshold: 0.45
   adjacent_icp_rmse_threshold: 0.03
   max_adjacent_delta_translation: 0.25
   max_adjacent_delta_rotation_deg: 12.0
-  default_odom_info_scale: 120.0
 
+  # ===== PGO Parameters =====
+  default_odom_info_scale: 120.0
   enable_chain_pgo_without_loop: true
   chain_pgo_window: 4
   recent_query_submaps: 2
-
   pgo_edge_prune_thres: 0.25
-  min_interval: 3
-  voxel_size: 0.05
 
+# ============================================================
+# Gaussian Optimization Parameters
+# ============================================================
 opt_params:
+  # ===== Iteration Parameters =====
   iterations: 30000
+  densify_from_iter: 500 #当总迭代次iter_count数达到该值时，把gs不透明度重置为0.01
+  densify_until_iter: 15000
+  densification_interval: 100
+  opacity_reset_interval: 3000
+
+  # ===== Learning Rates =====
   position_lr_init: 0.00016
   position_lr_final: 0.0000016
   position_lr_delay_mult: 0.01
@@ -112,15 +146,18 @@ opt_params:
   opacity_lr: 0.05
   scaling_lr: 0.001
   rotation_lr: 0.001
+
+  # ===== Densification Parameters =====
   percent_dense: 0.01 #0.01->0.03
-  lambda_sensor_normal: 0.001 #
-  lambda_dssim: 0.2
-  densification_interval: 100
-  opacity_reset_interval: 3000
-  densify_from_iter: 500 #当总迭代次iter_count数达到该值时，把gs不透明度重置为0.01
-  densify_until_iter: 15000
   densify_grad_threshold: 0.0002 #0.0002->0.0006
 
+  # ===== Loss Parameters =====
+  lambda_sensor_normal: 0.001 #
+  lambda_dssim: 0.2
+
+# ============================================================
+# Model Parameters
+# ============================================================
 model_params:
   sh_degree: 0
   source_path: ""
@@ -129,6 +166,9 @@ model_params:
   white_background: False
   data_device: "cuda"
 
+# ============================================================
+# Pipeline Parameters
+# ============================================================
 pipeline_params:
   convert_SHs_python: False
   compute_cov3D_python: False
@@ -137,6 +177,10 @@ pipeline_params:
   # surf depth is either median or expected by setting depth_ratio to 1 or 0
   # for bounded scene, use median depth, i.e., depth_ratio = 1;
   # for unbounded scene, use expected depth, i.e., depth_ration = 0, to reduce disk anliasing.
+
+# ============================================================
+# Ablation Switches
+# ============================================================
 Ablation:
   use_submap: True           # (2) 是否开启子图切图策略 (关闭时退化为全局单地图)
   use_loop_closure: True     # (3)&(4) 是否开启回环检测与全局 PGO 修正
