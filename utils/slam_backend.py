@@ -78,6 +78,10 @@ class BackEnd(mp.Process):
         self.backend_pose_check_eps_r_deg = float(self.config.get("Backend", {}).get(
             "backend_pose_check_eps_r_deg", 1.0e-6
         ))
+        self.pose_check_log_every = int(self.config.get("Backend", {}).get(
+            "pose_check_log_every", 50
+        ))
+        self._pose_check_call_count = 0
 
         Log(
             f"[BackendPosePolicy] optimize_keyframe_pose={self.optimize_keyframe_pose}, "
@@ -469,8 +473,8 @@ class BackEnd(mp.Process):
             max_dr = 0.0
             restored_frames = []
             # float32 合理容忍阈值
-            _eps_t = 1e-5
-            _eps_r_deg = 1e-4
+            _eps_t = 1e-5      # m
+            _eps_r_deg = 0.05  # deg
 
             for kf_idx, T_before in pose_backup.items():
                 if kf_idx not in self.viewpoints:
@@ -492,9 +496,15 @@ class BackEnd(mp.Process):
                         if self.viewpoints[kf_idx].cam_trans_delta is not None:
                             self.viewpoints[kf_idx].cam_trans_delta.requires_grad_(False)
 
+            self._pose_check_call_count += 1
+            should_log = (
+                restored > 0
+                or (self._pose_check_call_count % self.pose_check_log_every == 0)
+            )
             if restored == 0:
-                # 一切正常，不逐帧打印
-                pass
+                if should_log:
+                    Log(f"[BackendPoseCheck] checked={checked}, restored=0, "
+                        f"max_dt={max_dt:.3e}m, max_dr={max_dr:.3e}deg — pose stable")
             else:
                 Log(
                     f"[BackendPoseCheck] checked={checked}, restored={restored}, "

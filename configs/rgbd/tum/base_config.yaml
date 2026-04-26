@@ -84,7 +84,7 @@ FFTVO:
   disable_fftvo_after_submap_start: true
   fftvo_warmup_frames_after_submap_start: 10
   fftvo_min_improvement_ratio: 0.75
-  fftvo_max_delta_t: 0.025
+  fftvo_max_delta_t: 0.030
   fftvo_max_delta_deg: 2.0
   fftvo_min_inliers: 250
   fftvo_min_inlier_ratio: 0.70
@@ -109,6 +109,11 @@ FFTVO:
   selected_tracking_itr_ratio: 0.7
   min_tracking_itr_num: 30
 
+  # Rescue mode: 小步 refinement 选择
+  enable_rescue_mode: true
+  rescue_trial_iters: 8
+  rescue_accept_refined_loss_ratio: 0.99
+  rescue_log: true
 # ============================================================
 # Backend Mapping Configuration (EAGS-style: Gaussian only)
 # ============================================================
@@ -119,6 +124,7 @@ Backend:
   backend_restore_pose_if_changed: true
   backend_pose_check_eps_t: 1.0e-8
   backend_pose_check_eps_r_deg: 1.0e-6
+  pose_check_log_every: 50
 
 # ============================================================
 # Submap Configuration

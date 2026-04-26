@@ -103,11 +103,17 @@ class FrontEnd(mp.Process):
         # ===== FFTVO refined pose feedback (EAGS 风格) =====
         self.enable_pose_feedback = fftvo_cfg.get("enable_pose_feedback", True)
 
+        # ===== FFTVO rescue mode (EAGS 风格多候选小步 refinement) =====
+        self.enable_rescue_mode = fftvo_cfg.get("enable_rescue_mode", True)
+        self.rescue_trial_iters = int(fftvo_cfg.get("rescue_trial_iters", 8))
+        self.rescue_accept_refined_loss_ratio = float(fftvo_cfg.get("rescue_accept_refined_loss_ratio", 0.99))
+        self.rescue_log = fftvo_cfg.get("rescue_log", True)
+
         self.fft_vo_stats = {
             "success": 0, "fail": 0,
-            "rejected_by_loss": 0, "rejected_by_quality": 0,
-            "selected_previous": 0, "selected_const_speed": 0,
-            "selected_fft_vo": 0,
+            "selected_previous": 0, "selected_direct_fftvo": 0,
+            "rescue_accepted": 0, "rescue_rejected": 0,
+            "hard_rejected": 0,
         }
 
     # ========================================================================
@@ -303,6 +309,72 @@ class FrontEnd(mp.Process):
 
         return loss.item()
 
+    # ========================================================================
+    # Rescue mode: 小步 render refinement 不污染正式 tracking
+    # ========================================================================
+    def _rescue_trial_refine(self, viewpoint, candidate_w2c, iters):
+        """对候选位姿运行 iters 次小步 render tracking refinement。
+        完全恢复 viewpoint 状态，不修改 Gaussian，不更新 exposure。
+        返回 (refined_loss, refined_w2c)。"""
+        # 保存完整状态
+        orig_T = viewpoint.T.clone()
+        orig_rot_delta = viewpoint.cam_rot_delta.data.clone()
+        orig_trans_delta = viewpoint.cam_trans_delta.data.clone()
+        orig_fixed = viewpoint.fixed_pose
+
+        # 设置候选位姿
+        viewpoint.T = candidate_w2c.clone()
+        viewpoint.reset_pose_deltas()
+        viewpoint.fixed_pose = False
+        viewpoint.cam_rot_delta.requires_grad_(True)
+        viewpoint.cam_trans_delta.requires_grad_(True)
+
+        # 只优化当前帧 pose，不优化 exposure
+        trial_opt_params = [
+            {"params": [viewpoint.cam_rot_delta],
+             "lr": self.config["Training"]["lr"]["cam_rot_delta"],
+             "name": f"rescue_rot_{viewpoint.uid}"},
+            {"params": [viewpoint.cam_trans_delta],
+             "lr": self.config["Training"]["lr"]["cam_trans_delta"],
+             "name": f"rescue_trans_{viewpoint.uid}"},
+        ]
+        trial_optimizer = torch.optim.Adam(trial_opt_params)
+
+        best_loss = float("inf")
+        best_T = None
+        for _ in range(iters):
+            render_pkg = render(
+                viewpoint, self.gaussians, self.pipeline_params, self.background, surf=False
+            )
+            image, depth, opacity = (
+                render_pkg["render"], render_pkg["depth"], render_pkg["opacity"],
+            )
+            trial_optimizer.zero_grad()
+            loss_val = get_loss_tracking(self.config, image, depth, opacity, viewpoint)
+            loss_val.backward()
+
+            with torch.no_grad():
+                trial_optimizer.step()
+                converged = update_pose(viewpoint)
+                current_loss = loss_val.item()
+                if current_loss < best_loss:
+                    best_loss = current_loss
+                    best_T = viewpoint.T.clone()
+                del render_pkg
+                if converged:
+                    break
+
+        refined_loss = best_loss if best_loss < float("inf") else float("inf")
+        refined_w2c = best_T.clone() if best_T is not None else candidate_w2c.clone()
+
+        # 恢复原始状态
+        viewpoint.T = orig_T
+        viewpoint.cam_rot_delta.data.copy_(orig_rot_delta)
+        viewpoint.cam_trans_delta.data.copy_(orig_trans_delta)
+        viewpoint.fixed_pose = orig_fixed
+
+        return refined_loss, refined_w2c
+
     def select_best_tracking_init(self, cur_frame_idx, viewpoint):
         """构造候选初值，EAGS 风格保守选择：默认 previous；FFTVO 只在明显优于
         previous 且通过严格质量门控时才被接受。子图 warmup 期 FFTVO 只诊断不接管。
@@ -378,46 +450,88 @@ class FrontEnd(mp.Process):
         reason = fft_vo_reject_reason if fft_vo_reject_reason else "default"
         prev_loss = losses.get("previous", float("inf"))
 
-        # fft_vo: 必须通过严格质量门控 + 明显优于 previous
+        # ---- FFTVO 三层门控：hard reject / direct accept / rescue trial ----
         if "fft_vo" in losses and fft_vo_info is not None:
             fft_loss = losses["fft_vo"]
-            current_best_loss = losses.get(best_name, prev_loss)
+            prev_loss_val = losses.get("previous", float("inf"))
 
-            n_inliers = fft_vo_info.get("n_inliers", 0)
-            inlier_ratio = fft_vo_info.get("inlier_ratio", 0)
-            delta_t = fft_vo_info.get("delta_t", 0)
-            delta_deg = fft_vo_info.get("delta_deg", 0)
+            n_inl = fft_vo_info.get("n_inliers", 0)
+            inl_r = fft_vo_info.get("inlier_ratio", 0)
+            d_t = fft_vo_info.get("delta_t", 0)
+            d_d = fft_vo_info.get("delta_deg", 0)
 
-            if not self.allow_fft_vo_override_pose:
-                fft_vo_reject_reason = "override_disabled"
-            elif n_inliers < self.fftvo_min_inliers:
-                fft_vo_reject_reason = "insufficient_inliers"
-            elif inlier_ratio < self.fftvo_min_inlier_ratio:
-                fft_vo_reject_reason = "low_inlier_ratio"
-            elif delta_t > self.fftvo_max_delta_t or delta_deg > self.fftvo_max_delta_deg:
-                fft_vo_reject_reason = "large_motion"
-            elif fft_loss >= current_best_loss * self.fftvo_min_improvement_ratio:
-                fft_vo_reject_reason = "weak_improvement"
-            else:
+            # --- Tier 1: Hard Reject ---
+            if inl_r < 0.60 or n_inl < 100 or d_t > 0.05 or d_d > 4.0:
+                reason = "hard_reject"
+                self.fft_vo_stats["hard_rejected"] += 1
+                if self.fft_vo.debug_log:
+                    tag = []
+                    if inl_r < 0.60: tag.append("low_inlier_ratio")
+                    if n_inl < 100: tag.append("too_few_inliers")
+                    if d_t > 0.05: tag.append("large_motion_t")
+                    if d_d > 4.0: tag.append("large_motion_r")
+                    Log(f"[FFTVO] hard reject frame={cur_frame_idx} reason={'+'.join(tag)} "
+                        f"n_inl={n_inl} ratio={inl_r:.3f} dt={d_t:.3f}m ddeg={d_d:.1f}°")
+
+            # --- Tier 2: Direct Accept ---
+            elif (not in_warmup
+                  and fft_loss < prev_loss_val * 0.75
+                  and n_inl >= 250 and inl_r >= 0.70
+                  and d_t <= 0.03 and d_d <= 2.0):
                 best_name = "fft_vo"
                 best_w2c = fft_vo_w2c
-                reason = (f"fft_loss={fft_loss:.4f} < best_loss={current_best_loss:.4f}"
-                          f"*{self.fftvo_min_improvement_ratio}")
-
-            if best_name != "fft_vo":
-                key = "rejected_by_loss" if fft_vo_reject_reason == "weak_improvement" else "rejected_by_quality"
-                self.fft_vo_stats[key] += 1
+                reason = "direct_accept: strong_loss_and_geometry"
+                self.fft_vo_stats["selected_direct_fftvo"] += 1
                 if self.fft_vo.debug_log:
-                    Log(f"[FFTVO] frame {cur_frame_idx}: rejected ({fft_vo_reject_reason}) "
-                        f"n_inliers={n_inliers}, inlier_ratio={inlier_ratio:.3f}, "
-                        f"delta_t={delta_t:.3f}m, delta_deg={delta_deg:.1f}°, "
-                        f"fft_loss={fft_loss:.4f}, best_loss={current_best_loss:.4f}")
+                    Log(f"[FFTVO] frame {cur_frame_idx}: direct accept "
+                        f"fft_loss={fft_loss:.4f} prev_loss={prev_loss_val:.4f} "
+                        f"n_inl={n_inl} ratio={inl_r:.3f} dt={d_t:.3f}m ddeg={d_d:.1f}°")
+
+            # --- Tier 3: Rescue Trial ---
+            elif (self.enable_rescue_mode and not in_warmup
+                  and fft_loss < prev_loss_val * 0.90
+                  and n_inl >= 100 and inl_r >= 0.60
+                  and d_t <= 0.05 and d_d <= 4.0):
+
+                if self.rescue_log:
+                    Log(f"[FFTVO-Rescue] frame={cur_frame_idx} "
+                        f"previous_init_loss={prev_loss_val:.4f} fft_init_loss={fft_loss:.4f}")
+
+                prev_refined_loss, prev_refined_w2c = self._rescue_trial_refine(
+                    viewpoint, prev_w2c, self.rescue_trial_iters)
+                fft_refined_loss, fft_refined_w2c = self._rescue_trial_refine(
+                    viewpoint, fft_vo_w2c, self.rescue_trial_iters)
+
+                if self.rescue_log:
+                    Log(f"[FFTVO-Rescue] previous_refined={prev_refined_loss:.4f} "
+                        f"fft_refined={fft_refined_loss:.4f}")
+
+                if fft_refined_loss < prev_refined_loss * self.rescue_accept_refined_loss_ratio:
+                    best_name = "fft_vo"
+                    best_w2c = fft_refined_w2c
+                    reason = "rescue: refined_loss_better"
+                    self.fft_vo_stats["rescue_accepted"] += 1
+                    if self.rescue_log:
+                        Log(f"[FFTVO-Rescue] selected=fft_vo reason={reason}")
+                else:
+                    self.fft_vo_stats["rescue_rejected"] += 1
+                    if self.rescue_log:
+                        Log(f"[FFTVO-Rescue] selected=previous reason=fft_refined not better")
+                    if self.fft_vo.debug_log:
+                        Log(f"[FFTVO] frame {cur_frame_idx}: rejected (weak_improvement) "
+                            f"fft_loss={fft_loss:.4f} prev_loss={prev_loss_val:.4f} "
+                            f"n_inl={n_inl} ratio={inl_r:.3f} dt={d_t:.3f}m ddeg={d_d:.1f}°")
+
+            # --- Not rescued, not direct, not hard reject: just weak reject ---
+            else:
+                if self.fft_vo.debug_log:
+                    Log(f"[FFTVO] frame {cur_frame_idx}: rejected (weak_improvement) "
+                        f"fft_loss={fft_loss:.4f} prev_loss={prev_loss_val:.4f} "
+                        f"n_inl={n_inl} ratio={inl_r:.3f} dt={d_t:.3f}m ddeg={d_d:.1f}°")
 
         # ---- 统计 ----
         if best_name == "previous":
             self.fft_vo_stats["selected_previous"] += 1
-        elif best_name == "fft_vo":
-            self.fft_vo_stats["selected_fft_vo"] += 1
 
         # ---- 候选 loss 日志 ----
         if self.log_candidate_losses:
@@ -1158,9 +1272,10 @@ class FrontEnd(mp.Process):
                     if self.use_fft_vo_init:
                         s = self.fft_vo_stats
                         Log(f"[FFTVO] Stats: success={s['success']}, fail={s['fail']}, "
-                            f"selected_fft_vo={s['selected_fft_vo']}, "
-                            f"rejected_by_loss={s['rejected_by_loss']}, "
-                            f"rejected_by_quality={s['rejected_by_quality']}, "
-                            f"selected_previous={s['selected_previous']}")
+                            f"selected_previous={s['selected_previous']}, "
+                            f"direct_accept={s['selected_direct_fftvo']}, "
+                            f"hard_rejected={s['hard_rejected']}, "
+                            f"rescue_accepted={s['rescue_accepted']}, "
+                            f"rescue_rejected={s['rescue_rejected']}")
                     Log("Frontend Stopped.")
                     break
