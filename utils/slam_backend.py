@@ -57,9 +57,6 @@ class BackEnd(mp.Process):
         self.current_submap_seed_global_c2w = np.eye(4, dtype=np.float64)
 
         # ===== 子图切割参数 =====
-        self.enable_cut_local_ba = self.config.get("Submap", {}).get("enable_cut_local_ba", True)
-        self.cut_local_ba_iters = self.config.get("Submap", {}).get("cut_local_ba_iters", 40)
-        self.cut_local_prune_iters = self.config.get("Submap", {}).get("cut_local_prune_iters", 8)
         self.seed_init_iters = self.config.get("Submap", {}).get("seed_init_iters", 500)
 
     # ========================================================================
@@ -423,38 +420,7 @@ class BackEnd(mp.Process):
         return submap_keyframe_poses
 
     # ========================================================================
-    # 8. Submap Freezing (Local BA before checkpoint)
-    # ========================================================================
-    def finalize_submap_before_freeze(self):
-        if not self.enable_cut_local_ba:
-            return
-
-        if len(self.current_window) == 0:
-            return
-
-        if self.keyframe_optimizers is None:
-            Log("[SubmapLocalBA] skip: keyframe_optimizers is None")
-            return
-
-        ba_iters = max(int(self.cut_local_ba_iters), 0)
-        prune_iters = max(int(self.cut_local_prune_iters), 0)
-
-        Log(
-            f"[SubmapLocalBA] freeze 前局部优化开始 | "
-            f"window={len(self.current_window)}, "
-            f"ba_iters={ba_iters}, prune_iters={prune_iters}"
-        )
-
-        if ba_iters > 0:
-            self.map(self.current_window, prune=False, iters=ba_iters)
-
-        if prune_iters > 0:
-            self.map(self.current_window, prune=True, iters=prune_iters)
-
-        Log("[SubmapLocalBA] freeze 前局部优化完成")
-
-    # ========================================================================
-    # 9. Color Refinement (offline)
+    # 8. Color Refinement (offline)
     # ========================================================================
     def color_refinement(self):
         Log("Starting color refinement")
@@ -705,8 +671,6 @@ class BackEnd(mp.Process):
                     self.current_submap_id = completed_submap_id + 1
                     self.current_submap_seed_global_c2w = new_seed_global_c2w.copy()
                     Log(f"==> Backend received new_submap signal. Freezing submap {completed_submap_id}...")
-
-                    self.finalize_submap_before_freeze()
 
                     save_dir = self.config["Results"]["save_dir"]
                     submaps_dir = os.path.join(save_dir, "submaps")
