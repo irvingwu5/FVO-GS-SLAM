@@ -122,6 +122,17 @@ FFTVO:
   min_tracking_itr_num: 30
 
 # ============================================================
+# Backend Mapping Configuration (EAGS-style: Gaussian only)
+# ============================================================
+Backend:
+  optimize_keyframe_pose: false
+  optimize_keyframe_exposure: false
+  backend_pose_sanity_check: true
+  backend_restore_pose_if_changed: true
+  backend_pose_check_eps_t: 1.0e-8
+  backend_pose_check_eps_r_deg: 1.0e-6
+
+# ============================================================
 # Submap Configuration
 # ============================================================
 Submap:

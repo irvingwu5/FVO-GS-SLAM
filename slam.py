@@ -636,7 +636,7 @@ if __name__ == "__main__":
     save_dir = None
 
     if args.eval:
-        Log("Running SA-GS-SLAM in Evaluation Mode")
+        Log("Running FVO-GS-SLAM in Evaluation Mode")
         Log("Following config will be overriden")
         Log("\tsave_results=True")
         config["Results"]["save_results"] = True

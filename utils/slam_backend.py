@@ -59,6 +59,32 @@ class BackEnd(mp.Process):
         # ===== 子图切割参数 =====
         self.seed_init_iters = self.config.get("Submap", {}).get("seed_init_iters", 500)
 
+        # ===== Backend pose policy (EAGS 风格: Gaussian only) =====
+        self.optimize_keyframe_pose = self.config.get("Backend", {}).get(
+            "optimize_keyframe_pose", False
+        )
+        self.optimize_keyframe_exposure = self.config.get("Backend", {}).get(
+            "optimize_keyframe_exposure", False
+        )
+        self.backend_pose_sanity_check = self.config.get("Backend", {}).get(
+            "backend_pose_sanity_check", True
+        )
+        self.backend_restore_pose_if_changed = self.config.get("Backend", {}).get(
+            "backend_restore_pose_if_changed", True
+        )
+        self.backend_pose_check_eps_t = float(self.config.get("Backend", {}).get(
+            "backend_pose_check_eps_t", 1.0e-8
+        ))
+        self.backend_pose_check_eps_r_deg = float(self.config.get("Backend", {}).get(
+            "backend_pose_check_eps_r_deg", 1.0e-6
+        ))
+
+        Log(
+            f"[BackendPosePolicy] optimize_keyframe_pose={self.optimize_keyframe_pose}, "
+            f"optimize_keyframe_exposure={self.optimize_keyframe_exposure}, "
+            f"pose_sanity_check={self.backend_pose_sanity_check}"
+        )
+
     # ========================================================================
     # 2. Hyperparameters
     # ========================================================================
@@ -192,11 +218,41 @@ class BackEnd(mp.Process):
         Log("Initialized map")
 
     # ========================================================================
-    # 6. Map Optimization (Local BA)
+    # 6. Map Optimization (Gaussian only)
     # ========================================================================
-    def map(self, current_window, prune=False, iters=1):
+    def _backup_window_poses(self, current_window):
+        pose_backup = {}
+        for kf_idx in current_window:
+            if kf_idx in self.viewpoints:
+                pose_backup[int(kf_idx)] = self.viewpoints[kf_idx].T.detach().clone()
+        return pose_backup
+
+    @staticmethod
+    def _pose_delta_stats(T_before, T_after):
+        c2w_before = torch.linalg.inv(T_before.detach()).cpu()
+        c2w_after = torch.linalg.inv(T_after.detach()).cpu()
+        delta = torch.linalg.inv(c2w_before) @ c2w_after
+        dt = torch.linalg.norm(delta[:3, 3]).item()
+        R = delta[:3, :3]
+        cos_angle = ((torch.trace(R) - 1.0) / 2.0).clamp(-1.0, 1.0)
+        dr = torch.rad2deg(torch.acos(cos_angle)).item()
+        return dt, dr
+
+    def map(self, current_window, prune=False, iters=1,
+            optimize_pose=None, optimize_exposure=None):
         if len(current_window) == 0:
             return
+
+        if optimize_pose is None:
+            optimize_pose = self.optimize_keyframe_pose
+        if optimize_exposure is None:
+            optimize_exposure = self.optimize_keyframe_exposure
+
+        # ---- 后端 pose sanity check ----
+        pose_backup = (
+            self._backup_window_poses(current_window)
+            if self.backend_pose_sanity_check else {}
+        )
 
         viewpoint_stack = [self.viewpoints[kf_idx] for kf_idx in current_window]
         random_viewpoint_stack = []
@@ -380,29 +436,76 @@ class BackEnd(mp.Process):
                     )
                     gaussian_split = True
 
-                if self.keyframe_optimizers is not None:
-                    self.gaussians.optimizer.step()
-                    self.gaussians.optimizer.zero_grad(set_to_none=True)
-                    self.gaussians.update_learning_rate(self.iteration_count)
+                # Gaussian optimizer 始终 step
+                self.gaussians.optimizer.step()
+                self.gaussians.optimizer.zero_grad(set_to_none=True)
+                self.gaussians.update_learning_rate(self.iteration_count)
 
+                if optimize_pose and self.keyframe_optimizers is not None:
                     self.keyframe_optimizers.step()
                     self.keyframe_optimizers.zero_grad(set_to_none=True)
 
                     frames_to_optimize = self.config["Training"]["pose_window"]
                     for cam_idx in range(min(frames_to_optimize, len(current_window))):
                         viewpoint = viewpoint_stack[cam_idx]
-
-                        is_fixed_pose = getattr(viewpoint, "fixed_pose", False)
-
-                        if is_fixed_pose:
+                        if getattr(viewpoint, "fixed_pose", False):
                             viewpoint.reset_pose_deltas()
                             continue
-
                         update_pose(viewpoint)
                 else:
-                    self.gaussians.optimizer.step()
-                    self.gaussians.optimizer.zero_grad(set_to_none=True)
-                    self.gaussians.update_learning_rate(self.iteration_count)
+                    # optimize_pose=false: 冻结所有 keyframe pose
+                    for viewpoint in viewpoint_stack:
+                        viewpoint.reset_pose_deltas()
+                        if viewpoint.cam_rot_delta is not None:
+                            viewpoint.cam_rot_delta.requires_grad_(False)
+                        if viewpoint.cam_trans_delta is not None:
+                            viewpoint.cam_trans_delta.requires_grad_(False)
+
+        # ---- 后端 pose sanity check（汇总输出，避免刷屏）----
+        if self.backend_pose_sanity_check and pose_backup:
+            checked = 0
+            restored = 0
+            max_dt = 0.0
+            max_dr = 0.0
+            restored_frames = []
+            # float32 合理容忍阈值
+            _eps_t = 1e-5
+            _eps_r_deg = 1e-4
+
+            for kf_idx, T_before in pose_backup.items():
+                if kf_idx not in self.viewpoints:
+                    continue
+                T_after = self.viewpoints[kf_idx].T.detach()
+                dt, dr = self._pose_delta_stats(T_before, T_after)
+                checked += 1
+                max_dt = max(max_dt, dt)
+                max_dr = max(max_dr, dr)
+
+                if not optimize_pose and (dt > _eps_t or dr > _eps_r_deg):
+                    restored += 1
+                    restored_frames.append((kf_idx, dt, dr))
+                    if self.backend_restore_pose_if_changed:
+                        self.viewpoints[kf_idx].T = T_before.clone()
+                        self.viewpoints[kf_idx].reset_pose_deltas()
+                        if self.viewpoints[kf_idx].cam_rot_delta is not None:
+                            self.viewpoints[kf_idx].cam_rot_delta.requires_grad_(False)
+                        if self.viewpoints[kf_idx].cam_trans_delta is not None:
+                            self.viewpoints[kf_idx].cam_trans_delta.requires_grad_(False)
+
+            if restored == 0:
+                # 一切正常，不逐帧打印
+                pass
+            else:
+                Log(
+                    f"[BackendPoseCheck] checked={checked}, restored={restored}, "
+                    f"max_dt={max_dt:.6e}m, max_dr={max_dr:.6e}deg"
+                )
+                for fid, dt, dr in restored_frames:
+                    Log(
+                        f"[BackendPoseCheck][ERROR] Backend changed keyframe pose "
+                        f"although optimize_pose=false! frame={fid} "
+                        f"dt={dt:.6e}m dr={dr:.6e}deg"
+                    )
 
         return gaussian_split
 
@@ -501,10 +604,6 @@ class BackEnd(mp.Process):
                     continue
 
                 if self.single_thread:
-                    time.sleep(0.01)
-                    continue
-
-                if self.keyframe_optimizers is None:
                     time.sleep(0.01)
                     continue
 
@@ -615,43 +714,50 @@ class BackEnd(mp.Process):
                             len(self.current_window)
                             == self.config["Training"]["window_size"]
                         ):
-                            frames_to_optimize = (
-                                self.config["Training"]["window_size"] - 1
-                            )
                             iter_per_kf = 50 if self.live_mode else 300
                             Log("Performing initial BA for initialization")
                         else:
                             iter_per_kf = self.mapping_itr_num
 
                     for cam_idx in range(len(self.current_window)):
-                        viewpoint = self.viewpoints[current_window[cam_idx]]
+                        vp = self.viewpoints[current_window[cam_idx]]
                         should_opt = (cam_idx < frames_to_optimize)
 
-                        if should_opt and not getattr(viewpoint, "fixed_pose", False):
-                            rot_lr = self.config["Training"]["lr"]["cam_rot_delta"] * 0.5
-                            trans_lr = self.config["Training"]["lr"]["cam_trans_delta"] * 0.5
+                        if should_opt and not getattr(vp, "fixed_pose", False):
+                            if self.optimize_keyframe_pose:
+                                rot_lr = self.config["Training"]["lr"]["cam_rot_delta"] * 0.5
+                                trans_lr = self.config["Training"]["lr"]["cam_trans_delta"] * 0.5
+                                opt_params.append({
+                                    "params": [vp.cam_rot_delta],
+                                    "lr": rot_lr,
+                                    "name": "rot_{}".format(vp.uid),
+                                })
+                                opt_params.append({
+                                    "params": [vp.cam_trans_delta],
+                                    "lr": trans_lr,
+                                    "name": "trans_{}".format(vp.uid),
+                                })
+                            else:
+                                vp.reset_pose_deltas()
+                                vp.cam_rot_delta.requires_grad_(False)
+                                vp.cam_trans_delta.requires_grad_(False)
 
-                            opt_params.append({
-                                "params": [viewpoint.cam_rot_delta],
-                                "lr": rot_lr,
-                                "name": "rot_{}".format(viewpoint.uid),
-                            })
-                            opt_params.append({
-                                "params": [viewpoint.cam_trans_delta],
-                                "lr": trans_lr,
-                                "name": "trans_{}".format(viewpoint.uid),
-                            })
-                            opt_params.append({
-                                "params": [viewpoint.exposure_a],
-                                "lr": 0.01,
-                                "name": "exposure_a_{}".format(viewpoint.uid),
-                            })
-                            opt_params.append({
-                                "params": [viewpoint.exposure_b],
-                                "lr": 0.01,
-                                "name": "exposure_b_{}".format(viewpoint.uid),
-                            })
-                    self.keyframe_optimizers = torch.optim.Adam(opt_params)
+                            if self.optimize_keyframe_exposure:
+                                opt_params.append({
+                                    "params": [vp.exposure_a],
+                                    "lr": 0.01,
+                                    "name": "exposure_a_{}".format(vp.uid),
+                                })
+                                opt_params.append({
+                                    "params": [vp.exposure_b],
+                                    "lr": 0.01,
+                                    "name": "exposure_b_{}".format(vp.uid),
+                                })
+
+                    if len(opt_params) > 0:
+                        self.keyframe_optimizers = torch.optim.Adam(opt_params)
+                    else:
+                        self.keyframe_optimizers = None
                     self.map(self.current_window, iters=iter_per_kf)
                     self.map(self.current_window, prune=True)
                     self.push_to_frontend("keyframe")
@@ -671,6 +777,10 @@ class BackEnd(mp.Process):
                     self.current_submap_id = completed_submap_id + 1
                     self.current_submap_seed_global_c2w = new_seed_global_c2w.copy()
                     Log(f"==> Backend received new_submap signal. Freezing submap {completed_submap_id}...")
+                    Log(
+                        f"[SubmapSave] optimize_keyframe_pose={self.optimize_keyframe_pose}, "
+                        f"keyframe poses are frontend tracking poses"
+                    )
 
                     save_dir = self.config["Results"]["save_dir"]
                     submaps_dir = os.path.join(save_dir, "submaps")
