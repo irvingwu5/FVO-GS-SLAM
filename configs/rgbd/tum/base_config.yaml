@@ -77,8 +77,8 @@ Training:
 # ============================================================
 Submap:
   # ===== Submap Cut Thresholds (motion-only, relative to submap start frame) =====
-  trans_thre: 0.5
-  rot_thre: 50
+  trans_thre: 1.5
+  rot_thre: 60
   use_global_seed_submap: true
 
 # ============================================================

@@ -219,6 +219,10 @@ class FrontEnd(mp.Process):
         if self.is_first_frame_of_submap:
             Log(f"[DEBUG] tracking() consumed first-frame flag at frame {cur_frame_idx}")
 
+            # 从切图帧继承全局位姿，防止新子图第一帧从单位阵开始导致轨迹跳变
+            prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
+            viewpoint.T = prev.T.clone()
+
             viewpoint.fixed_pose = True
             viewpoint.reset_pose_deltas()
             viewpoint.cam_rot_delta.requires_grad_(False)
