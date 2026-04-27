@@ -118,15 +118,11 @@ def _rebuild_submap_anchors_from_ckpts(save_dir):
         prev_sid = all_sids[i - 1]
         curr_sid = all_sids[i]
 
-        curr_ckpt = torch.load(sid_to_ckpt[curr_sid], map_location="cpu")
-        if "prev_submap_tsfm_refined" in curr_ckpt:
-            rel_prev_from_curr = np.array(curr_ckpt["prev_submap_tsfm_refined"], dtype=np.float64)
-        else:
-            prev_ckpt = torch.load(sid_to_ckpt[prev_sid], map_location="cpu")
-            rel_prev_from_curr = np.array(
-                prev_ckpt.get("next_submap_relative_pose", prev_ckpt.get("relative_pose", np.eye(4))),
-                dtype=np.float64
-            )
+        prev_ckpt = torch.load(sid_to_ckpt[prev_sid], map_location="cpu")
+        rel_prev_from_curr = np.array(
+            prev_ckpt.get("relative_pose", np.eye(4)),
+            dtype=np.float64
+        )
 
         anchors[curr_sid] = anchors[prev_sid] @ rel_prev_from_curr
 

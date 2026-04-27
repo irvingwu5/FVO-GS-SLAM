@@ -45,6 +45,7 @@ class GaussianModel:
         self._rotation = torch.empty(0, device="cuda") # 高斯旋转(四元数) (高斯数量,4)
         self._opacity = torch.empty(0, device="cuda") # 高斯不透明度  (高斯数量,1)
         # 不参与优化的辅助变量
+        self._normal = torch.empty(0, device="cuda")  # 世界坐标系 2DGS surfel 法线 (N,3)
         self.max_radii2D = torch.empty(0, device="cuda") # 高斯投影后的最大半径(通过计算2D协方差矩阵的特征值，取其最大值的平方根，再乘以3并向上取整得到的) (高斯数量,)
         self.xyz_gradient_accum = torch.empty(0, device="cuda") # 高斯位置(均值)的累积梯度 (高斯数量,1)
         #这两个变量用于追踪高斯点的来源（哪个关键帧）和稳定性（被观测了多少次），主要用于增量式建图场景。
@@ -403,13 +404,15 @@ class GaussianModel:
         assert rots.shape[0] == N
         assert opacities.shape[0] == N
 
-        return fused_point_cloud, features, scales, rots, opacities
+        normals_tensor = torch.from_numpy(normals_np).float() if normals_np is not None else torch.zeros((fused_point_cloud.shape[0], 3))
+        return fused_point_cloud, features, scales, rots, opacities, normals_tensor
 
     def init_lr(self, spatial_lr_scale):
         self.spatial_lr_scale = spatial_lr_scale # 高斯位置(均值)学习率缩放, mu_new = mu_old - lr*partial{loss}/partial{mu}
 
     def extend_from_pcd(
-        self, fused_point_cloud, features, scales, rots, opacities, kf_id
+        self, fused_point_cloud, features, scales, rots, opacities, kf_id,
+        normals=None,
     ):
         new_xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         new_features_dc = nn.Parameter(
@@ -434,17 +437,17 @@ class GaussianModel:
             new_rotation,
             new_kf_ids=new_unique_kfIDs,
             new_n_obs=new_n_obs,
+            new_normals=normals,
         )
 
     def extend_from_pcd_seq(
         self, cam_info, kf_id=-1, init=False, scale=2.0, depthmap=None
     ):
-        fused_point_cloud, features, scales, rots, opacities = (
+        fused_point_cloud, features, scales, rots, opacities, normals = (
             self.create_pcd_from_image(cam_info, init, scale=scale, depthmap=depthmap)
-        ) #基于相机信息生成点云相关数据并解包
-        # 将这些数据传给另一个方法进行模型扩展
+        )
         self.extend_from_pcd(
-            fused_point_cloud, features, scales, rots, opacities, kf_id
+            fused_point_cloud, features, scales, rots, opacities, kf_id, normals=normals
         )
 
     def training_setup(self, training_args):
@@ -531,6 +534,11 @@ class GaussianModel:
             l.append("rot_{}".format(i))
         return l
 
+    def _derive_normal_from_rotation(self):
+        """从 _rotation 推导 world-frame 法线 (rotation 的局部 z 轴)。"""
+        rot_mat = build_rotation(self._rotation).detach()  # (N,3,3)
+        return rot_mat[:, :, 2]  # (N,3)
+
     def capture_dict(self):
         """
         将当前高斯子图的所有参数及优化器状态打包为字典，转移至 CPU。
@@ -551,6 +559,8 @@ class GaussianModel:
             "denom": self.denom.detach().cpu(),
             "unique_kfIDs": self.unique_kfIDs.detach().cpu(),
             "n_obs": self.n_obs.detach().cpu(),
+            "_normal": (self._normal.detach().cpu() if len(self._normal) == len(self._xyz)
+                         else self._derive_normal_from_rotation().detach().cpu()),
         }
 
         # 提取 Adam 优化器的当前动量状态（如果需要热启动）
@@ -583,6 +593,7 @@ class GaussianModel:
         self._opacity = torch.empty(0, device="cuda")
 
         # 2. 清空辅助张量
+        self._normal = torch.empty(0, device="cuda")
         self.max_radii2D = torch.empty(0, device="cuda")
         self.xyz_gradient_accum = torch.empty(0, device="cuda")
         self.denom = torch.empty(0, device="cuda")
@@ -632,6 +643,10 @@ class GaussianModel:
 
         self.unique_kfIDs = params_dict["unique_kfIDs"].int()
         self.n_obs = params_dict["n_obs"].int()
+        if "_normal" in params_dict and params_dict["_normal"].shape[0] > 0:
+            self._normal = params_dict["_normal"].cuda()
+        else:
+            self._normal = torch.empty(0, device="cuda")
 
         # 如果提供了训练参数，则重新构建优化器
         if training_args is not None:
@@ -1024,6 +1039,8 @@ class GaussianModel:
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.unique_kfIDs = self.unique_kfIDs[valid_points_mask.cpu()]
         self.n_obs = self.n_obs[valid_points_mask.cpu()]
+        if len(self._normal) == len(valid_points_mask):
+            self._normal = self._normal[valid_points_mask]
 
     # 将新的张量（tensors_dict 中的张量）添加到现有的优化器参数中，并更新优化器的状态
     # def cat_tensors_to_optimizer(self, tensors_dict):
@@ -1112,6 +1129,7 @@ class GaussianModel:
         new_rotation,
         new_kf_ids=None,
         new_n_obs=None,
+        new_normals=None,
     ): # 创建一个字典 d，包含新的高斯点属性，这里new_xyz(219,3) 新增分裂(484,3)
         d = {
             "xyz": new_xyz,
@@ -1129,6 +1147,13 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+
+        # 更新 _normal: 优先使用传入的 normals，否则从 _rotation 推导后清零重建
+        if new_normals is not None:
+            nn_new = new_normals.float().cuda()
+            self._normal = (torch.cat([self._normal, nn_new], dim=0) if len(self._normal) > 0 else nn_new)
+        else:
+            self._normal = torch.empty(0, device="cuda")
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")

@@ -6,6 +6,7 @@ import open3d as o3d
 import torch.multiprocessing as mp
 import roma
 from utils.logging_utils import Log
+from utils.registration_2dgs import load_submap_from_ckpt, registration_2dgs
 import torchvision.transforms as T
 import torchvision.models as models
 import torch.nn as nn
@@ -231,15 +232,6 @@ class LoopClosureProcess(mp.Process):
         self.max_loop_delta_translation = self.config.get("LoopClosure", {}).get("max_loop_delta_translation", 0.80)
         self.max_loop_delta_rotation_deg = self.config.get("LoopClosure", {}).get("max_loop_delta_rotation_deg", 45.0)
 
-        # ===== 相邻子图边精炼参数 =====
-        self.adjacent_icp_fitness_threshold = self.config.get("LoopClosure", {}).get("adjacent_icp_fitness_threshold", 0.45)
-        self.adjacent_icp_rmse_threshold = self.config.get("LoopClosure", {}).get("adjacent_icp_rmse_threshold", 0.03)
-        self.max_adjacent_delta_translation = self.config.get("LoopClosure", {}).get("max_adjacent_delta_translation", 0.25)
-        self.max_adjacent_delta_rotation_deg = self.config.get("LoopClosure", {}).get("max_adjacent_delta_rotation_deg", 12.0)
-        self.adjacent_edge_weight = self.config.get("LoopClosure", {}).get("adjacent_edge_weight", 0.25)
-        self.adjacent_info_min_scale = self.config.get("LoopClosure", {}).get("adjacent_info_min_scale", 0.5)
-        self.adjacent_info_max_scale = self.config.get("LoopClosure", {}).get("adjacent_info_max_scale", 8.0)
-
         # ===== PGO 参数 =====
         self.default_odom_info_scale = self.config.get("LoopClosure", {}).get("default_odom_info_scale", 120.0)
         self.global_seed_default_odom_info_scale = self.config.get("LoopClosure", {}).get("global_seed_default_odom_info_scale", 1.0e-3)
@@ -460,6 +452,26 @@ class LoopClosureProcess(mp.Process):
 
     def compute_relative_transform(self, source_id, target_id, current_pose_guesses):
         try:
+            init_guess = (
+                    np.linalg.inv(current_pose_guesses[target_id]) @
+                    current_pose_guesses[source_id]
+            )
+
+            # 2DGS registration (优先)
+            reg_method = self.config.get("LoopClosure", {}).get("registration_method", "icp")
+            src_ckpt, tgt_ckpt = self.submap_records.get(source_id), self.submap_records.get(target_id)
+            if (reg_method == "2dgs_hybrid" and src_ckpt and tgt_ckpt
+                    and os.path.exists(src_ckpt) and os.path.exists(tgt_ckpt)):
+                src_sub = load_submap_from_ckpt(src_ckpt, submap_id=source_id)
+                tgt_sub = load_submap_from_ckpt(tgt_ckpt, submap_id=target_id)
+                reg = registration_2dgs(src_sub, tgt_sub, init_guess, mode="loop")
+                if reg["successful"]:
+                    return reg["transformation"], reg["information"], True, {
+                        "fitness": reg["fitness"], "rmse": reg["inlier_rmse"],
+                        "delta_t": reg.get("delta_t", 0), "delta_r": reg.get("delta_r", 0)}
+                Log(f"[LoopClosure] 2DGS reg failed for {source_id}->{target_id}: {reg.get('reason','')}")
+
+            # Fallback: 原始 ICP
             if not self._ensure_pcd_loaded(source_id):
                 Log(f"[LoopClosure] 无法加载子图 {source_id} 的点云，跳过 ICP")
                 return np.identity(4), np.identity(6), False, {}
@@ -469,11 +481,6 @@ class LoopClosureProcess(mp.Process):
 
             source_pcd = self.submap_pcds[source_id]
             target_pcd = self.submap_pcds[target_id]
-
-            init_guess = (
-                    np.linalg.inv(current_pose_guesses[target_id]) @
-                    current_pose_guesses[source_id]
-            )
 
             coarse_icp = o3d.pipelines.registration.registration_icp(
                 source_pcd, target_pcd,
@@ -554,157 +561,7 @@ class LoopClosureProcess(mp.Process):
             return np.identity(4), np.identity(6), False, {}
 
     # ========================================================================
-    # 4.6 Adjacent Submap Edge Refinement
-    # ========================================================================
-    def _clear_refined_adjacent_edge(self, curr_sid):
-        ckpt_path = self.submap_records.get(curr_sid)
-        if ckpt_path is None or not os.path.exists(ckpt_path):
-            return
-
-        ckpt = torch.load(ckpt_path, map_location="cpu")
-
-        dirty = False
-        for key in [
-            "prev_submap_tsfm_refined",
-            "prev_submap_info_matrix",
-            "prev_submap_metrics",
-        ]:
-            if key in ckpt:
-                del ckpt[key]
-                dirty = True
-
-        if dirty:
-            torch.save(ckpt, ckpt_path)
-            Log(f"[AdjacentOdom] 已清理子图 {curr_sid} 的无效 refined adjacent edge")
-
-    def refine_adjacent_submap_edge(self, curr_sid):
-        if curr_sid <= 0:
-            return False
-
-        prev_sid = curr_sid - 1
-
-        if not self._ensure_pcd_loaded(curr_sid):
-            return False
-        if not self._ensure_pcd_loaded(prev_sid):
-            return False
-
-        all_ids = sorted(self.submap_records.keys())
-        _, current_pose_guesses = self._build_current_pose_guesses(all_ids)
-
-        init_guess = (
-                np.linalg.inv(current_pose_guesses[prev_sid]) @
-                current_pose_guesses[curr_sid]
-        )
-
-        source_pcd = self.submap_dense_pcds[curr_sid]
-        target_pcd = self.submap_dense_pcds[prev_sid]
-
-        coarse = o3d.pipelines.registration.registration_icp(
-            source_pcd,
-            target_pcd,
-            max_correspondence_distance=self.voxel_size * 8.0,
-            init=init_guess,
-            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-            criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
-                max_iteration=60, relative_fitness=1e-6, relative_rmse=1e-6
-            ),
-        )
-
-        medium = o3d.pipelines.registration.registration_icp(
-            source_pcd,
-            target_pcd,
-            max_correspondence_distance=self.voxel_size * 4.0,
-            init=coarse.transformation,
-            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-            criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
-                max_iteration=100, relative_fitness=1e-7, relative_rmse=1e-7
-            ),
-        )
-
-        fine = o3d.pipelines.registration.registration_icp(
-            source_pcd,
-            target_pcd,
-            max_correspondence_distance=self.voxel_size * 2.0,
-            init=medium.transformation,
-            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-            criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
-                max_iteration=150, relative_fitness=1e-8, relative_rmse=1e-8
-            ),
-        )
-
-        if fine.fitness < self.adjacent_icp_fitness_threshold or fine.inlier_rmse > self.adjacent_icp_rmse_threshold:
-            Log(
-                f"[AdjacentOdom] 相邻子图 {curr_sid}->{prev_sid} 精炼失败 "
-                f"(fitness={fine.fitness:.3f}, rmse={fine.inlier_rmse:.3f})"
-            )
-            self._clear_refined_adjacent_edge(curr_sid)
-            return False
-
-        refined = np.array(fine.transformation, dtype=np.float64)
-
-        delta = refined @ np.linalg.inv(init_guess)
-        delta_t = np.linalg.norm(delta[:3, 3])
-        delta_r = self._rotation_error_deg(refined, init_guess)
-
-        if delta_t > self.max_adjacent_delta_translation or delta_r > self.max_adjacent_delta_rotation_deg:
-            Log(
-                f"[AdjacentOdom] 相邻子图 {curr_sid}->{prev_sid} 偏差过大，拒绝写回 "
-                f"(delta_t={delta_t:.3f}m, delta_r={delta_r:.2f}deg)"
-            )
-            return False
-
-        large_delta = (
-                delta_t > self.max_adjacent_delta_translation or
-                delta_r > self.max_adjacent_delta_rotation_deg
-        )
-
-        info = o3d.pipelines.registration.get_information_matrix_from_point_clouds(
-            source_pcd,
-            target_pcd,
-            self.voxel_size * 2.0,
-            refined,
-        )
-
-        raw_conf = fine.fitness / max(fine.inlier_rmse, 1e-3)
-        conf = float(np.clip(raw_conf, self.adjacent_info_min_scale, self.adjacent_info_max_scale))
-
-        if large_delta:
-            penalty_t = np.exp(-max(0.0, delta_t - self.max_adjacent_delta_translation) * 4.0)
-            penalty_r = np.exp(-max(0.0, delta_r - self.max_adjacent_delta_rotation_deg) * 0.15)
-            soft_scale = max(0.05, penalty_t * penalty_r)
-            Log(
-                f"[AdjacentOdom] 相邻子图 {curr_sid}->{prev_sid} 偏差较大，但保留写回并降权 "
-                f"(delta_t={delta_t:.3f}m, delta_r={delta_r:.2f}deg, soft_scale={soft_scale:.3f})"
-            )
-        else:
-            soft_scale = 1.0
-
-        info = np.array(info, dtype=np.float64) * conf * float(self.adjacent_edge_weight) * soft_scale
-
-        ckpt_path = self.submap_records[curr_sid]
-        ckpt = torch.load(ckpt_path, map_location="cpu")
-        ckpt["prev_submap_tsfm_refined"] = refined
-        ckpt["prev_submap_info_matrix"] = info
-        ckpt["prev_submap_metrics"] = {
-            "fitness": float(fine.fitness),
-            "rmse": float(fine.inlier_rmse),
-            "delta_t": float(delta_t),
-            "delta_r": float(delta_r),
-            "raw_conf": float(raw_conf),
-            "edge_weight": float(self.adjacent_edge_weight),
-        }
-        torch.save(ckpt, ckpt_path)
-
-        Log(
-            f"[AdjacentOdom] 已写回子图 {curr_sid} 的 refined prev edge | "
-            f"fitness={fine.fitness:.3f}, rmse={fine.inlier_rmse:.3f}, "
-            f"delta_t={delta_t:.3f}, delta_r={delta_r:.2f}, "
-            f"raw_conf={raw_conf:.3f}, edge_weight={self.adjacent_edge_weight:.3f}"
-        )
-        return True
-
-    # ========================================================================
-    # 4.7 Pose Graph Optimization — Global
+    # 4.6 Pose Graph Optimization — Global
     # ========================================================================
     # --- PGO Helper: load transitions from ckpt ---
     def _load_relative_pose_from_ckpt(self, sid):
@@ -719,55 +576,19 @@ class LoopClosureProcess(mp.Process):
         return np.array(rel, dtype=np.float64)
 
     def _load_prev_to_curr_transition(self, prev_sid, curr_sid):
-        curr_ckpt_path = self.submap_records.get(curr_sid)
-
-        if curr_ckpt_path is not None and os.path.exists(curr_ckpt_path):
-            curr_ckpt = torch.load(curr_ckpt_path, map_location="cpu")
-
-            if "prev_submap_tsfm_refined" in curr_ckpt:
-                rel = curr_ckpt["prev_submap_tsfm_refined"]
-                if isinstance(rel, torch.Tensor):
-                    rel = rel.numpy()
-                return np.array(rel, dtype=np.float64)
-
-        if self.use_global_seed_submap:
-            return np.eye(4, dtype=np.float64)
-
         prev_ckpt_path = self.submap_records.get(prev_sid)
         if prev_ckpt_path is not None and os.path.exists(prev_ckpt_path):
             prev_ckpt = torch.load(prev_ckpt_path, map_location="cpu")
-
-            rel = prev_ckpt.get(
-                "next_submap_relative_pose",
-                prev_ckpt.get("relative_pose", np.eye(4, dtype=np.float64)),
-            )
-
+            rel = prev_ckpt.get("relative_pose", np.eye(4, dtype=np.float64))
             if isinstance(rel, torch.Tensor):
                 rel = rel.numpy()
-
             return np.array(rel, dtype=np.float64)
 
         return np.eye(4, dtype=np.float64)
 
     def _load_prev_to_curr_information(self, prev_sid, curr_sid):
-        curr_ckpt_path = self.submap_records.get(curr_sid)
-
-        if curr_ckpt_path is not None and os.path.exists(curr_ckpt_path):
-            curr_ckpt = torch.load(curr_ckpt_path, map_location="cpu")
-            info = curr_ckpt.get("prev_submap_info_matrix", None)
-
-            if info is not None:
-                if isinstance(info, torch.Tensor):
-                    info = info.numpy()
-                return np.array(info, dtype=np.float64)
-
-        if self.use_global_seed_submap:
-            return np.identity(6, dtype=np.float64) * float(
-                self.global_seed_default_odom_info_scale
-            )
-
-        return np.identity(6, dtype=np.float64) * (
-                float(self.default_odom_info_scale) * float(self.adjacent_edge_weight)
+        return np.identity(6, dtype=np.float64) * float(
+            self.global_seed_default_odom_info_scale
         )
 
     # --- PGO Helper: anchor chain ---
@@ -775,11 +596,6 @@ class LoopClosureProcess(mp.Process):
         anchors = {}
 
         if len(all_submap_ids) == 0:
-            return anchors
-
-        if self.use_global_seed_submap:
-            for sid in all_submap_ids:
-                anchors[sid] = np.eye(4, dtype=np.float64)
             return anchors
 
         anchors[all_submap_ids[0]] = np.eye(4, dtype=np.float64)
@@ -932,7 +748,7 @@ class LoopClosureProcess(mp.Process):
         return correction_list
 
     # ========================================================================
-    # 4.8 Apply Correction to Submaps
+    # 4.7 Apply Correction to Submaps
     # ========================================================================
     def apply_correction_to_submaps(self, correction_list):
         for correction in correction_list:
@@ -1035,10 +851,6 @@ class LoopClosureProcess(mp.Process):
                     if submap_id in self.submap_access_order:
                         self.submap_access_order.remove(submap_id)
                     self.submap_access_order.append(submap_id)
-
-                    # 1) 先精炼相邻子图边
-                    if submap_id > 0 and self.config.get("LoopClosure", {}).get("enable_adjacent_odom", False):
-                        self.refine_adjacent_submap_edge(submap_id)
 
                     if self.debug_disable_pgo_for_fftvo_test:
                         Log("[LoopClosure] PGO disabled for FFTVO ablation test")

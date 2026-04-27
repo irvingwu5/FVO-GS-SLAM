@@ -139,8 +139,9 @@ Submap:
 # Loop Closure Configuration
 # ============================================================
 LoopClosure:
+  registration_method: "2dgs_hybrid"  # choices: icp, 2dgs_hybrid
+
   # ===== Basic Parameters =====
-  enable_adjacent_odom: false
   keep_recent_submaps: 3         # 显存中只保留最近 3 个子图
   min_interval: 3
   voxel_size: 0.02
@@ -150,15 +151,6 @@ LoopClosure:
   max_loop_delta_translation: 1.5
   max_loop_delta_rotation_deg: 60.0
   icp_fitness_threshold: 0.40
-
-  # ===== Adjacent Submap Constraints =====
-  adjacent_icp_fitness_threshold: 0.20
-  adjacent_icp_rmse_threshold: 0.04
-  max_adjacent_delta_translation: 0.10
-  max_adjacent_delta_rotation_deg: 5.0
-  adjacent_edge_weight: 0.35
-  adjacent_info_min_scale: 0.5
-  adjacent_info_max_scale: 8.0
 
   # ===== PGO Parameters =====
   default_odom_info_scale: 120.0

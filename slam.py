@@ -71,15 +71,11 @@ def rebuild_submap_anchors_from_ckpts(save_dir):
         prev_sid = all_sids[i - 1]
         curr_sid = all_sids[i]
 
-        curr_ckpt = torch.load(sid_to_ckpt[curr_sid], map_location="cpu")
-        if "prev_submap_tsfm_refined" in curr_ckpt:
-            rel_prev_from_curr = np.array(curr_ckpt["prev_submap_tsfm_refined"], dtype=np.float64)
-        else:
-            prev_ckpt = torch.load(sid_to_ckpt[prev_sid], map_location="cpu")
-            rel_prev_from_curr = np.array(
-                prev_ckpt.get("next_submap_relative_pose", prev_ckpt.get("relative_pose", np.eye(4))),
-                dtype=np.float64
-            )
+        prev_ckpt = torch.load(sid_to_ckpt[prev_sid], map_location="cpu")
+        rel_prev_from_curr = np.array(
+            prev_ckpt.get("relative_pose", np.eye(4)),
+            dtype=np.float64
+        )
 
         anchors[curr_sid] = anchors[prev_sid] @ rel_prev_from_curr
 
@@ -387,6 +383,8 @@ class SLAM:
             cpu_scaling = torch.cat(final_params["_scaling"], dim=0)
             cpu_rotation = torch.cat(final_params["_rotation"], dim=0)
             cpu_opacity = torch.cat(final_params["_opacity"], dim=0)
+            cpu_normal = (torch.cat(final_params["_normal"], dim=0)
+                          if has_normal and "_normal" in final_params else None)
 
             final_params.clear()
             import gc
@@ -425,12 +423,11 @@ class SLAM:
                 self.gaussians._rotation = nn.Parameter(cpu_rotation.cuda())
                 self.gaussians._opacity = nn.Parameter(cpu_opacity.cuda())
 
-            if has_normal:
-                cpu_normal = torch.cat(final_params["_normal"], dim=0)
-                self.gaussians._normal = nn.Parameter(cpu_normal.cuda())
+            if has_normal and cpu_normal is not None:
+                self.gaussians._normal = cpu_normal.cuda()
 
             del cpu_xyz, cpu_features_dc, cpu_features_rest, cpu_scaling, cpu_rotation, cpu_opacity
-            if has_normal:
+            if has_normal and cpu_normal is not None:
                 del cpu_normal
             gc.collect()
 
