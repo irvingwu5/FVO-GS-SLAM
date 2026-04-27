@@ -92,8 +92,8 @@ def get_loss_tracking_rgbd(
     return alpha * l1_rgb + (1 - alpha) * l1_depth.mean()
 
 
-def get_loss_mapping(config, image, depth, viewpoint, initialization=False):
-    if initialization:
+def get_loss_mapping(config, image, depth, viewpoint, initialization=False, apply_exposure=True):
+    if initialization or not apply_exposure:
         image_ab = image
     else:
         image_ab = (torch.exp(viewpoint.exposure_a)) * image + viewpoint.exposure_b

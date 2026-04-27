@@ -6,7 +6,7 @@ import open3d as o3d
 import torch.multiprocessing as mp
 import roma
 from utils.logging_utils import Log
-from utils.registration_2dgs import load_submap_from_ckpt, registration_2dgs
+from utils.gsr_2dgs.solver_2dgs import registration_2dgs_gsreg
 import torchvision.transforms as T
 import torchvision.models as models
 import torch.nn as nn
@@ -457,19 +457,21 @@ class LoopClosureProcess(mp.Process):
                     current_pose_guesses[source_id]
             )
 
-            # 2DGS registration (优先)
-            reg_method = self.config.get("LoopClosure", {}).get("registration_method", "icp")
+            # 2DGS-GSReg registration (LoopSplat-style)
+            reg_method = self.config.get("LoopClosure", {}).get("registration_method", "2dgs_gsreg")
             src_ckpt, tgt_ckpt = self.submap_records.get(source_id), self.submap_records.get(target_id)
-            if (reg_method == "2dgs_hybrid" and src_ckpt and tgt_ckpt
+            if (reg_method == "2dgs_gsreg" and src_ckpt and tgt_ckpt
                     and os.path.exists(src_ckpt) and os.path.exists(tgt_ckpt)):
-                src_sub = load_submap_from_ckpt(src_ckpt, submap_id=source_id)
-                tgt_sub = load_submap_from_ckpt(tgt_ckpt, submap_id=target_id)
-                reg = registration_2dgs(src_sub, tgt_sub, init_guess, mode="loop")
-                if reg["successful"]:
-                    return reg["transformation"], reg["information"], True, {
-                        "fitness": reg["fitness"], "rmse": reg["inlier_rmse"],
-                        "delta_t": reg.get("delta_t", 0), "delta_r": reg.get("delta_r", 0)}
-                Log(f"[LoopClosure] 2DGS reg failed for {source_id}->{target_id}: {reg.get('reason','')}")
+                from utils.gsr_2dgs.gaussian_io_2dgs import load_2dgs_submap_ckpt
+                src = load_2dgs_submap_ckpt(src_ckpt)
+                tgt = load_2dgs_submap_ckpt(tgt_ckpt)
+                reg = registration_2dgs_gsreg(
+                    src_ckpt, tgt_ckpt, init_guess, self.config.get("LoopClosure", {}))
+                if reg.get("success"):
+                    info = np.eye(6)
+                    return reg["T_tgt_src"], info, True, {"fitness": reg.get("overlap", 0),
+                                                            "rmse": 0.0, "delta_t": 0, "delta_r": 0}
+                Log(f"[LoopClosure] 2DGS-GSReg failed for {source_id}->{target_id}: {reg.get('reason','')}")
 
             # Fallback: 原始 ICP
             if not self._ensure_pcd_loaded(source_id):

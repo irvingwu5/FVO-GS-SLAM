@@ -303,7 +303,8 @@ class BackEnd(mp.Process):
                 )
 
                 loss_view = get_loss_mapping(
-                    self.config, image, depth, viewpoint
+                    self.config, image, depth, viewpoint,
+                    apply_exposure=optimize_exposure,
                 )
 
                 if self.use_fdn and viewpoint.normal is not None:
@@ -354,7 +355,8 @@ class BackEnd(mp.Process):
                 )
 
                 loss_view = get_loss_mapping(
-                    self.config, image, depth, viewpoint
+                    self.config, image, depth, viewpoint,
+                    apply_exposure=optimize_exposure,
                 )
 
                 loss_view.backward()

@@ -145,7 +145,23 @@ Submap:
 # Loop Closure Configuration
 # ============================================================
 LoopClosure:
-  registration_method: "2dgs_hybrid"  # choices: icp, 2dgs_hybrid
+  registration_method: "2dgs_gsreg"  # choices: icp, 2dgs_gsreg
+  enable_legacy_icp_fallback: false
+  allow_identity_loop_init: false
+
+  gsreg_overlap_radius: 0.10
+  gsreg_min_overlap: 0.05
+  gsreg_topk_views: 3
+  gsreg_max_iters: 80
+  gsreg_lr_rot: 0.002
+  gsreg_lr_trans: 0.005
+  gsreg_rgb_weight: 1.0
+  gsreg_depth_weight: 1.0
+  gsreg_normal_weight: 0.1
+  gsreg_max_loss: 0.10
+  gsreg_min_successful_views: 1
+  gsreg_max_delta_t_from_init: 0.50
+  gsreg_max_delta_r_from_init: 30.0
 
   # ===== Basic Parameters =====
   keep_recent_submaps: 3         # 显存中只保留最近 3 个子图
