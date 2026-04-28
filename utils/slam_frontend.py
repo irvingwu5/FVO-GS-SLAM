@@ -61,9 +61,7 @@ class FrontEnd(mp.Process):
         self.submap_seed_global_c2w = {0: np.eye(4, dtype=np.float64)}
         self.last_submap_seed_global_c2w = None
         # ================================================
-        self.is_first_frame_of_submap = False  # 标记当前帧是否为子图的第一帧
         self.submap_anchor_pose = None #运动监控锚点
-        self.cut_refine_iters = self.config.get("Submap", {}).get("cut_refine_iters", 0)
         self.submap_start_frame_idx = 0
         self.fft_filter = None  # 频域滤波器实例
         # 消融实验开关
@@ -71,39 +69,30 @@ class FrontEnd(mp.Process):
         self.use_fft_mask = self.config.get("Ablation", {}).get("use_fft_mask", True)
         self.use_error_mask = self.config.get("Ablation", {}).get("use_error_mask", True)
 
-        # ===== FFT VO 初值模块 =====
+        # ===== FFTVO 模块 =====
         self.use_fft_vo_init = self.config.get("FFTVO", {}).get("use_fft_vo_init", False)
         self.fft_vo = FFTGuidedRGBDVO(self.config) if self.use_fft_vo_init else None
 
-        # ===== FFTVO 候选控制开关 (EAGS 风格) =====
+        # ===== FFTVO Primary Tracker (EAGS-style map-independent) =====
         fftvo_cfg = self.config.get("FFTVO", {})
+        self.use_fft_vo_primary = fftvo_cfg.get("use_fft_vo_primary", False)
+        self.tracking_refine_iters = int(fftvo_cfg.get("tracking_refine_iters", 0))
+        self.tracking_fallback_iters = int(fftvo_cfg.get("tracking_fallback_iters", 100))
+        self.enable_pose_feedback = fftvo_cfg.get("enable_pose_feedback", True)
+        self.debug_log = fftvo_cfg.get("debug_log", True)
+        self.log_candidate_losses = fftvo_cfg.get("log_candidate_losses", False)
+
+        # Legacy FFTVO attribs (preserved for use_fft_vo_primary=false backward compat)
         self.use_previous_candidate = fftvo_cfg.get("use_previous_candidate", True)
         self.use_const_speed_candidate = fftvo_cfg.get("use_const_speed_candidate", False)
         self.use_fft_vo_candidate = fftvo_cfg.get("use_fft_vo_candidate", True)
-        self.allow_fft_vo_override_pose = fftvo_cfg.get("allow_fft_vo_override_pose", True)
-        self.log_candidate_losses = fftvo_cfg.get("log_candidate_losses", False)
-
-        # ===== FFTVO 子图启动保护期 =====
-        self.disable_fftvo_after_submap_start = fftvo_cfg.get(
-            "disable_fftvo_after_submap_start", True
-        )
-        self.fftvo_warmup_frames_after_submap_start = int(
-            fftvo_cfg.get("fftvo_warmup_frames_after_submap_start", 10)
-        )
-
-        # ===== FFTVO 严格质量门控 =====
-        self.fftvo_min_improvement_ratio = float(
-            fftvo_cfg.get("fftvo_min_improvement_ratio", 0.75)
-        )
-        self.fftvo_max_delta_t = float(fftvo_cfg.get("fftvo_max_delta_t", 0.025))
+        self.disable_fftvo_after_submap_start = fftvo_cfg.get("disable_fftvo_after_submap_start", True)
+        self.fftvo_warmup_frames_after_submap_start = int(fftvo_cfg.get("fftvo_warmup_frames_after_submap_start", 10))
+        self.fftvo_min_improvement_ratio = float(fftvo_cfg.get("fftvo_min_improvement_ratio", 0.75))
+        self.fftvo_max_delta_t = float(fftvo_cfg.get("fftvo_max_delta_t", 0.03))
         self.fftvo_max_delta_deg = float(fftvo_cfg.get("fftvo_max_delta_deg", 2.0))
         self.fftvo_min_inliers = int(fftvo_cfg.get("fftvo_min_inliers", 250))
         self.fftvo_min_inlier_ratio = float(fftvo_cfg.get("fftvo_min_inlier_ratio", 0.70))
-
-        # ===== FFTVO refined pose feedback (EAGS 风格) =====
-        self.enable_pose_feedback = fftvo_cfg.get("enable_pose_feedback", True)
-
-        # ===== FFTVO rescue mode (EAGS 风格多候选小步 refinement) =====
         self.enable_rescue_mode = fftvo_cfg.get("enable_rescue_mode", True)
         self.rescue_trial_iters = int(fftvo_cfg.get("rescue_trial_iters", 8))
         self.rescue_accept_refined_loss_ratio = float(fftvo_cfg.get("rescue_accept_refined_loss_ratio", 0.99))
@@ -541,83 +530,109 @@ class FrontEnd(mp.Process):
         return best_name, best_w2c
 
     # ========================================================================
-    # 5. Tracking (per-frame pose estimation)
+    # 5. Tracking (per-frame pose estimation, EAGS-style map-independent)
     # ========================================================================
     def tracking(self, cur_frame_idx, viewpoint):
-        # perform_submap_cut() 已用切图帧完成初始化，切图帧不会再次进入 tracking()
-        # 如果当前帧不是 seed 帧，说明是过期 flag，忽略并正常 tracking
-        if self.is_first_frame_of_submap:
-            if cur_frame_idx == self.submap_start_frame_idx:
-                Log(f"[DEBUG] tracking() consumed first-frame flag at seed frame {cur_frame_idx}")
-                viewpoint.fixed_pose = True
-                viewpoint.reset_pose_deltas()
-                viewpoint.cam_rot_delta.requires_grad_(False)
-                viewpoint.cam_trans_delta.requires_grad_(False)
-                self.is_first_frame_of_submap = False
-            else:
-                Log(f"[Warning] stale first-frame flag ignored at frame {cur_frame_idx}; "
-                    f"submap_start_frame_idx={self.submap_start_frame_idx}")
-                self.is_first_frame_of_submap = False
-
-        if not viewpoint.fixed_pose:
-            # 选择最优 tracking 初值（FFT VO / const_speed / previous）
-            if self.use_fft_vo_init and self.fft_vo is not None:
-                best_name, best_w2c = self.select_best_tracking_init(cur_frame_idx, viewpoint)
-                viewpoint.T = best_w2c.clone()
-                if self.fft_vo.debug_log:
-                    Log(f"[FFTVO] frame {cur_frame_idx}: selected init = {best_name}")
-            else:
-                prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
-                viewpoint.T = prev.T.clone()
-
-            viewpoint.fixed_pose = False
-            viewpoint.cam_rot_delta.requires_grad_(True)
-            viewpoint.cam_trans_delta.requires_grad_(True)
-
-        opt_params = []
-        if not viewpoint.fixed_pose:
-            opt_params.append(
-                {
-                    "params": [viewpoint.cam_rot_delta],
-                    "lr": self.config["Training"]["lr"]["cam_rot_delta"],
-                    "name": "rot_{}".format(viewpoint.uid),
-                }
+        # Seed frame: render once for visibility, no pose change
+        if viewpoint.fixed_pose:
+            with torch.no_grad():
+                render_pkg = render(
+                    viewpoint, self.gaussians, self.pipeline_params, self.background, surf=False
+                )
+            self.median_depth = get_median_depth(
+                render_pkg["depth"], render_pkg["opacity"]
             )
-            opt_params.append(
-                {
-                    "params": [viewpoint.cam_trans_delta],
-                    "lr": self.config["Training"]["lr"]["cam_trans_delta"],
-                    "name": "trans_{}".format(viewpoint.uid),
-                }
+            return render_pkg
+
+        prev_cam = self.cameras.get(cur_frame_idx - 1)
+
+        # ---- Step 1: Pose estimation (FFTVO-primary or legacy) ----
+        fftvo_success = False
+        if self.use_fft_vo_primary and self.fft_vo is not None and prev_cam is not None:
+            prev_c2w = torch.linalg.inv(prev_cam.T)
+            fftvo_success, fft_c2w, fft_info = self.fft_vo.estimate(
+                prev_cam, viewpoint, prev_c2w
             )
-        opt_params.append(
-            {
-                "params": [viewpoint.exposure_a],
-                "lr": 0.01,
-                "name": "exposure_a_{}".format(viewpoint.uid),
-            }
-        )
-        opt_params.append(
-            {
-                "params": [viewpoint.exposure_b],
-                "lr": 0.01,
-                "name": "exposure_b_{}".format(viewpoint.uid),
-            }
-        )
+            if fftvo_success:
+                viewpoint.T = torch.linalg.inv(fft_c2w)
+                self.fft_vo_stats["success"] += 1
+                if self.debug_log:
+                    n_inl = fft_info.get("n_inliers", 0)
+                    ratio = fft_info.get("inlier_ratio", 0)
+                    dt = fft_info.get("delta_t", 0)
+                    dd = fft_info.get("delta_deg", 0)
+                    Log(f"[FFTVO] frame {cur_frame_idx}: success, "
+                        f"n_inl={n_inl} ratio={ratio:.3f} dt={dt:.3f}m ddeg={dd:.1f} deg")
+            else:
+                viewpoint.T = prev_cam.T.clone()
+                self.fft_vo_stats["fail"] += 1
+                if self.debug_log:
+                    err = fft_info.get("error", "unknown")
+                    n_prev = fft_info.get("kp_prev", fft_info.get("n_prev", 0))
+                    n_trk = fft_info.get("n_tracked", 0)
+                    n_3d = fft_info.get("n_3d", 0)
+                    n_inl = fft_info.get("n_inliers", 0)
+                    inl_r = fft_info.get("inlier_ratio", 0)
+                    dt = fft_info.get("delta_t", 0)
+                    dd = fft_info.get("delta_deg", 0)
+                    Log(f"[FFTVO] frame {cur_frame_idx}: FAILED ({err}) "
+                        f"kp={n_prev} trk={n_trk} 3d={n_3d} inl={n_inl} r={inl_r:.2f} "
+                        f"dt={dt:.3f}m ddeg={dd:.1f} deg")
+        elif self.use_fft_vo_init and self.fft_vo is not None and prev_cam is not None:
+            # Legacy: FFTVO as init candidate, render tracking as primary
+            best_name, best_w2c = self.select_best_tracking_init(cur_frame_idx, viewpoint)
+            viewpoint.T = best_w2c.clone()
+            if self.debug_log:
+                Log(f"[FFTVO] frame {cur_frame_idx}: selected init = {best_name}")
+        elif prev_cam is not None:
+            viewpoint.T = prev_cam.T.clone()
+
+        # ---- Step 2: Determine refinement iteration count ----
+        if self.use_fft_vo_primary:
+            refine_iters = self.tracking_refine_iters if fftvo_success else self.tracking_fallback_iters
+        else:
+            refine_iters = self.tracking_itr_num
+
+        # ---- Zero-refinement path: single no-grad render for downstream ----
+        if refine_iters <= 0:
+            viewpoint.cam_rot_delta.requires_grad_(False)
+            viewpoint.cam_trans_delta.requires_grad_(False)
+            with torch.no_grad():
+                render_pkg = render(
+                    viewpoint, self.gaussians, self.pipeline_params, self.background, surf=False
+                )
+            self.median_depth = get_median_depth(
+                render_pkg["depth"], render_pkg["opacity"]
+            )
+            return render_pkg
+
+        # ---- Step 3: Render refinement ----
+        viewpoint.fixed_pose = False
+        viewpoint.cam_rot_delta.requires_grad_(True)
+        viewpoint.cam_trans_delta.requires_grad_(True)
+
+        opt_params = [
+            {"params": [viewpoint.cam_rot_delta],
+             "lr": self.config["Training"]["lr"]["cam_rot_delta"],
+             "name": "rot_{}".format(viewpoint.uid)},
+            {"params": [viewpoint.cam_trans_delta],
+             "lr": self.config["Training"]["lr"]["cam_trans_delta"],
+             "name": "trans_{}".format(viewpoint.uid)},
+            {"params": [viewpoint.exposure_a], "lr": 0.01,
+             "name": "exposure_a_{}".format(viewpoint.uid)},
+            {"params": [viewpoint.exposure_b], "lr": 0.01,
+             "name": "exposure_b_{}".format(viewpoint.uid)},
+        ]
 
         pose_optimizer = torch.optim.Adam(opt_params)
-        # EAGS 风格：保存 min loss 对应的 pose
-        best_T = None
-        best_loss = float("inf")
-        best_render_pkg = None
-        for tracking_itr in range(self.tracking_itr_num):
+        best_T, best_loss, best_render_pkg = None, float("inf"), None
+
+        for tracking_itr in range(refine_iters):
             render_pkg = render(
                 viewpoint, self.gaussians, self.pipeline_params, self.background, surf=False
             )
             image, depth, opacity = (
-                render_pkg["render"],
-                render_pkg["depth"],
-                render_pkg["opacity"],
+                render_pkg["render"], render_pkg["depth"], render_pkg["opacity"],
             )
             pose_optimizer.zero_grad()
             loss_tracking = get_loss_tracking(
@@ -627,12 +642,7 @@ class FrontEnd(mp.Process):
 
             with torch.no_grad():
                 pose_optimizer.step()
-                if viewpoint.fixed_pose:
-                    viewpoint.reset_pose_deltas()
-                    converged = True
-                else:
-                    converged = update_pose(viewpoint)
-
+                converged = update_pose(viewpoint)
                 current_loss = loss_tracking.item()
                 if current_loss < best_loss:
                     best_loss = current_loss
@@ -657,13 +667,13 @@ class FrontEnd(mp.Process):
             if converged:
                 break
 
-        if best_T is not None and not viewpoint.fixed_pose:
+        if best_T is not None:
             viewpoint.T = best_T.clone()
 
-        self.median_depth = get_median_depth(depth, opacity)
-        if best_render_pkg is not None:
-            return best_render_pkg
-        return render_pkg
+        self.median_depth = get_median_depth(
+            best_render_pkg["depth"], best_render_pkg["opacity"]
+        )
+        return best_render_pkg if best_render_pkg is not None else render_pkg
 
     # ========================================================================
     # 6. Keyframe Detection
@@ -841,54 +851,6 @@ class FrontEnd(mp.Process):
         )
         np.save(cut_info_path, submap_cut_info)
 
-    def refine_cut_frame_pose(self, viewpoint, extra_iters=30, lr_scale=0.25):
-        """
-        在真正切图前，对 cut frame 再额外做一小段 pose refine，
-        减小 handoff 噪声被直接写进 relative_pose / anchor 链。
-        """
-        old_fixed = viewpoint.fixed_pose
-        viewpoint.fixed_pose = False
-        viewpoint.cam_rot_delta.requires_grad_(True)
-        viewpoint.cam_trans_delta.requires_grad_(True)
-
-        opt_params = [
-            {
-                "params": [viewpoint.cam_rot_delta],
-                "lr": self.config["Training"]["lr"]["cam_rot_delta"] * lr_scale,
-                "name": f"cut_refine_rot_{viewpoint.uid}",
-            },
-            {
-                "params": [viewpoint.cam_trans_delta],
-                "lr": self.config["Training"]["lr"]["cam_trans_delta"] * lr_scale,
-                "name": f"cut_refine_trans_{viewpoint.uid}",
-            },
-        ]
-        pose_optimizer = torch.optim.Adam(opt_params)
-
-        for _ in range(extra_iters):
-            render_pkg = render(
-                viewpoint, self.gaussians, self.pipeline_params, self.background, surf=False
-            )
-            image, depth, opacity = (
-                render_pkg["render"],
-                render_pkg["depth"],
-                render_pkg["opacity"],
-            )
-
-            pose_optimizer.zero_grad()
-            loss_tracking = get_loss_tracking(
-                self.config, image, depth, opacity, viewpoint
-            )
-            loss_tracking.backward()
-
-            with torch.no_grad():
-                pose_optimizer.step()
-                converged = update_pose(viewpoint)
-                if converged:
-                    break
-
-        viewpoint.fixed_pose = old_fixed
-
     def perform_submap_cut(self, cur_frame_idx, viewpoint, current_c2w, cut_metrics):
         Log(
             f"==> 启动新子图 (ID: {self.current_submap_id + 1}) | "
@@ -898,17 +860,7 @@ class FrontEnd(mp.Process):
 
         self.save_submap_cut_info(current_c2w, cut_metrics)
 
-        # 1) 当前帧已经在旧子图上完成 tracking；
-        #    这里只允许小步 refine，不能重置位姿。
-        cut_refine_iters = self.config.get("Submap", {}).get("cut_refine_iters", 20)
-        if cut_refine_iters > 0:
-            self.refine_cut_frame_pose(
-                viewpoint,
-                extra_iters=cut_refine_iters,
-                lr_scale=0.25,
-            )
-            current_c2w = torch.linalg.inv(viewpoint.T)
-
+        # FFTVO-primary 模式下 cut frame pose 已由 FFTVO 直接给出，无需渲染 refine
         seed_global_c2w = current_c2w.detach().cpu().numpy().astype(np.float64)
 
         # 2) 保存子图间 transition：prev_seed -> new_seed
@@ -960,7 +912,6 @@ class FrontEnd(mp.Process):
         # 新子图运动监控锚点就是 seed 的全局位姿
         self.submap_anchor_pose = current_c2w.clone()
         self.submap_start_frame_idx = cur_frame_idx
-        self.is_first_frame_of_submap = True
 
         # 5) 用当前 seed 帧初始化新子图。
         depth_map = self.add_new_keyframe(cur_frame_idx, init=True)
@@ -1088,6 +1039,11 @@ class FrontEnd(mp.Process):
                 self.cameras[cur_frame_idx] = viewpoint
                 self.frame_to_submap[cur_frame_idx] = self.current_submap_id
 
+                # 延迟清理：帧 N-2 已不再被任何 FFTVO prev_cam 引用，可安全释放
+                stale_idx = cur_frame_idx - 2
+                if stale_idx >= 0 and stale_idx in self.cameras and stale_idx not in self.current_window:
+                    self.cleanup(stale_idx)
+
                 if self.reset:
                     self.initialize(cur_frame_idx, viewpoint)
                     self.current_window.append(cur_frame_idx)
@@ -1135,7 +1091,6 @@ class FrontEnd(mp.Process):
                     )
 
                 if self.requested_keyframe > 0:
-                    self.cleanup(cur_frame_idx)
                     cur_frame_idx += 1
                     continue
 
@@ -1225,8 +1180,6 @@ class FrontEnd(mp.Process):
                     self.request_keyframe(
                         cur_frame_idx, viewpoint, self.current_window, depth_map
                     )
-                else:
-                    self.cleanup(cur_frame_idx)
                 cur_frame_idx += 1
 
                 if (
@@ -1242,9 +1195,6 @@ class FrontEnd(mp.Process):
                         self.save_dir,
                         cur_frame_idx,
                         monocular=self.monocular,
-                        frame_to_submap=self.frame_to_submap,
-                        submap_anchor_poses=self.submap_anchor_poses,
-                        cameras_already_global=True,
                     )
                 toc.record()
                 torch.cuda.synchronize()
