@@ -674,11 +674,7 @@ class BackEnd(mp.Process):
                     seed_global_c2w_from_viewpoint = (
                         torch.linalg.inv(viewpoint.T.detach()).cpu().numpy().astype(np.float64)
                     )
-
-                    if self.current_submap_id == 0 and len(self.viewpoints) == 0:
-                        self.current_submap_seed_global_c2w = seed_global_c2w_from_viewpoint.copy()
-                    else:
-                        self.current_submap_seed_global_c2w = seed_global_c2w_from_viewpoint.copy()
+                    self.current_submap_seed_global_c2w = seed_global_c2w_from_viewpoint.copy()
 
                     if len(self.gaussians._xyz) == 0 and self.current_submap_id > 0:
                         Log("Initializing new submap from seed frame (state already clean)")

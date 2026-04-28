@@ -48,40 +48,6 @@ from utils.slam_frontend import FrontEnd
 # Utility Functions
 # ============================================================================
 
-def rebuild_submap_anchors_from_ckpts(save_dir):
-    submaps_dir = os.path.join(save_dir, "submaps")
-    if not os.path.isdir(submaps_dir):
-        return {}
-
-    ckpt_files = sorted(
-        [os.path.join(submaps_dir, f) for f in os.listdir(submaps_dir) if f.endswith(".ckpt")]
-    )
-    if len(ckpt_files) == 0:
-        return {}
-
-    sid_to_ckpt = {
-        int(os.path.basename(p).split(".")[0]): p
-        for p in ckpt_files
-    }
-
-    all_sids = sorted(sid_to_ckpt.keys())
-    anchors = {all_sids[0]: np.eye(4)}
-
-    for i in range(1, len(all_sids)):
-        prev_sid = all_sids[i - 1]
-        curr_sid = all_sids[i]
-
-        prev_ckpt = torch.load(sid_to_ckpt[prev_sid], map_location="cpu")
-        rel_prev_from_curr = np.array(
-            prev_ckpt.get("relative_pose", np.eye(4)),
-            dtype=np.float64
-        )
-
-        anchors[curr_sid] = anchors[prev_sid] @ rel_prev_from_curr
-
-    return anchors
-
-
 # ============================================================================
 # GPU Memory Monitor
 # ============================================================================
@@ -295,15 +261,6 @@ class SLAM:
         has_normal = False
 
         frame_to_submap = torch.load(os.path.join(save_dir, "frame_to_submap.pt"))
-        submaps_dir = os.path.join(save_dir, "submaps")
-        submap_anchor_poses = rebuild_submap_anchors_from_ckpts(submaps_dir)
-
-        if len(submap_anchor_poses) == 0:
-            submap_anchor_poses_path = os.path.join(save_dir, "submap_anchor_poses.pt")
-            if os.path.exists(submap_anchor_poses_path):
-                submap_anchor_poses = torch.load(submap_anchor_poses_path)
-            else:
-                submap_anchor_poses = None
 
         # Step A: Read PGO correction matrices (small)
         submap_tsfms = {}
@@ -328,14 +285,8 @@ class SLAM:
             gp = ckpt["gaussian_params"]
 
             ct = submap_tsfms[sid].numpy()
-            anchor = np.eye(4)
-            if submap_anchor_poses is not None and sid in submap_anchor_poses:
-                anchor = submap_anchor_poses[sid]
-                if isinstance(anchor, torch.Tensor):
-                    anchor = anchor.cpu().numpy()
-                anchor = np.array(anchor, dtype=np.float64)
-
-            full_tsfm = ct @ anchor
+            # Gaussians 已在全局坐标系（global seed mode），只叠加 PGO correct_tsfm
+            full_tsfm = ct
 
             if not np.allclose(full_tsfm, np.eye(4), atol=1e-4):
                 gp_cuda = {
@@ -442,17 +393,11 @@ class SLAM:
             for frame_id, cam in tqdm(self.frontend.cameras.items(), desc="Correcting Trajectory"):
                 sid = frame_to_submap.get(frame_id, 0)
 
-                anchor_c2w = np.eye(4)
-                if submap_anchor_poses is not None and sid in submap_anchor_poses:
-                    anchor_c2w = submap_anchor_poses[sid]
-                    if isinstance(anchor_c2w, torch.Tensor):
-                        anchor_c2w = anchor_c2w.cpu().numpy()
-                anchor_c2w = torch.from_numpy(np.array(anchor_c2w, dtype=np.float32)).to(cam.T.device)
-
                 correct_tsfm = submap_tsfms.get(sid, torch.eye(4)).to(cam.T.device).float()
 
-                local_c2w = torch.linalg.inv(cam.T)
-                global_c2w = correct_tsfm @ anchor_c2w @ local_c2w
+                # cam.T 已经是全局 W2C（前端 global seed 模式下所有帧都在全局坐标系跟踪）
+                # 只叠加 PGO correct_tsfm，不叠加 submap anchor（否则会 double count）
+                global_c2w = correct_tsfm @ torch.linalg.inv(cam.T)
 
                 with torch.no_grad():
                     cam.T = torch.linalg.inv(global_c2w)
@@ -476,9 +421,6 @@ class SLAM:
                 0,
                 final=True,
                 monocular=self.monocular,
-                frame_to_submap=frame_to_submap,
-                submap_anchor_poses=submap_anchor_poses,
-                cameras_already_global=True
             )
 
             Log("Rendering Current Map Quality...")

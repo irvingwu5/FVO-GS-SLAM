@@ -95,7 +95,7 @@ def _load_submap_correct_tsfms(save_dir):
             correct_tsfms[sid] = np.eye(4)
     return correct_tsfms
 
-def _rebuild_submap_anchors_from_ckpts(save_dir):
+def rebuild_submap_anchors_from_ckpts(save_dir):
     submaps_dir = os.path.join(save_dir, "submaps")
     if not os.path.isdir(submaps_dir):
         return {}
@@ -128,83 +128,17 @@ def _rebuild_submap_anchors_from_ckpts(save_dir):
 
     return anchors
 
-def eval_ate(frames, kf_ids, save_dir, iterations, final=False, monocular=False,
-             frame_to_submap=None, submap_anchor_poses=None,
-             cameras_already_global=False):
-    """
-    评估绝对轨迹误差 (ATE)。
-
-    新增参数:
-        cameras_already_global (bool):
-            如果为 True，表示 frames 中的 cam.T 已经被上游（如 slam.py 的
-            轨迹拉扯步骤）修正为全局坐标系下的 W2C 矩阵，此时直接使用
-            inv(cam.T) 作为全局 C2W，不再叠加 anchor 和 correct_tsfm，
-            避免重复变换。
-
-            如果为 False（默认），表示 cam.T 仍然是子图局部坐标系下的 W2C，
-            需要依次叠加：
-              1. submap_anchor_poses[sid]  —— 开环锚点（前端累积的全局 C2W）
-              2. correct_tsfm[sid]         —— PGO 闭环修正矩阵
-            来还原全局 C2W。
-    """
+def eval_ate(frames, kf_ids, save_dir, iterations, final=False, monocular=False):
+    """计算全局轨迹 ATE。frames 中的 cam.T 必须是全局 W2C。"""
     trj_data = dict()
     latest_frame_idx = kf_ids[-1] + 2 if final else kf_ids[-1] + 1
     trj_id, trj_est, trj_gt = [], [], []
     trj_est_np, trj_gt_np = [], []
 
-    # ------------------------------------------------------------------
-    # 如果需要在线拼接（cameras_already_global=False），预加载 PGO 修正矩阵
-    # ------------------------------------------------------------------
-    correct_tsfms = {} #初始化一个空字典 correct_tsfms 用于存放每个子图的 4x4 修正矩阵
-    rebuilt_anchor_poses = {}
-    if save_dir is not None and frame_to_submap is not None:
-        rebuilt_anchor_poses = _rebuild_submap_anchors_from_ckpts(save_dir)
-    if not cameras_already_global and frame_to_submap is not None: #false表示当前frames中的相机位姿仍是子图局部坐标,表示存在子图分配信息
-        correct_tsfms = _load_submap_correct_tsfms(save_dir)
-
     for kf_id in kf_ids:
         kf = frames[kf_id]
-
-        # 1. 获取局部坐标系下的 C2W 矩阵
-        local_c2w = np.linalg.inv(kf.T.cpu().numpy())
-
-        # 2. 根据模式决定是否需要拼接全局位姿
-        if cameras_already_global:
-            # -------------------------------------------------------
-            # 模式 A：cam.T 已经是全局 W2C（slam.py 终局评估阶段）
-            # 直接使用 inv(cam.T) 即可，不做任何额外变换
-            # -------------------------------------------------------
-            pose_est = local_c2w
-
-
-        elif frame_to_submap is not None:
-
-            sid = frame_to_submap.get(kf_id, 0)
-
-            # 优先使用从 ckpt 重建的 anchor
-
-            # 新逻辑：优先用磁盘重建锚点；当前活动子图缺失时，回退到前端内存锚点
-            anchor_c2w = None
-
-            if rebuilt_anchor_poses is not None and sid in rebuilt_anchor_poses:
-                anchor_c2w = rebuilt_anchor_poses[sid]  # 冻结过的子图，优先用磁盘/精炼结果
-            elif submap_anchor_poses is not None and sid in submap_anchor_poses:
-                anchor_c2w = submap_anchor_poses[sid]  # 当前活动子图，回退到前端在线锚点
-
-            if anchor_c2w is not None:
-                if isinstance(anchor_c2w, torch.Tensor):
-                    anchor_c2w = anchor_c2w.cpu().numpy()
-                anchor_c2w = np.array(anchor_c2w, dtype=np.float64)
-
-                ct = correct_tsfms.get(sid, np.eye(4))
-                global_c2w = ct @ anchor_c2w @ local_c2w
-                pose_est = global_c2w
-            else:
-                pose_est = local_c2w
-
-            if anchor_c2w is None and sid > 0:
-                Log(f"[eval_ate] submap {sid} anchor missing, fallback to local pose")
-
+        # cam.T 是全局 W2C，inv 得全局 C2W
+        pose_est = np.linalg.inv(kf.T.cpu().numpy())
         pose_gt = np.linalg.inv(kf.T_gt.cpu().numpy())
 
         trj_id.append(frames[kf_id].uid)
