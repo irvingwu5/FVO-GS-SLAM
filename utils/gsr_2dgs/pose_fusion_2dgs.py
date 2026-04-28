@@ -2,7 +2,6 @@
 # Weighted pose fusion from multiple candidates.
 
 import numpy as np
-import roma
 from utils.logging_utils import Log
 
 

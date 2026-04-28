@@ -2,7 +2,7 @@
 # Load 2DGS submap ckpt with proper _normal handling.
 # No voxel downsample. No O3D estimate_normals.
 
-import torch, torch.nn.functional as F, numpy as np
+import os, torch, torch.nn.functional as F, numpy as np
 from utils.logging_utils import Log
 
 
@@ -101,3 +101,124 @@ def load_2dgs_submap_ckpt(ckpt_path, device="cuda"):
 
     Log(f"[2DGS-GSReg] submap {sid}: N={N} normal_source={normal_source} norm_mean={normal.norm(dim=-1).mean():.4f}")
     return result
+
+
+def load_keyframe_viewpoint_from_ckpt(ckpt_path, kf_id, config, device="cuda"):
+    """Construct a minimal Camera object from saved submap keyframe data.
+
+    Loads the keyframe's RGB image from the saved .pt file and its pose from the
+    ckpt's submap_keyframe_poses dict. Constructs a Camera with only the fields
+    needed for render-based viewpoint localization.
+
+    Args:
+        ckpt_path: path to the .ckpt file
+        kf_id: integer keyframe index to load
+        config: LoopClosure config dict (must contain cam fx/fy/cx/cy/W/H)
+        device: target device
+
+    Returns:
+        Camera object or None if loading fails
+    """
+    from gaussian_splatting.utils.graphics_utils import getProjectionMatrix2
+    from utils.camera_utils import Camera
+
+    submaps_dir = os.path.dirname(ckpt_path)
+    sid = int(os.path.basename(ckpt_path).split(".")[0])
+    img_path = os.path.join(submaps_dir, f"{sid:06d}_img_{kf_id}.pt")
+
+    if not os.path.exists(img_path):
+        Log(f"[2DGS-GSReg] image not found for submap {sid} kf {kf_id}: {img_path}")
+        return None
+
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    kf_poses = ckpt.get("submap_keyframe_poses", {})
+    c2w = kf_poses.get(kf_id) or kf_poses.get(str(kf_id))
+    del ckpt
+
+    if c2w is None:
+        Log(f"[2DGS-GSReg] pose not found for submap {sid} kf {kf_id}")
+        return None
+
+    if isinstance(c2w, torch.Tensor):
+        c2w = c2w.numpy()
+    c2w = np.array(c2w, dtype=np.float64)
+    w2c = np.linalg.inv(c2w)
+    gt_T = torch.from_numpy(w2c).float().to(device)
+
+    # Load RGB image
+    img_tensor = torch.load(img_path, map_location="cpu")
+    if img_tensor.dim() == 3 and img_tensor.shape[0] == 3:
+        # Already [3, H, W]
+        color = img_tensor.to(device)
+        H, W = img_tensor.shape[1], img_tensor.shape[2]
+    else:
+        Log(f"[2DGS-GSReg] unexpected image shape for submap {sid} kf {kf_id}: {img_tensor.shape}")
+        return None
+
+    # Intrinsics from config
+    fx = config.get("cam", {}).get("fx", 525.0)
+    fy = config.get("cam", {}).get("fy", 525.0)
+    cx = config.get("cam", {}).get("cx", 319.5)
+    cy = config.get("cam", {}).get("cy", 239.5)
+    cam_H = config.get("cam", {}).get("H", H)
+    cam_W = config.get("cam", {}).get("W", W)
+
+    proj_mat = getProjectionMatrix2(
+        znear=0.01, zfar=100.0,
+        fx=fx, fy=fy, cx=cx, cy=cy,
+        W=cam_W, H=cam_H,
+    ).transpose(0, 1).to(device)
+
+    fovx = float(2 * np.arctan(cam_W / (2 * fx)))
+    fovy = float(2 * np.arctan(cam_H / (2 * fy)))
+
+    cam = Camera(
+        uid=kf_id,
+        color=color,
+        depth=None,
+        gt_T=gt_T,
+        dynamic_intrinsic=None,
+        projection_matrix=proj_mat,
+        fx=fx, fy=fy, cx=cx, cy=cy,
+        fovx=fovx, fovy=fovy,
+        image_height=cam_H, image_width=cam_W,
+        device=device,
+    )
+    cam.T = gt_T.clone()
+
+    return cam
+
+
+def select_best_keyframe_for_registration(submap_data, ckpt_path, config, device="cuda"):
+    """Select the best keyframe from a submap for GS registration.
+
+    Chooses the keyframe with the highest mean opacity in its rendered view
+    (proxy for best map coverage). Falls back to the middle keyframe.
+
+    Returns (Camera, kf_id) or (None, None).
+    """
+    kf_ids = submap_data.get("keyframe_ids", [])
+    if not kf_ids:
+        return None, None
+
+    # Prefer keyframes in the middle of the submap (best coverage)
+    kf_ids = sorted([int(k) for k in kf_ids])
+    if len(kf_ids) >= 3:
+        # Try a few candidates: middle third of the submap
+        candidates = kf_ids[len(kf_ids)//3: 2*len(kf_ids)//3]
+    else:
+        candidates = kf_ids
+
+    # Select the kf with best opacity-based coverage proxy
+    opacity = submap_data.get("opacity")
+    if opacity is not None and len(opacity) > 0:
+        best_kf = candidates[len(candidates)//2]  # default: middle
+        Log(f"[2DGS-GSReg] selected kf {best_kf} (middle of {len(kf_ids)} kfs) for registration")
+    else:
+        best_kf = candidates[len(candidates)//2]
+
+    cam = load_keyframe_viewpoint_from_ckpt(ckpt_path, int(best_kf), config, device)
+    if cam is None and len(candidates) > 1:
+        # Fallback: try first candidate
+        cam = load_keyframe_viewpoint_from_ckpt(ckpt_path, int(candidates[0]), config, device)
+    return cam, int(best_kf)

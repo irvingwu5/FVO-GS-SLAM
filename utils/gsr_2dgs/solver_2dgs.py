@@ -53,20 +53,32 @@ def registration_2dgs_gsreg(src_ckpt, tgt_ckpt, init_guess, config,
         Log(f"[2DGS-GSReg] load failed for {sid}->{tid}: {e}")
         return {"success": False, "reason": f"load_failed_{e}", "overlap": 0}
 
-    # Overlap
-    ov = compute_overlap_2dgs(src["xyz"], tgt["xyz"], init_guess, radius=radius)
+    # Overlap (with normal filter if normals available)
+    max_n_angle = config.get("gsreg_max_normal_angle_deg", 45.0)
+    ov = compute_overlap_2dgs(
+        src["xyz"], tgt["xyz"], init_guess, radius=radius,
+        src_normal=src.get("normal"), tgt_normal=tgt.get("normal"),
+        max_normal_angle_deg=max_n_angle,
+    )
     if ov["overlap"] < min_ov:
         Log(f"[2DGS-GSReg] rejected {sid} -> {tid} reason=overlap_too_low {ov['overlap']:.3f} < {min_ov}")
         return {"success": False, "reason": "overlap_too_low", "overlap": ov["overlap"]}
 
-    # Viewpoint localization: need viewpoint objects from submap keyframes
-    # Fallback: use provided viewpoints or construct minimal ones
+    # Viewpoint localization: auto-construct from saved keyframe data if not provided
     if src_viewpoint is None or tgt_viewpoint is None:
-        Log(f"[2DGS-GSReg] no viewpoint provided for {sid}->{tid}, skipping render localization")
+        from .gaussian_io_2dgs import select_best_keyframe_for_registration
+        if src_viewpoint is None:
+            src_viewpoint, src_kf = select_best_keyframe_for_registration(
+                src, src_ckpt, config, device="cuda")
+        if tgt_viewpoint is None:
+            tgt_viewpoint, tgt_kf = select_best_keyframe_for_registration(
+                tgt, tgt_ckpt, config, device="cuda")
+
+    if src_viewpoint is None or tgt_viewpoint is None:
+        Log(f"[2DGS-GSReg] cannot construct viewpoint for {sid}->{tid}, skipping render localization")
         return {"success": False, "reason": "no_viewpoint", "overlap": ov["overlap"]}
 
     # Build target Gaussian model from tgt ckpt (lightweight)
-    from gaussian_splatting.scene.gaussian_model import GaussianModel
     tgt_gm = _build_tmp_gaussian(tgt)
     src_gm = _build_tmp_gaussian(src)
 

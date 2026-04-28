@@ -4,7 +4,6 @@
 
 import torch, numpy as np
 from gaussian_splatting.gaussian_renderer import render as gs_render
-from utils.logging_utils import Log
 
 
 def viewpoint_localize_2dgs(viewpoint, target_gaussians, pipeline_params, bg,
@@ -22,7 +21,11 @@ def viewpoint_localize_2dgs(viewpoint, target_gaussians, pipeline_params, bg,
 
     lr_rot = config.get("gsreg_lr_rot", 0.002)
     lr_trans = config.get("gsreg_lr_trans", 0.005)
-    rw, dw, nw = config.get("gsreg_rgb_weight", 1.0), config.get("gsreg_depth_weight", 1.0), config.get("gsreg_normal_weight", 0.1)
+    rw = config.get("gsreg_rgb_weight", 1.0)
+    dw = config.get("gsreg_depth_weight", 1.0)
+    nw = config.get("gsreg_normal_weight", 0.1)
+    ow = config.get("gsreg_opacity_weight", 0.0)
+    use_huber = config.get("gsreg_use_huber_loss", True)
 
     opt = torch.optim.Adam([
         {"params": [viewpoint.cam_rot_delta], "lr": lr_rot},
@@ -39,15 +42,43 @@ def viewpoint_localize_2dgs(viewpoint, target_gaussians, pipeline_params, bg,
         render_rgb, render_depth, render_alpha = pkg["render"], pkg["depth"], pkg["opacity"]
         gt_img = viewpoint.original_image.to(dev)
 
-        loss = rw * torch.abs(render_rgb - gt_img).mean()
+        # RGB loss with optional Huber
+        if use_huber:
+            rgb_loss = torch.nn.functional.huber_loss(render_rgb, gt_img, delta=0.1)
+        else:
+            rgb_loss = torch.abs(render_rgb - gt_img).mean()
+        loss = rw * rgb_loss
+
+        # Depth loss
         if has_depth:
             gt_d = torch.from_numpy(viewpoint.depth).float().to(dev).unsqueeze(0)
             mask = gt_d > 0.01
             if mask.any():
-                loss += dw * torch.abs(render_depth[mask] - gt_d[mask]).mean()
-        if nw > 0 and "rend_normal" in pkg:
-            rn = pkg["rend_normal"]
-            loss += nw * (1.0 - torch.abs(rn).mean())
+                if use_huber:
+                    depth_loss = torch.nn.functional.huber_loss(
+                        render_depth[mask], gt_d[mask], delta=0.05)
+                else:
+                    depth_loss = torch.abs(render_depth[mask] - gt_d[mask]).mean()
+                loss += dw * depth_loss
+
+        # Normal consistency loss: penalize deviation from GT normal in camera frame
+        if nw > 0 and "rend_normal" in pkg and hasattr(viewpoint, "normal"):
+            rn = pkg["rend_normal"]  # [3, H, W] in camera frame
+            # viewpoint.normal is [1, 3, H, W] in camera frame (from FDN)
+            gt_normal = viewpoint.normal.to(dev)
+            # Mask: only where GT normal is valid
+            if hasattr(viewpoint, "mask"):
+                normal_mask = viewpoint.mask.to(dev)
+            else:
+                normal_mask = (gt_normal.norm(dim=1, keepdim=True) > 0.01).float()
+            # Cosine similarity: 1 - |dot|
+            cos_sim = torch.abs((rn.unsqueeze(1) * gt_normal).sum(dim=1, keepdim=True))
+            normal_loss = (normal_mask * (1.0 - cos_sim)).mean()
+            loss += nw * normal_loss
+
+        # Opacity regularization
+        if ow > 0:
+            loss += ow * (1.0 - render_alpha).mean()
 
         opt.zero_grad()
         loss.backward()
