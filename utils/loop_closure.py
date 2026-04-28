@@ -237,9 +237,6 @@ class LoopClosureProcess(mp.Process):
         self.global_seed_default_odom_info_scale = self.config.get("LoopClosure", {}).get("global_seed_default_odom_info_scale", 1.0e-3)
         self.use_global_seed_submap = self.config.get("Submap", {}).get("use_global_seed_submap", False)
 
-        # ===== Feature cloud 保留比例 =====
-        self.feature_keep_ratio = self.config.get("LoopClosure", {}).get("feature_keep_ratio", 0.30)
-
         # ===== PGO 保护参数 (EAGS 风格) =====
         self.debug_disable_pgo_for_fftvo_test = self.config.get("LoopClosure", {}).get(
             "debug_disable_pgo_for_fftvo_test", False
@@ -297,15 +294,18 @@ class LoopClosureProcess(mp.Process):
     # 4.3 Point Cloud Extraction & Cache
     # ========================================================================
     def extract_pcd_from_2dgs_ckpt(self, ckpt_path):
+        """Extract O3D point cloud from 2DGS ckpt using FDN normals directly.
+        No curvature filtering. No O3D normal estimation.
+        Returns (dense_pcd, feature_pcd) — both use FDN normals from Gaussian _rotation.
+        """
         submap_ckpt = torch.load(ckpt_path, map_location="cpu")
         gp = submap_ckpt["gaussian_params"]
-
         xyz = gp["_xyz"].numpy()
-        rot_q = gp["_rotation"]
 
+        # Use FDN normals from rotation quaternion: 2DGS surfel normal = local z-axis
+        rot_q = gp["_rotation"]
         rot_mat = roma.unitquat_to_rotmat(rot_q).numpy()
         normals = rot_mat[:, :, 2]
-
         normals_norm = np.linalg.norm(normals, axis=1, keepdims=True)
         normals_norm[normals_norm < 1e-6] = 1.0
         normals = normals / normals_norm
@@ -314,10 +314,10 @@ class LoopClosureProcess(mp.Process):
         pcd.points = o3d.utility.Vector3dVector(xyz)
         pcd.normals = o3d.utility.Vector3dVector(normals)
 
-        # 1) 去离群
+        # Remove statistical outliers
         pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
 
-        # 2) voxel 下采样 → dense cloud
+        # Voxel downsample → both dense and feature are the same (FDN normals)
         pcd_dense = pcd.voxel_down_sample(voxel_size=self.voxel_size)
 
         if len(pcd_dense.points) == 0:
@@ -325,52 +325,14 @@ class LoopClosureProcess(mp.Process):
             del submap_ckpt, gp
             return pcd_dense, pcd_dense
 
-        # 3) feature cloud 在 dense 副本上做曲率筛选
-        pcd_for_feature = o3d.geometry.PointCloud(pcd_dense)
-        pcd_for_feature.estimate_normals(
-            search_param=o3d.geometry.KDTreeSearchParamKNN(knn=20)
-        )
-        pcd_for_feature.normalize_normals()
-
-        points = np.asarray(pcd_for_feature.points)
-        normals_ds = np.asarray(pcd_for_feature.normals)
-
-        if len(points) < 10:
-            Log(f"[LoopClosure] 点数过少，dense 直接兼作 feature: {len(points)}")
-            del submap_ckpt, gp
-            return pcd_dense, pcd_for_feature
-
-        tree = o3d.geometry.KDTreeFlann(pcd_for_feature)
-        curvatures = []
-        for i in range(len(points)):
-            k, idx, _ = tree.search_knn_vector_3d(points[i], 10)
-            neighbor_normals = normals_ds[idx]
-            curvature = np.std(neighbor_normals, axis=0).mean()
-            curvatures.append(curvature)
-
-        curvatures = np.asarray(curvatures)
-
-        keep_ratio = float(self.feature_keep_ratio)
-        keep_ratio = min(max(keep_ratio, 0.05), 0.95)
-        threshold = np.percentile(curvatures, 100.0 * (1.0 - keep_ratio))
-        feature_mask = curvatures >= threshold
-        feature_indices = np.where(feature_mask)[0]
-
-        feature_points = points[feature_indices]
-        feature_normals = normals_ds[feature_indices]
-
-        pcd_feature = o3d.geometry.PointCloud()
-        pcd_feature.points = o3d.utility.Vector3dVector(feature_points)
-        pcd_feature.normals = o3d.utility.Vector3dVector(feature_normals)
-
         Log(
-            f"[LoopClosure] 点云提取：原始 {len(pcd.points)} "
+            f"[LoopClosure] 点云提取 (FDN normals): 原始 {len(pcd.points)} "
             f"→ dense {len(pcd_dense.points)} "
-            f"→ feature {len(pcd_feature.points)}"
+            f"(voxel={self.voxel_size:.3f})"
         )
 
         del submap_ckpt, gp
-        return pcd_dense, pcd_feature
+        return pcd_dense, pcd_dense
 
     def _ensure_pcd_loaded(self, submap_id):
         if submap_id in self.submap_pcds and submap_id in self.submap_dense_pcds:
@@ -457,23 +419,42 @@ class LoopClosureProcess(mp.Process):
                     current_pose_guesses[source_id]
             )
 
-            # 2DGS-GSReg registration (LoopSplat-style)
+            # 2DGS-GSReg registration (LoopSplat-style render-based)
             reg_method = self.config.get("LoopClosure", {}).get("registration_method", "2dgs_gsreg")
             src_ckpt, tgt_ckpt = self.submap_records.get(source_id), self.submap_records.get(target_id)
             if (reg_method == "2dgs_gsreg" and src_ckpt and tgt_ckpt
                     and os.path.exists(src_ckpt) and os.path.exists(tgt_ckpt)):
-                from utils.gsr_2dgs.gaussian_io_2dgs import load_2dgs_submap_ckpt
-                src = load_2dgs_submap_ckpt(src_ckpt)
-                tgt = load_2dgs_submap_ckpt(tgt_ckpt)
+                # Merge camera intrinsics into the LC config for viewpoint construction
+                reg_config = dict(self.config.get("LoopClosure", {}))
+                dataset_cfg = self.config.get("Dataset", {})
+                reg_config["cam"] = {
+                    "fx": dataset_cfg.get("fx", 525.0),
+                    "fy": dataset_cfg.get("fy", 525.0),
+                    "cx": dataset_cfg.get("cx", 319.5),
+                    "cy": dataset_cfg.get("cy", 239.5),
+                    "W": dataset_cfg.get("width", 640),
+                    "H": dataset_cfg.get("height", 480),
+                }
                 reg = registration_2dgs_gsreg(
-                    src_ckpt, tgt_ckpt, init_guess, self.config.get("LoopClosure", {}))
+                    src_ckpt, tgt_ckpt, init_guess, reg_config)
                 if reg.get("success"):
                     info = np.eye(6)
-                    return reg["T_tgt_src"], info, True, {"fitness": reg.get("overlap", 0),
-                                                            "rmse": 0.0, "delta_t": 0, "delta_r": 0}
-                Log(f"[LoopClosure] 2DGS-GSReg failed for {source_id}->{target_id}: {reg.get('reason','')}")
+                    delta_t = reg.get("delta_t_from_init", 0)
+                    delta_r = reg.get("delta_r_from_init", 0)
+                    overlap = reg.get("overlap", 0)
+                    Log(
+                        f"[2DGS-GSReg] 子图 {source_id}->{target_id} 配准成功! "
+                        f"overlap={overlap:.3f} delta_t={delta_t:.3f}m delta_r={delta_r:.1f}deg"
+                    )
+                    return reg["T_tgt_src"], info, True, {
+                        "fitness": float(overlap),
+                        "rmse": 0.0,
+                        "delta_t": float(delta_t),
+                        "delta_r": float(delta_r),
+                    }
+                Log(f"[2DGS-GSReg] 子图 {source_id}->{target_id} failed: {reg.get('reason','unknown')}")
 
-            # Fallback: 原始 ICP
+            # Fallback: single-stage ICP using FDN normals from 2DGS
             if not self._ensure_pcd_loaded(source_id):
                 Log(f"[LoopClosure] 无法加载子图 {source_id} 的点云，跳过 ICP")
                 return np.identity(4), np.identity(6), False, {}
@@ -484,37 +465,15 @@ class LoopClosureProcess(mp.Process):
             source_pcd = self.submap_pcds[source_id]
             target_pcd = self.submap_pcds[target_id]
 
-            coarse_icp = o3d.pipelines.registration.registration_icp(
+            icp_result = o3d.pipelines.registration.registration_icp(
                 source_pcd, target_pcd,
-                max_correspondence_distance=self.voxel_size * 8.0,
+                max_correspondence_distance=self.voxel_size * 4.0,
                 init=init_guess,
                 estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
                 criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
-                    max_iteration=60, relative_fitness=1e-6, relative_rmse=1e-6
+                    max_iteration=100, relative_fitness=1e-6, relative_rmse=1e-6
                 )
             )
-
-            medium_icp = o3d.pipelines.registration.registration_icp(
-                source_pcd, target_pcd,
-                max_correspondence_distance=self.voxel_size * 4.0,
-                init=coarse_icp.transformation,
-                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-                criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
-                    max_iteration=100, relative_fitness=1e-7, relative_rmse=1e-7
-                )
-            )
-
-            fine_icp = o3d.pipelines.registration.registration_icp(
-                source_pcd, target_pcd,
-                max_correspondence_distance=self.voxel_size * 2.0,
-                init=medium_icp.transformation,
-                estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-                criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
-                    max_iteration=150, relative_fitness=1e-8, relative_rmse=1e-8
-                )
-            )
-
-            icp_result = fine_icp
 
             if icp_result.fitness < self.icp_fitness_threshold or icp_result.inlier_rmse > 0.04:
                 Log(f"[!] ICP 配准失败: 子图 {source_id}->{target_id} "
