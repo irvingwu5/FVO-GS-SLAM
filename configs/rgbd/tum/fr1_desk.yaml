@@ -17,5 +17,15 @@ Dataset:
     height: 480
     depth_scale: 5000.0
 
+# ---- 消融实验：密度 + 渲染精化 ----
+Training:
+  gaussian_update_every: 50
+  gaussian_update_offset: 10
+  gaussian_th: 0.3
+  gaussian_reset: 99999
+
+FFTEdgeVO:
+  tracking_refine_iters: 100      # 20→100, 大幅增强渲染约束
+
 
 

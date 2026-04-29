@@ -85,6 +85,27 @@ Training:
   max_init_gaussian_scale: 0.06
 
 # ============================================================
+# FFT Edge VO Configuration (dense DT alignment, Edge VO style)
+# ============================================================
+FFTEdgeVO:
+  use_fft_edge_vo: true
+  tracking_refine_iters: 20
+  tracking_fallback_iters: 100
+  num_levels: 3
+  level_scale: 0.5
+  max_iters_coarse: 25
+  max_iters_fine: 15
+  dt_max_dist: 50.0
+  dt_huber_delta: 5.0
+  max_ref_points: 8000
+  min_ref_points: 300
+  ref_downsample: 2
+  dt_mean_fail_threshold: 15.0
+  require_visible_ratio: 0.3
+  min_dt_mean: 0.5
+  debug_log: true
+
+# ============================================================
 # Submap Configuration
 # ============================================================
 Submap:

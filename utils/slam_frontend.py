@@ -15,7 +15,7 @@ from utils.pose_utils import update_pose
 from utils.slam_utils import get_loss_tracking, get_median_depth
 import cv2
 from utils.fft_filter import FFTFrequencyFilter
-from utils.fft_rgbd_vo import FFTGuidedRGBDVO
+from utils.fft_edge_vo import FFTEdgeVO
 
 class FrontEnd(mp.Process):
     # ========================================================================
@@ -69,44 +69,46 @@ class FrontEnd(mp.Process):
         self.use_fft_mask = self.config.get("Ablation", {}).get("use_fft_mask", True)
         self.use_error_mask = self.config.get("Ablation", {}).get("use_error_mask", True)
 
-        # ===== FFTVO 模块 =====
-        self.use_fft_vo_init = self.config.get("FFTVO", {}).get("use_fft_vo_init", False)
-        self.fft_vo = FFTGuidedRGBDVO(self.config) if self.use_fft_vo_init else None
-
-        # ===== FFTVO Primary Tracker (EAGS-style map-independent) =====
-        fftvo_cfg = self.config.get("FFTVO", {})
-        self.use_fft_vo_primary = fftvo_cfg.get("use_fft_vo_primary", False)
-        self.tracking_refine_iters = int(fftvo_cfg.get("tracking_refine_iters", 0))
-        self.tracking_fallback_iters = int(fftvo_cfg.get("tracking_fallback_iters", 100))
-        self.enable_pose_feedback = fftvo_cfg.get("enable_pose_feedback", True)
-        self.debug_log = fftvo_cfg.get("debug_log", True)
-        self.log_candidate_losses = fftvo_cfg.get("log_candidate_losses", False)
-
-        # Legacy FFTVO attribs (preserved for use_fft_vo_primary=false backward compat)
-        self.use_previous_candidate = fftvo_cfg.get("use_previous_candidate", True)
-        self.use_const_speed_candidate = fftvo_cfg.get("use_const_speed_candidate", False)
-        self.use_fft_vo_candidate = fftvo_cfg.get("use_fft_vo_candidate", True)
-        self.disable_fftvo_after_submap_start = fftvo_cfg.get("disable_fftvo_after_submap_start", True)
-        self.fftvo_warmup_frames_after_submap_start = int(fftvo_cfg.get("fftvo_warmup_frames_after_submap_start", 10))
-        self.fftvo_min_improvement_ratio = float(fftvo_cfg.get("fftvo_min_improvement_ratio", 0.75))
-        self.fftvo_max_delta_t = float(fftvo_cfg.get("fftvo_max_delta_t", 0.03))
-        self.fftvo_max_delta_deg = float(fftvo_cfg.get("fftvo_max_delta_deg", 2.0))
-        self.fftvo_min_inliers = int(fftvo_cfg.get("fftvo_min_inliers", 250))
-        self.fftvo_min_inlier_ratio = float(fftvo_cfg.get("fftvo_min_inlier_ratio", 0.70))
-        self.enable_rescue_mode = fftvo_cfg.get("enable_rescue_mode", True)
-        self.rescue_trial_iters = int(fftvo_cfg.get("rescue_trial_iters", 8))
-        self.rescue_accept_refined_loss_ratio = float(fftvo_cfg.get("rescue_accept_refined_loss_ratio", 0.99))
-        self.rescue_log = fftvo_cfg.get("rescue_log", True)
-
-        self.fft_vo_stats = {
-            "success": 0, "fail": 0,
-            "selected_previous": 0, "selected_direct_fftvo": 0,
-            "rescue_accepted": 0, "rescue_rejected": 0,
-            "hard_rejected": 0,
-        }
+        # ===== FFT Edge VO 模块 (dense DT alignment, Edge VO style) =====
+        evo_cfg = self.config.get("FFTEdgeVO", {})
+        self.use_fft_edge_vo = evo_cfg.get("use_fft_edge_vo", False)
+        self.fft_edge_vo = None
+        self.fft_edge_vo_initialized = False
+        self.tracking_refine_iters = int(evo_cfg.get("tracking_refine_iters", 20))
+        self.tracking_fallback_iters = int(evo_cfg.get("tracking_fallback_iters", 100))
+        self.debug_log = evo_cfg.get("debug_log", True)
 
     # ========================================================================
-    # 2. Hyperparameters
+    # 2. FFT Edge VO helpers
+    # ========================================================================
+
+    def _init_fft_edge_vo(self):
+        if self.fft_edge_vo is not None:
+            return
+        self.fft_edge_vo = FFTEdgeVO(
+            self.config,
+            W=self.dataset.width, H=self.dataset.height,
+            fx=self.dataset.fx, fy=self.dataset.fy,
+            cx=self.dataset.cx, cy=self.dataset.cy,
+        )
+        Log("[FFTEdgeVO] tracker created (Edge VO style, dense FFT-mask DT alignment)")
+
+    @staticmethod
+    def _camera_rgb_to_bgr(cam):
+        img = getattr(cam, "original_image", None)
+        if img is None:
+            return None
+        if isinstance(img, torch.Tensor):
+            img = img.detach().cpu().numpy()
+        img = img.transpose(1, 2, 0)  # (3,H,W) → (H,W,3)
+        if img.max() <= 1.01:
+            img = (img * 255).astype(np.uint8)
+        else:
+            img = img.astype(np.uint8)
+        return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+    # ========================================================================
+    # 3. Hyperparameters
     # ========================================================================
     def set_hyperparams(self):
         self.save_dir = self.config["Results"]["save_dir"] # 结果保存路径
@@ -124,6 +126,7 @@ class FrontEnd(mp.Process):
     # ========================================================================
     def initialize(self, cur_frame_idx, viewpoint):
         self.initialized = not self.monocular
+        self.fft_edge_vo_initialized = False
         self.kf_indices = []
         self.iteration_count = 0
         self.occ_aware_visibility = {}
@@ -246,294 +249,9 @@ class FrontEnd(mp.Process):
         return error_mask
 
     # ========================================================================
-    # 5. Tracking Initialization (FFT VO candidates)
-    # ========================================================================
-    def build_const_speed_w2c(self, cur_frame_idx):
-        """根据前两帧构造恒速模型初值 w2c。帧数不足返回 None。"""
-        if cur_frame_idx < 2:
-            return None
-        prev = self.cameras.get(cur_frame_idx - 1)
-        prev_prev = self.cameras.get(cur_frame_idx - 2)
-        if prev is None or prev_prev is None:
-            return None
-
-        # 转到 c2w 空间做外推，避免 w2c 空间的公式歧义
-        prev_w2c = prev.T.detach().clone()
-        prev_prev_w2c = prev_prev.T.detach().clone()
-        prev_c2w = torch.linalg.inv(prev_w2c)
-        prev_prev_c2w = torch.linalg.inv(prev_prev_w2c)
-        delta_c2w = prev_c2w @ torch.linalg.inv(prev_prev_c2w)
-        cur_c2w_pred = delta_c2w @ prev_c2w
-        return torch.linalg.inv(cur_c2w_pred)
-
-    def evaluate_tracking_init_loss(self, viewpoint, candidate_w2c):
-        """用候选 w2c 渲染一次并计算 tracking loss。不修改原始状态。"""
-        with torch.no_grad():
-            # 保存原始状态（cam_rot_delta / cam_trans_delta 是 nn.Parameter，取 .data）
-            orig_T = viewpoint.T.clone()
-            orig_rot_delta = viewpoint.cam_rot_delta.data.clone()
-            orig_trans_delta = viewpoint.cam_trans_delta.data.clone()
-
-            # 临时设置候选位姿
-            viewpoint.T = candidate_w2c.clone()
-            viewpoint.reset_pose_deltas()
-
-            # 渲染一次
-            render_pkg = render(
-                viewpoint, self.gaussians, self.pipeline_params, self.background, surf=False
-            )
-            loss = get_loss_tracking(
-                self.config,
-                render_pkg["render"],
-                render_pkg["depth"],
-                render_pkg["opacity"],
-                viewpoint,
-            )
-            del render_pkg
-
-            # 恢复原始状态（nn.Parameter 用 .data.copy_() 写回）
-            viewpoint.T = orig_T
-            viewpoint.cam_rot_delta.data.copy_(orig_rot_delta)
-            viewpoint.cam_trans_delta.data.copy_(orig_trans_delta)
-
-        return loss.item()
-
-    # ========================================================================
-    # Rescue mode: 小步 render refinement 不污染正式 tracking
-    # ========================================================================
-    def _rescue_trial_refine(self, viewpoint, candidate_w2c, iters):
-        """对候选位姿运行 iters 次小步 render tracking refinement。
-        完全恢复 viewpoint 状态，不修改 Gaussian，不更新 exposure。
-        返回 (refined_loss, refined_w2c)。"""
-        # 保存完整状态
-        orig_T = viewpoint.T.clone()
-        orig_rot_delta = viewpoint.cam_rot_delta.data.clone()
-        orig_trans_delta = viewpoint.cam_trans_delta.data.clone()
-        orig_fixed = viewpoint.fixed_pose
-
-        # 设置候选位姿
-        viewpoint.T = candidate_w2c.clone()
-        viewpoint.reset_pose_deltas()
-        viewpoint.fixed_pose = False
-        viewpoint.cam_rot_delta.requires_grad_(True)
-        viewpoint.cam_trans_delta.requires_grad_(True)
-
-        # 只优化当前帧 pose，不优化 exposure
-        trial_opt_params = [
-            {"params": [viewpoint.cam_rot_delta],
-             "lr": self.config["Training"]["lr"]["cam_rot_delta"],
-             "name": f"rescue_rot_{viewpoint.uid}"},
-            {"params": [viewpoint.cam_trans_delta],
-             "lr": self.config["Training"]["lr"]["cam_trans_delta"],
-             "name": f"rescue_trans_{viewpoint.uid}"},
-        ]
-        trial_optimizer = torch.optim.Adam(trial_opt_params)
-
-        best_loss = float("inf")
-        best_T = None
-        for _ in range(iters):
-            render_pkg = render(
-                viewpoint, self.gaussians, self.pipeline_params, self.background, surf=False
-            )
-            image, depth, opacity = (
-                render_pkg["render"], render_pkg["depth"], render_pkg["opacity"],
-            )
-            trial_optimizer.zero_grad()
-            loss_val = get_loss_tracking(self.config, image, depth, opacity, viewpoint)
-            loss_val.backward()
-
-            with torch.no_grad():
-                trial_optimizer.step()
-                converged = update_pose(viewpoint)
-                current_loss = loss_val.item()
-                if current_loss < best_loss:
-                    best_loss = current_loss
-                    best_T = viewpoint.T.clone()
-                del render_pkg
-                if converged:
-                    break
-
-        refined_loss = best_loss if best_loss < float("inf") else float("inf")
-        refined_w2c = best_T.clone() if best_T is not None else candidate_w2c.clone()
-
-        # 恢复原始状态
-        viewpoint.T = orig_T
-        viewpoint.cam_rot_delta.data.copy_(orig_rot_delta)
-        viewpoint.cam_trans_delta.data.copy_(orig_trans_delta)
-        viewpoint.fixed_pose = orig_fixed
-
-        return refined_loss, refined_w2c
-
-    def select_best_tracking_init(self, cur_frame_idx, viewpoint):
-        """构造候选初值，EAGS 风格保守选择：默认 previous；FFTVO 只在明显优于
-        previous 且通过严格质量门控时才被接受。子图 warmup 期 FFTVO 只诊断不接管。
-        返回 (best_name, best_w2c)。"""
-        prev_cam = self.cameras.get(cur_frame_idx - 1)
-        prev_w2c = prev_cam.T.clone() if prev_cam is not None else torch.eye(4, device=self.device)
-
-        # ---- 判断是否在子图启动保护期 ----
-        in_warmup = (
-            self.disable_fftvo_after_submap_start
-            and (cur_frame_idx - self.submap_start_frame_idx) < self.fftvo_warmup_frames_after_submap_start
-        )
-
-        # ---- 候选 A: 上一帧位姿 (previous) ----
-        candidates = []
-        if self.use_previous_candidate:
-            candidates.append(("previous", prev_w2c))
-
-        # ---- 候选 B: 恒速模型 (const_speed，默认关闭) ----
-        if self.use_const_speed_candidate:
-            const_w2c = self.build_const_speed_w2c(cur_frame_idx)
-            if const_w2c is not None:
-                candidates.append(("const_speed", const_w2c))
-
-        # ---- 候选 C: FFT VO ----
-        fft_vo_w2c = None
-        fft_vo_info = None
-        fft_vo_reject_reason = None
-
-        if self.use_fft_vo_candidate and self.fft_vo is not None and prev_cam is not None:
-            if in_warmup:
-                # warmup 期：运行 FFTVO 收集诊断，但不参与候选
-                prev_c2w = torch.linalg.inv(prev_w2c)
-                vo_success, vo_c2w, vo_info = self.fft_vo.estimate(prev_cam, viewpoint, prev_c2w)
-                if vo_success:
-                    self.fft_vo_stats["success"] += 1
-                    if self.fft_vo.debug_log:
-                        Log(f"[FFTVO] frame {cur_frame_idx}: skipped (submap warmup, "
-                            f"submap_start={self.submap_start_frame_idx}, "
-                            f"warmup={self.fftvo_warmup_frames_after_submap_start}), "
-                            f"obs n_inliers={vo_info.get('n_inliers', 0)}, "
-                            f"delta_t={vo_info.get('delta_t', 0):.3f}m")
-                else:
-                    self.fft_vo_stats["fail"] += 1
-                fft_vo_reject_reason = "warmup"
-            else:
-                prev_c2w = torch.linalg.inv(prev_w2c)
-                vo_success, vo_c2w, vo_info = self.fft_vo.estimate(prev_cam, viewpoint, prev_c2w)
-                if vo_success:
-                    self.fft_vo_stats["success"] += 1
-                    fft_vo_w2c = torch.linalg.inv(vo_c2w)
-                    fft_vo_info = vo_info
-                    candidates.append(("fft_vo", fft_vo_w2c))
-                    if self.fft_vo.debug_log:
-                        Log(f"[FFTVO] frame {cur_frame_idx}: success, "
-                            f"n_prev={vo_info.get('n_prev', 0)}, "
-                            f"n_tracked={vo_info.get('n_tracked', 0)}, "
-                            f"n_inliers={vo_info.get('n_inliers', 0)}, "
-                            f"inlier_ratio={vo_info.get('inlier_ratio', 0):.3f}, "
-                            f"delta_t={vo_info.get('delta_t', 0):.3f}m, "
-                            f"delta_deg={vo_info.get('delta_deg', 0):.1f}°")
-                else:
-                    self.fft_vo_stats["fail"] += 1
-
-        # ---- 评估所有候选的 render loss ----
-        losses = {}
-        for name, w2c in candidates:
-            losses[name] = self.evaluate_tracking_init_loss(viewpoint, w2c)
-
-        # ---- 保守选择策略：默认 previous ----
-        best_name = "previous"
-        best_w2c = prev_w2c
-        reason = fft_vo_reject_reason if fft_vo_reject_reason else "default"
-        prev_loss = losses.get("previous", float("inf"))
-
-        # ---- FFTVO 三层门控：hard reject / direct accept / rescue trial ----
-        if "fft_vo" in losses and fft_vo_info is not None:
-            fft_loss = losses["fft_vo"]
-            prev_loss_val = losses.get("previous", float("inf"))
-
-            n_inl = fft_vo_info.get("n_inliers", 0)
-            inl_r = fft_vo_info.get("inlier_ratio", 0)
-            d_t = fft_vo_info.get("delta_t", 0)
-            d_d = fft_vo_info.get("delta_deg", 0)
-
-            # --- Tier 1: Hard Reject ---
-            if inl_r < 0.60 or n_inl < 100 or d_t > 0.05 or d_d > 4.0:
-                reason = "hard_reject"
-                self.fft_vo_stats["hard_rejected"] += 1
-                if self.fft_vo.debug_log:
-                    tag = []
-                    if inl_r < 0.60: tag.append("low_inlier_ratio")
-                    if n_inl < 100: tag.append("too_few_inliers")
-                    if d_t > 0.05: tag.append("large_motion_t")
-                    if d_d > 4.0: tag.append("large_motion_r")
-                    Log(f"[FFTVO] hard reject frame={cur_frame_idx} reason={'+'.join(tag)} "
-                        f"n_inl={n_inl} ratio={inl_r:.3f} dt={d_t:.3f}m ddeg={d_d:.1f}°")
-
-            # --- Tier 2: Direct Accept ---
-            elif (not in_warmup
-                  and fft_loss < prev_loss_val * 0.75
-                  and n_inl >= 250 and inl_r >= 0.70
-                  and d_t <= 0.03 and d_d <= 2.0):
-                best_name = "fft_vo"
-                best_w2c = fft_vo_w2c
-                reason = "direct_accept: strong_loss_and_geometry"
-                self.fft_vo_stats["selected_direct_fftvo"] += 1
-                if self.fft_vo.debug_log:
-                    Log(f"[FFTVO] frame {cur_frame_idx}: direct accept "
-                        f"fft_loss={fft_loss:.4f} prev_loss={prev_loss_val:.4f} "
-                        f"n_inl={n_inl} ratio={inl_r:.3f} dt={d_t:.3f}m ddeg={d_d:.1f}°")
-
-            # --- Tier 3: Rescue Trial ---
-            elif (self.enable_rescue_mode and not in_warmup
-                  and fft_loss < prev_loss_val * 0.90
-                  and n_inl >= 100 and inl_r >= 0.60
-                  and d_t <= 0.05 and d_d <= 4.0):
-
-                if self.rescue_log:
-                    Log(f"[FFTVO-Rescue] frame={cur_frame_idx} "
-                        f"previous_init_loss={prev_loss_val:.4f} fft_init_loss={fft_loss:.4f}")
-
-                prev_refined_loss, prev_refined_w2c = self._rescue_trial_refine(
-                    viewpoint, prev_w2c, self.rescue_trial_iters)
-                fft_refined_loss, fft_refined_w2c = self._rescue_trial_refine(
-                    viewpoint, fft_vo_w2c, self.rescue_trial_iters)
-
-                if self.rescue_log:
-                    Log(f"[FFTVO-Rescue] previous_refined={prev_refined_loss:.4f} "
-                        f"fft_refined={fft_refined_loss:.4f}")
-
-                if fft_refined_loss < prev_refined_loss * self.rescue_accept_refined_loss_ratio:
-                    best_name = "fft_vo"
-                    best_w2c = fft_refined_w2c
-                    reason = "rescue: refined_loss_better"
-                    self.fft_vo_stats["rescue_accepted"] += 1
-                    if self.rescue_log:
-                        Log(f"[FFTVO-Rescue] selected=fft_vo reason={reason}")
-                else:
-                    self.fft_vo_stats["rescue_rejected"] += 1
-                    if self.rescue_log:
-                        Log(f"[FFTVO-Rescue] selected=previous reason=fft_refined not better")
-                    if self.fft_vo.debug_log:
-                        Log(f"[FFTVO] frame {cur_frame_idx}: rejected (weak_improvement) "
-                            f"fft_loss={fft_loss:.4f} prev_loss={prev_loss_val:.4f} "
-                            f"n_inl={n_inl} ratio={inl_r:.3f} dt={d_t:.3f}m ddeg={d_d:.1f}°")
-
-            # --- Not rescued, not direct, not hard reject: just weak reject ---
-            else:
-                if self.fft_vo.debug_log:
-                    Log(f"[FFTVO] frame {cur_frame_idx}: rejected (weak_improvement) "
-                        f"fft_loss={fft_loss:.4f} prev_loss={prev_loss_val:.4f} "
-                        f"n_inl={n_inl} ratio={inl_r:.3f} dt={d_t:.3f}m ddeg={d_d:.1f}°")
-
-        # ---- 统计 ----
-        if best_name == "previous":
-            self.fft_vo_stats["selected_previous"] += 1
-
-        # ---- 候选 loss 日志 ----
-        if self.log_candidate_losses:
-            loss_str = " ".join(f"{n}={v:.4f}" for n, v in losses.items())
-            Log(f"[InitLoss] frame={cur_frame_idx} {loss_str} selected={best_name} reason={reason}")
-
-        return best_name, best_w2c
-
-    # ========================================================================
-    # 5. Tracking (per-frame pose estimation, EAGS-style map-independent)
+    # 5. Tracking (FFT Edge VO + render refinement)
     # ========================================================================
     def tracking(self, cur_frame_idx, viewpoint):
-        # Seed frame: render once for visibility, no pose change
         if viewpoint.fixed_pose:
             with torch.no_grad():
                 render_pkg = render(
@@ -546,67 +264,40 @@ class FrontEnd(mp.Process):
 
         prev_cam = self.cameras.get(cur_frame_idx - 1)
 
-        # ---- Step 1: Pose estimation (FFTVO-primary or legacy) ----
-        fftvo_success = False
-        if self.use_fft_vo_primary and self.fft_vo is not None and prev_cam is not None:
-            prev_c2w = torch.linalg.inv(prev_cam.T)
-            fftvo_success, fft_c2w, fft_info = self.fft_vo.estimate(
-                prev_cam, viewpoint, prev_c2w
-            )
-            if fftvo_success:
-                viewpoint.T = torch.linalg.inv(fft_c2w)
-                self.fft_vo_stats["success"] += 1
-                if self.debug_log:
-                    n_inl = fft_info.get("n_inliers", 0)
-                    ratio = fft_info.get("inlier_ratio", 0)
-                    dt = fft_info.get("delta_t", 0)
-                    dd = fft_info.get("delta_deg", 0)
-                    Log(f"[FFTVO] frame {cur_frame_idx}: success, "
-                        f"n_inl={n_inl} ratio={ratio:.3f} dt={dt:.3f}m ddeg={dd:.1f} deg")
+        # ---- Step 1: FFT Edge VO pose estimation ---------------------------
+        vo_success = False
+        if self.use_fft_edge_vo:
+            self._init_fft_edge_vo()
+            rgb_bgr = self._camera_rgb_to_bgr(viewpoint)
+            depth_np = viewpoint.depth
+            init_c2w = (torch.linalg.inv(prev_cam.T).cpu().numpy().astype(np.float64)
+                        if prev_cam is not None else None)
+
+            if not self.fft_edge_vo_initialized:
+                if init_c2w is None:
+                    init_c2w = np.eye(4, dtype=np.float64)
+                ok = self.fft_edge_vo.set_reference(rgb_bgr, depth_np, init_c2w)
+                if ok:
+                    self.fft_edge_vo_initialized = True
+                    vo_success, est_c2w, _ = self.fft_edge_vo.track(rgb_bgr, depth_np, init_c2w)
+                # else: vo_success stays False
             else:
-                viewpoint.T = prev_cam.T.clone()
-                self.fft_vo_stats["fail"] += 1
-                if self.debug_log:
-                    err = fft_info.get("error", "unknown")
-                    n_prev = fft_info.get("kp_prev", fft_info.get("n_prev", 0))
-                    n_trk = fft_info.get("n_tracked", 0)
-                    n_3d = fft_info.get("n_3d", 0)
-                    n_inl = fft_info.get("n_inliers", 0)
-                    inl_r = fft_info.get("inlier_ratio", 0)
-                    dt = fft_info.get("delta_t", 0)
-                    dd = fft_info.get("delta_deg", 0)
-                    Log(f"[FFTVO] frame {cur_frame_idx}: FAILED ({err}) "
-                        f"kp={n_prev} trk={n_trk} 3d={n_3d} inl={n_inl} r={inl_r:.2f} "
-                        f"dt={dt:.3f}m ddeg={dd:.1f} deg")
-        elif self.use_fft_vo_init and self.fft_vo is not None and prev_cam is not None:
-            # Legacy: FFTVO as init candidate, render tracking as primary
-            best_name, best_w2c = self.select_best_tracking_init(cur_frame_idx, viewpoint)
-            viewpoint.T = best_w2c.clone()
-            if self.debug_log:
-                Log(f"[FFTVO] frame {cur_frame_idx}: selected init = {best_name}")
+                vo_success, est_c2w, _ = self.fft_edge_vo.track(rgb_bgr, depth_np, init_c2w)
+
+            if vo_success:
+                viewpoint.T = torch.from_numpy(np.linalg.inv(est_c2w)).float().cuda()
         elif prev_cam is not None:
             viewpoint.T = prev_cam.T.clone()
 
-        # ---- Step 2: Determine refinement iteration count ----
-        if self.use_fft_vo_primary:
-            refine_iters = self.tracking_refine_iters if fftvo_success else self.tracking_fallback_iters
+        # ---- Step 2: Refinement iteration count ----------------------------
+        if self.use_fft_edge_vo:
+            refine_iters = (self.tracking_refine_iters if vo_success
+                            else self.tracking_fallback_iters)
         else:
             refine_iters = self.tracking_itr_num
+        refine_iters = max(refine_iters, 5)  # minimum GPU refinement
 
-        # ---- Zero-refinement path: single no-grad render for downstream ----
-        if refine_iters <= 0:
-            viewpoint.cam_rot_delta.requires_grad_(False)
-            viewpoint.cam_trans_delta.requires_grad_(False)
-            with torch.no_grad():
-                render_pkg = render(
-                    viewpoint, self.gaussians, self.pipeline_params, self.background, surf=False
-                )
-            self.median_depth = get_median_depth(
-                render_pkg["depth"], render_pkg["opacity"]
-            )
-            return render_pkg
-
-        # ---- Step 3: Render refinement ----
+        # ---- Step 3: Render refinement ------------------------------------
         viewpoint.fixed_pose = False
         viewpoint.cam_rot_delta.requires_grad_(True)
         viewpoint.cam_trans_delta.requires_grad_(True)
@@ -614,16 +305,15 @@ class FrontEnd(mp.Process):
         opt_params = [
             {"params": [viewpoint.cam_rot_delta],
              "lr": self.config["Training"]["lr"]["cam_rot_delta"],
-             "name": "rot_{}".format(viewpoint.uid)},
+             "name": f"rot_{viewpoint.uid}"},
             {"params": [viewpoint.cam_trans_delta],
              "lr": self.config["Training"]["lr"]["cam_trans_delta"],
-             "name": "trans_{}".format(viewpoint.uid)},
+             "name": f"trans_{viewpoint.uid}"},
             {"params": [viewpoint.exposure_a], "lr": 0.01,
-             "name": "exposure_a_{}".format(viewpoint.uid)},
+             "name": f"exposure_a_{viewpoint.uid}"},
             {"params": [viewpoint.exposure_b], "lr": 0.01,
-             "name": "exposure_b_{}".format(viewpoint.uid)},
+             "name": f"exposure_b_{viewpoint.uid}"},
         ]
-
         pose_optimizer = torch.optim.Adam(opt_params)
         best_T, best_loss, best_render_pkg = None, float("inf"), None
 
@@ -639,7 +329,6 @@ class FrontEnd(mp.Process):
                 self.config, image, depth, opacity, viewpoint
             )
             loss_tracking.backward()
-
             with torch.no_grad():
                 pose_optimizer.step()
                 converged = update_pose(viewpoint)
@@ -653,7 +342,6 @@ class FrontEnd(mp.Process):
                         "opacity": opacity.detach().clone(),
                         "n_touched": render_pkg.get("n_touched", None),
                     }
-
             if self.use_gui and tracking_itr % 10 == 0:
                 self.q_main2vis.put(
                     gui_utils.GaussianPacket(
@@ -669,7 +357,6 @@ class FrontEnd(mp.Process):
 
         if best_T is not None:
             viewpoint.T = best_T.clone()
-
         self.median_depth = get_median_depth(
             best_render_pkg["depth"], best_render_pkg["opacity"]
         )
@@ -816,11 +503,16 @@ class FrontEnd(mp.Process):
     # ========================================================================
     # 9. Submap Cutting — Decision (motion-only)
     # ========================================================================
-    def should_start_new_submap(self, current_c2w):
+    def should_start_new_submap(self, current_c2w, cur_frame_idx):
         if not self.use_submap:
             return False, None
 
         if self.submap_anchor_pose is None:
+            return False, None
+
+        # guard: minimum frames between cuts (prevents infinite cut loops)
+        min_frames = 3
+        if cur_frame_idx - self.submap_start_frame_idx < min_frames:
             return False, None
 
         translation, angle_deg = self.compute_submap_motion(current_c2w, self.submap_anchor_pose)
@@ -860,7 +552,7 @@ class FrontEnd(mp.Process):
 
         self.save_submap_cut_info(current_c2w, cut_metrics)
 
-        # FFTVO-primary 模式下 cut frame pose 已由 FFTVO 直接给出，无需渲染 refine
+        # 切图帧的 global pose 作为新子图 seed
         seed_global_c2w = current_c2w.detach().cpu().numpy().astype(np.float64)
 
         # 2) 保存子图间 transition：prev_seed -> new_seed
@@ -896,6 +588,9 @@ class FrontEnd(mp.Process):
             f"[DEBUG] cut frame {cur_frame_idx} inherited global pose into "
             f"submap {self.current_submap_id}"
         )
+
+        # Reset FFT Edge VO so new submap gets its own reference
+        self.fft_edge_vo_initialized = False
 
         # 4) 清空当前子图窗口，但不要改 viewpoint.T。
         self.current_window = []
@@ -1039,7 +734,7 @@ class FrontEnd(mp.Process):
                 self.cameras[cur_frame_idx] = viewpoint
                 self.frame_to_submap[cur_frame_idx] = self.current_submap_id
 
-                # 延迟清理：帧 N-2 已不再被任何 FFTVO prev_cam 引用，可安全释放
+                # 延迟清理：帧 N-2 已不再被任何 prev_cam 引用，可安全释放
                 stale_idx = cur_frame_idx - 2
                 if stale_idx >= 0 and stale_idx in self.cameras and stale_idx not in self.current_window:
                     self.cleanup(stale_idx)
@@ -1059,9 +754,16 @@ class FrontEnd(mp.Process):
 
                 current_c2w = torch.linalg.inv(viewpoint.T)
 
-                # EAGS 风格：tracking 完成后把 refined pose 写回 FFTVO
-                if self.enable_pose_feedback and self.fft_vo is not None:
-                    self.fft_vo.update_pose(cur_frame_idx, current_c2w)
+                # Auto-refresh FFT Edge VO reference when quality degrades
+                # (large rotation / scene change causes mask overlap to drop)
+                if self.use_fft_edge_vo and self.fft_edge_vo is not None:
+                    _min_vis = max(300, self.fft_edge_vo.ref_count * 0.5)
+                    if (self.fft_edge_vo.last_dt_mean > 8.0
+                            or self.fft_edge_vo.last_visible < _min_vis):
+                        rgb_bgr = self._camera_rgb_to_bgr(viewpoint)
+                        depth_np = viewpoint.depth
+                        c2w_np = current_c2w.cpu().numpy().astype(np.float64)
+                        self.fft_edge_vo.set_reference(rgb_bgr, depth_np, c2w_np)
 
                 if self.submap_anchor_pose is None:
                     self.submap_anchor_pose = current_c2w.clone()
@@ -1141,7 +843,7 @@ class FrontEnd(mp.Process):
                     create_kf = check_time and create_kf
 
                 # Submap cut decision
-                should_cut_submap, cut_metrics = self.should_start_new_submap(current_c2w)
+                should_cut_submap, cut_metrics = self.should_start_new_submap(current_c2w, cur_frame_idx)
 
                 if should_cut_submap:
                     did_cut = self.perform_submap_cut(
@@ -1151,6 +853,17 @@ class FrontEnd(mp.Process):
                         cut_metrics,
                     )
                     if did_cut:
+                        # Init FFT Edge VO reference from seed frame (has tracked
+                        # pose + fresh data; otherwise next frame fails with stale ref)
+                        if self.use_fft_edge_vo:
+                            self._init_fft_edge_vo()
+                            rgb_bgr = self._camera_rgb_to_bgr(viewpoint)
+                            depth_np = viewpoint.depth
+                            c2w = current_c2w.cpu().numpy().astype(np.float64)
+                            self.fft_edge_vo_initialized = self.fft_edge_vo.set_reference(
+                                rgb_bgr, depth_np, c2w)
+                        else:
+                            self.fft_edge_vo_initialized = False
                         cur_frame_idx += 1
                         continue
 
@@ -1180,6 +893,12 @@ class FrontEnd(mp.Process):
                     self.request_keyframe(
                         cur_frame_idx, viewpoint, self.current_window, depth_map
                     )
+                    # Refresh FFT Edge VO reference with this keyframe
+                    if self.use_fft_edge_vo and self.fft_edge_vo is not None:
+                        rgb_bgr = self._camera_rgb_to_bgr(viewpoint)
+                        depth_np = viewpoint.depth
+                        c2w = torch.linalg.inv(viewpoint.T).cpu().numpy().astype(np.float64)
+                        self.fft_edge_vo.set_reference(rgb_bgr, depth_np, c2w)
                 cur_frame_idx += 1
 
                 if (
@@ -1219,13 +938,5 @@ class FrontEnd(mp.Process):
                     self.requested_init = False
 
                 elif data[0] == "stop":
-                    if self.use_fft_vo_init:
-                        s = self.fft_vo_stats
-                        Log(f"[FFTVO] Stats: success={s['success']}, fail={s['fail']}, "
-                            f"selected_previous={s['selected_previous']}, "
-                            f"direct_accept={s['selected_direct_fftvo']}, "
-                            f"hard_rejected={s['hard_rejected']}, "
-                            f"rescue_accepted={s['rescue_accepted']}, "
-                            f"rescue_rejected={s['rescue_rejected']}")
                     Log("Frontend Stopped.")
                     break
