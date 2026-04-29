@@ -6,11 +6,7 @@ import evo
 import numpy as np
 import torch
 from evo.core import metrics, trajectory
-from evo.core.metrics import PoseRelation, Unit
-from evo.core.trajectory import PosePath3D, PoseTrajectory3D
-from evo.tools import plot
-from evo.tools.plot import PlotMode
-from evo.tools.settings import SETTINGS
+from evo.core.trajectory import PosePath3D
 from matplotlib import pyplot as plt
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
@@ -64,69 +60,6 @@ def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
     plt.close(fig)
     return ape_stat
 
-
-def _load_submap_correct_tsfms(save_dir):
-    """
-    从磁盘加载所有子图的 PGO 修正矩阵 correct_tsfm。
-
-    Args:
-        save_dir: 结果保存根目录，其下应有 submaps/ 子目录存放 *.ckpt 文件。
-
-    Returns:
-        dict: {submap_id (int): correct_tsfm (np.ndarray, 4x4)}
-              如果 submaps 目录不存在或为空，返回空字典。
-    """
-    import glob
-    submaps_dir = os.path.join(save_dir, "submaps")
-    correct_tsfms = {}
-    if not os.path.isdir(submaps_dir):
-        return correct_tsfms
-    for ckpt_path in sorted(glob.glob(os.path.join(submaps_dir, "*.ckpt"))):
-        sid = int(os.path.basename(ckpt_path).split('.')[0])
-        try:
-            ckpt = torch.load(ckpt_path, map_location="cpu")
-            tsfm = ckpt.get("correct_tsfm", np.eye(4))
-            if isinstance(tsfm, torch.Tensor):
-                tsfm = tsfm.numpy()
-            correct_tsfms[sid] = np.array(tsfm, dtype=np.float64)
-            del ckpt
-        except Exception as e:
-            Log(f"[eval_ate] 读取子图 {sid} 的 correct_tsfm 失败: {e}")
-            correct_tsfms[sid] = np.eye(4)
-    return correct_tsfms
-
-def rebuild_submap_anchors_from_ckpts(save_dir):
-    submaps_dir = os.path.join(save_dir, "submaps")
-    if not os.path.isdir(submaps_dir):
-        return {}
-
-    ckpt_files = sorted(
-        [os.path.join(submaps_dir, f) for f in os.listdir(submaps_dir) if f.endswith(".ckpt")]
-    )
-    if len(ckpt_files) == 0:
-        return {}
-
-    sid_to_ckpt = {
-        int(os.path.basename(p).split(".")[0]): p
-        for p in ckpt_files
-    }
-
-    all_sids = sorted(sid_to_ckpt.keys())
-    anchors = {all_sids[0]: np.eye(4)}
-
-    for i in range(1, len(all_sids)):
-        prev_sid = all_sids[i - 1]
-        curr_sid = all_sids[i]
-
-        prev_ckpt = torch.load(sid_to_ckpt[prev_sid], map_location="cpu")
-        rel_prev_from_curr = np.array(
-            prev_ckpt.get("relative_pose", np.eye(4)),
-            dtype=np.float64
-        )
-
-        anchors[curr_sid] = anchors[prev_sid] @ rel_prev_from_curr
-
-    return anchors
 
 def eval_ate(frames, kf_ids, save_dir, iterations, final=False, monocular=False):
     """计算全局轨迹 ATE。frames 中的 cam.T 必须是全局 W2C。"""

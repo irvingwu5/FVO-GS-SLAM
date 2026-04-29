@@ -7,11 +7,10 @@ from tqdm import tqdm
 import os
 import numpy as np
 from gaussian_splatting.gaussian_renderer import render
-from gaussian_splatting.utils.loss_utils import l1_loss, ssim
 from utils.logging_utils import Log
 from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
-from utils.slam_utils import (get_loss_mapping,_save_normal_pair, _save_rendered_rgb,_save_gt_normal,check_normal_dir)
+from utils.slam_utils import get_loss_mapping
 import torch.nn.functional as F
 
 class BackEnd(mp.Process):
@@ -537,49 +536,6 @@ class BackEnd(mp.Process):
     # ========================================================================
     # 8. Color Refinement (offline)
     # ========================================================================
-    def color_refinement(self):
-        Log("Starting color refinement")
-
-        iteration_total = 26000
-        for iteration in tqdm(range(1, iteration_total + 1)):
-            viewpoint_idx_stack = list(self.viewpoints.keys())
-            viewpoint_cam_idx = viewpoint_idx_stack.pop(
-                random.randint(0, len(viewpoint_idx_stack) - 1)
-            )
-            viewpoint_cam = self.viewpoints[viewpoint_cam_idx]
-
-            render_pkg = render(
-                viewpoint_cam, self.gaussians, self.pipeline_params, self.background, surf=False
-            )
-            image, viewspace_point_tensor, visibility_filter, radii, depth, opacity, n_touched = (
-                render_pkg["render"],
-                render_pkg["viewspace_points"],
-                render_pkg["visibility_filter"],
-                render_pkg["radii"],
-                render_pkg["depth"],
-                render_pkg["opacity"],
-                render_pkg["n_touched"],
-            )
-
-            gt_image = viewpoint_cam.original_image.cuda()
-            Ll1 = l1_loss(image, gt_image)
-            loss = (1.0 - self.opt_params.lambda_dssim) * Ll1 + self.opt_params.lambda_dssim * (1.0 - ssim(image, gt_image))
-            loss.backward()
-            with torch.no_grad():
-                self.gaussians.max_radii2D[visibility_filter] = torch.max(
-                    self.gaussians.max_radii2D[visibility_filter],
-                    radii[visibility_filter],
-                )
-                self.gaussians.optimizer.step()
-                self.gaussians.optimizer.zero_grad(set_to_none=True)
-                self.gaussians.update_learning_rate(iteration)
-
-            del render_pkg
-
-            if iteration % 100 == 0:
-                torch.cuda.empty_cache()
-        Log("Map refinement done")
-
     # ========================================================================
     # 10. Frontend Communication
     # ========================================================================
@@ -663,9 +619,6 @@ class BackEnd(mp.Process):
                     self.pause = True
                 elif data[0] == "unpause":
                     self.pause = False
-                elif data[0] == "color_refinement":
-                    self.color_refinement()
-                    self.push_to_frontend()
                 elif data[0] == "init":
                     cur_frame_idx = data[1]
                     viewpoint = data[2]
