@@ -525,17 +525,6 @@ class LoopClosureProcess(mp.Process):
     # 4.6 Pose Graph Optimization — Global
     # ========================================================================
     # --- PGO Helper: load transitions from ckpt ---
-    def _load_relative_pose_from_ckpt(self, sid):
-        ckpt_path = self.submap_records.get(sid)
-        if ckpt_path is None or not os.path.exists(ckpt_path):
-            return np.eye(4)
-
-        ckpt = torch.load(ckpt_path, map_location="cpu")
-        rel = ckpt.get("relative_pose", np.eye(4))
-        if isinstance(rel, torch.Tensor):
-            rel = rel.numpy()
-        return np.array(rel, dtype=np.float64)
-
     def _load_prev_to_curr_transition(self, prev_sid, curr_sid):
         prev_ckpt_path = self.submap_records.get(prev_sid)
         if prev_ckpt_path is not None and os.path.exists(prev_ckpt_path):
@@ -712,6 +701,9 @@ class LoopClosureProcess(mp.Process):
     # 4.7 Apply Correction to Submaps
     # ========================================================================
     def apply_correction_to_submaps(self, correction_list):
+        """只写入 correct_tsfm 字段，不修改 ckpt 内的 gaussian_params 和 keyframe_poses。
+        slam.py 终局合并时一次性应用 correct_tsfm，避免双重修正。
+        """
         for correction in correction_list:
             submap_id = correction["submap_id"]
             new_correct_tsfm = np.array(correction["correct_tsfm"], dtype=np.float64)
@@ -721,63 +713,13 @@ class LoopClosureProcess(mp.Process):
                 continue
 
             submap_ckpt = torch.load(ckpt_path, map_location="cpu")
-
-            prev_correct_tsfm = submap_ckpt.get(
-                "correct_tsfm", np.eye(4, dtype=np.float64)
-            )
-            if isinstance(prev_correct_tsfm, torch.Tensor):
-                prev_correct_tsfm = prev_correct_tsfm.cpu().numpy()
-            prev_correct_tsfm = np.array(prev_correct_tsfm, dtype=np.float64)
-
-            delta_tsfm = new_correct_tsfm @ np.linalg.inv(prev_correct_tsfm)
-
-            if np.allclose(delta_tsfm, np.eye(4), atol=1e-6):
-                submap_ckpt["correct_tsfm"] = new_correct_tsfm
-                torch.save(submap_ckpt, ckpt_path)
-                continue
-
-            Log(
-                f"[LoopClosure] Apply rigid correction to submap {submap_id}: "
-                f"delta_t={np.linalg.norm(delta_tsfm[:3, 3]):.4f}m"
-            )
-
-            gaussian_params = submap_ckpt["gaussian_params"]
-
-            device = gaussian_params["_xyz"].device
-            gaussian_params = {
-                k: (v.cuda() if torch.is_tensor(v) else v)
-                for k, v in gaussian_params.items()
-            }
-
-            gaussian_params = rigid_transform_2dgs(gaussian_params, delta_tsfm)
-
-            gaussian_params = {
-                k: (v.detach().cpu() if torch.is_tensor(v) else v)
-                for k, v in gaussian_params.items()
-            }
-            submap_ckpt["gaussian_params"] = gaussian_params
-
-            kf_poses = submap_ckpt.get("submap_keyframe_poses", {})
-            new_kf_poses = {}
-
-            for kf_id, c2w in kf_poses.items():
-                if isinstance(c2w, torch.Tensor):
-                    c2w = c2w.cpu().numpy()
-                c2w = np.array(c2w, dtype=np.float64)
-
-                new_kf_poses[int(kf_id)] = (delta_tsfm @ c2w).astype(np.float64)
-
-            submap_ckpt["submap_keyframe_poses"] = new_kf_poses
-
             submap_ckpt["correct_tsfm"] = new_correct_tsfm
-
             torch.save(submap_ckpt, ckpt_path)
 
-            self.submap_pcds.pop(submap_id, None)
-            self.submap_dense_pcds.pop(submap_id, None)
-
-            if submap_id in self.submap_access_order:
-                self.submap_access_order.remove(submap_id)
+            Log(
+                f"[LoopClosure] PGO correction written to submap {submap_id}: "
+                f"delta_t={np.linalg.norm(new_correct_tsfm[:3, 3] - np.eye(4)[:3, 3]):.4f}m"
+            )
 
     # ========================================================================
     # 4.9 Main Loop
