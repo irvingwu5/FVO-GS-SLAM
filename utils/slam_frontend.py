@@ -145,6 +145,11 @@ class FrontEnd(mp.Process):
         viewpoint.cam_rot_delta.requires_grad_(False)
         viewpoint.cam_trans_delta.requires_grad_(False)
 
+        # Record submap 0 seed C2W (actual seed frame, not overwritten later)
+        seed_c2w = np.linalg.inv(viewpoint.T_gt.cpu().numpy()).astype(np.float64)
+        self.submap_seed_global_c2w[0] = seed_c2w.copy()
+        self.last_submap_seed_global_c2w = seed_c2w.copy()
+
         self.kf_indices = []
         depth_map = self.add_new_keyframe(cur_frame_idx, init=True)
         self.request_init(cur_frame_idx, viewpoint, depth_map)
@@ -155,17 +160,7 @@ class FrontEnd(mp.Process):
         self.kf_indices.append(cur_frame_idx)
         viewpoint = self.cameras[cur_frame_idx]
         gt_img = viewpoint.original_image.cuda()
-        # =================================================================
-        # FFT 频率掩膜条件计算
-        # =================================================================
-        if self.use_fft_mask:
-            if self.fft_filter is None:
-                self.fft_filter = FFTFrequencyFilter(gt_img.shape[1], gt_img.shape[2])
 
-            img_np = (gt_img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-            img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-            viewpoint.freq_mask = self.fft_filter.generate_frequency_mask(img_bgr)
-        # =================================================================
         valid_rgb = (gt_img.sum(dim=0) > rgb_boundary_threshold)[None]
         if self.monocular:
             if depth is None:
@@ -219,22 +214,17 @@ class FrontEnd(mp.Process):
     # ========================================================================
     def compute_error_mask(self, render_pkg, viewpoint):
         """
-        基于当前渲染结果与真实观测的差异，计算哪里需要补点 (Error Mask)
-        grad_mask 管"在哪里优化位姿"，freq_mask 管"新高斯点怎么撒、撒多大"，error_mask 管"在哪里补新高斯点"
+        对齐 FGS-SLAM seeding_mask：alpha 空洞 + 深度穿透误差
+        freq_mask 管"新高斯点尺度"，error_mask 管"在哪里补新高斯点"
         """
         gt_image = viewpoint.original_image.cuda()  # [3, H, W]
-        render_image = render_pkg["render"].detach()  # [3, H, W]
         render_opacity = render_pkg["opacity"].detach()  # [1, H, W]
 
-        # 1. Silhouette / Opacity 掩膜 (寻找地图没覆盖到的"漏洞")
-        silhouette_mask = (render_opacity < 0.95).squeeze(0)  # [H, W]
+        # 1. Alpha 掩膜 (地图空洞，对齐 FGS-SLAM alpha_mask)
+        alpha_mask = (render_opacity < 0.95).squeeze(0)  # [H, W]
 
-        # 2. RGB 光度误差掩膜 (寻找颜色重建错的地方)
-        rgb_error = torch.abs(gt_image - render_image).sum(dim=0)  # [H, W]
-        rgb_error_mask = rgb_error > 0.5
-
-        # 3. Depth 深度误差掩膜 (如果有 GT 深度的话)
-        depth_error_mask = torch.zeros_like(silhouette_mask, dtype=torch.bool)
+        # 2. Depth 穿透误差掩膜 (对齐 FGS-SLAM depth_error_mask)
+        depth_error_mask = torch.zeros_like(alpha_mask, dtype=torch.bool)
         if not self.monocular and viewpoint.depth is not None:
             gt_depth = torch.from_numpy(viewpoint.depth).cuda()  # [H, W]
             render_depth = render_pkg["depth"].detach().squeeze(0)  # [H, W]
@@ -243,10 +233,15 @@ class FrontEnd(mp.Process):
             valid_depth = gt_depth > 0.01
             if valid_depth.any():
                 median_error = depth_error[valid_depth].median()
-                depth_error_mask = valid_depth & (render_depth > gt_depth) & (depth_error > 10.0 * median_error)
+                # FGS-SLAM: render_depth > gt_depth AND depth_error > 40 * median
+                depth_error_mask = (
+                    valid_depth
+                    & (render_depth > gt_depth)
+                    & (depth_error > 40.0 * median_error)
+                )
 
-        # 综合掩膜：没覆盖的 | 颜色错的 | 深度错的
-        error_mask = silhouette_mask | rgb_error_mask | depth_error_mask
+        # 综合掩膜：空洞 | 深度穿透（对齐 FGS-SLAM seeding_mask = alpha_mask | depth_error_mask）
+        error_mask = alpha_mask | depth_error_mask
 
         return error_mask
 
@@ -288,6 +283,8 @@ class FrontEnd(mp.Process):
 
             if vo_success:
                 viewpoint.T = torch.from_numpy(np.linalg.inv(est_c2w)).float().cuda()
+            elif prev_cam is not None:
+                viewpoint.T = prev_cam.T.clone()
         elif prev_cam is not None:
             viewpoint.T = prev_cam.T.clone()
 
@@ -748,10 +745,6 @@ class FrontEnd(mp.Process):
                 if self.submap_motion_anchor_global_c2w is None:
                     self.submap_motion_anchor_global_c2w = current_c2w.clone()
 
-                    seed_np = current_c2w.detach().cpu().numpy().astype(np.float64)
-                    self.last_submap_seed_global_c2w = seed_np.copy()
-                    self.submap_seed_global_c2w[self.current_submap_id] = seed_np.copy()
-
                 # GUI update
                 if self.use_gui:
                     current_window_dict = {}
@@ -860,9 +853,6 @@ class FrontEnd(mp.Process):
                             "Keyframes lacks sufficient overlap to initialize the map, resetting."
                         )
                         continue
-
-                    if self.use_error_mask:
-                        viewpoint.error_mask = self.compute_error_mask(render_pkg, viewpoint)
 
                     depth_map = self.add_new_keyframe(
                         cur_frame_idx,

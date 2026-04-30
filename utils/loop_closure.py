@@ -538,7 +538,7 @@ class LoopClosureProcess(mp.Process):
 
     def _load_prev_to_curr_information(self, prev_sid, curr_sid):
         return np.identity(6, dtype=np.float64) * float(
-            self.global_seed_default_odom_info_scale
+            self.default_odom_info_scale
         )
 
     # --- PGO Helper: anchor chain ---
@@ -604,7 +604,9 @@ class LoopClosureProcess(mp.Process):
             curr_sid = all_submap_ids[i]
 
             rel_prev_from_curr = self._load_prev_to_curr_transition(prev_sid, curr_sid)
-            odom_source_to_target = np.linalg.inv(rel_prev_from_curr)
+            # Open3D convention: node_j = node_i @ T_ij
+            # T_odom = inv(seed_prev) @ seed_curr = rel_prev_from_curr (already source→target)
+            odom_source_to_target = rel_prev_from_curr.copy()
             info_odom = self._load_prev_to_curr_information(prev_sid, curr_sid)
 
             pose_graph.edges.append(
