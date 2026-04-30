@@ -12,6 +12,8 @@ from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
 from utils.slam_utils import get_loss_mapping
 import torch.nn.functional as F
+import cv2
+from utils.fft_filter import FFTFrequencyFilter
 
 class BackEnd(mp.Process):
     # ========================================================================
@@ -50,6 +52,8 @@ class BackEnd(mp.Process):
 
         # ===== 消融开关 =====
         self.use_fdn = self.config.get("Ablation", {}).get("use_fdn", True)
+        self.use_fft_mask = self.config.get("Ablation", {}).get("use_fft_mask", True)
+        self.fft_filter = None
 
         # ===== 子图状态 =====
         self.current_submap_id = 0
@@ -152,6 +156,51 @@ class BackEnd(mp.Process):
     # 5. Map Initialization
     # ========================================================================
     def add_next_kf(self, frame_idx, viewpoint, init=False, scale=2.0, depth_map=None):
+        # ==============================================================
+        # 对齐 FGS-SLAM：在 Backend 内计算 freq_mask 和 error_mask
+        # （而非 Frontend 中 tracking 时的一次性计算）
+        # ==============================================================
+
+        # ---- FFT 频率掩膜：描述图像纹理频率，用于 Gaussian 尺度初始化 ----
+        if self.use_fft_mask:
+            if self.fft_filter is None:
+                H, W = viewpoint.image_height, viewpoint.image_width
+                self.fft_filter = FFTFrequencyFilter(H, W)
+            img_np = (viewpoint.original_image.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+            viewpoint.freq_mask = self.fft_filter.generate_frequency_mask(img_bgr)
+
+        # ---- Error 掩膜：基于当前地图渲染的空洞 + 深度穿透检测 ----
+        use_error_mask = self.config.get("Ablation", {}).get("use_error_mask", True)
+        if (not init) and use_error_mask and len(self.gaussians._xyz) > 0:
+            with torch.no_grad():
+                render_pkg = render(
+                    viewpoint, self.gaussians, self.pipeline_params, self.background, surf=False
+                )
+                render_opacity = render_pkg["opacity"].detach()
+                render_depth = render_pkg["depth"].detach()
+
+                # Alpha 空洞掩膜（对齐 FGS-SLAM alpha_mask）
+                alpha_mask = (render_opacity < 0.95).squeeze(0)
+
+                # Depth 穿透误差掩膜（对齐 FGS-SLAM depth_error_mask）
+                depth_error_mask = torch.zeros_like(alpha_mask, dtype=torch.bool)
+                if (not self.monocular) and viewpoint.depth is not None:
+                    gt_depth = torch.from_numpy(viewpoint.depth).to(
+                        dtype=torch.float32, device=render_depth.device
+                    )
+                    depth_error = torch.abs(gt_depth - render_depth.squeeze(0))
+                    valid_depth = gt_depth > 0.01
+                    if valid_depth.any():
+                        median_error = depth_error[valid_depth].median()
+                        depth_error_mask = (
+                            valid_depth
+                            & (render_depth.squeeze(0) > gt_depth)
+                            & (depth_error > 40.0 * median_error)
+                        )
+
+                viewpoint.error_mask = (alpha_mask | depth_error_mask)
+
         self.gaussians.extend_from_pcd_seq(
             viewpoint, kf_id=frame_idx, init=init, scale=scale, depthmap=depth_map
         )

@@ -174,19 +174,10 @@ class GaussianModel:
         raw_valid_mask = valid_mask.copy()
 
         # ==============================================================
-        # 机制 1：FFT 掩膜
+        # 机制 1：FFT 掩膜 — 仅用于尺度控制（对齐 FGS-SLAM）
+        # 不在此处过滤点密度；freq_mask 在 create_pcd_from_image_and_depth
+        # 中通过 is_high_freq → scale_multiplier 区分高/低频尺度
         # ==============================================================
-        if use_fft_mask and hasattr(cam, "freq_mask") and cam.freq_mask is not None:
-            freq_mask_np = cam.freq_mask.detach().cpu().numpy().astype(bool)
-            if freq_mask_np.ndim == 3:
-                freq_mask_np = np.squeeze(freq_mask_np, axis=0)
-
-            downsample_low = 3
-            low_freq_grid = np.zeros((H, W), dtype=bool)
-            low_freq_grid[::downsample_low, ::downsample_low] = True
-
-            freq_valid = freq_mask_np | low_freq_grid
-            valid_mask = valid_mask & freq_valid
 
         # ==============================================================
         # 机制 2：误差掩膜
