@@ -94,11 +94,6 @@ FFTEdgeVO:
   dt_max_dist: 50.0
   dt_huber_delta: 5.0
 
-  # Reference points
-  max_ref_points: 8000
-  min_ref_points: 300
-  ref_downsample: 2
-
   # Quality
   dt_mean_fail_threshold: 15.0
   require_visible_ratio: 0.3
@@ -123,8 +118,8 @@ Backend:
 # ============================================================
 Submap:
   # ===== Submap Cut Thresholds (motion-only, relative to submap start frame) =====
-  trans_thre: 1.5
-  rot_thre: 60
+  trans_thre: 0.8
+  rot_thre: 50
   use_global_seed_submap: true
   seed_init_iters: 1500     # 新子图 seed 帧初始化迭代数（原默认 500）
 
@@ -133,7 +128,6 @@ Submap:
 # ============================================================
 LoopClosure:
   registration_method: "2dgs_gsreg"  # choices: icp, 2dgs_gsreg
-  enable_legacy_icp_fallback: false
   allow_identity_loop_init: false
 
   gsreg_overlap_radius: 0.10
@@ -155,7 +149,6 @@ LoopClosure:
   keep_recent_submaps: 3         # 显存中只保留最近 3 个子图
   min_interval: 3
   voxel_size: 0.02
-  feature_keep_ratio: 0.30
 
   # ===== Loop Detection Thresholds =====
   max_loop_delta_translation: 1.5

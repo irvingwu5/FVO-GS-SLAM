@@ -63,6 +63,7 @@ Training:
   kf_translation: 0.04
   kf_min_translation: 0.02 #0.02->4dtam 0.05
   kf_overlap: 0.95 #0.95->4dtam 0.9
+  kf_cutoff: 0.3
 
   # ===== Window Parameters =====
   window_size: 10 #关键帧滑动窗口
@@ -80,7 +81,8 @@ Training:
   single_thread: False
   spherical_harmonics: False
   #近景幕布gs+雾片挡相机，限制gs尺寸
-  low_freq_scale_multiplier: 1.05
+  alpha: 0.9
+  low_freq_scale_multiplier: 2.0
   min_init_gaussian_scale: 0.002
   max_init_gaussian_scale: 0.06
 
@@ -97,13 +99,22 @@ FFTEdgeVO:
   max_iters_fine: 15
   dt_max_dist: 50.0
   dt_huber_delta: 5.0
-  max_ref_points: 8000
-  min_ref_points: 300
-  ref_downsample: 2
   dt_mean_fail_threshold: 15.0
   require_visible_ratio: 0.3
   min_dt_mean: 0.5
   debug_log: true
+
+# ============================================================
+# Backend Mapping Configuration (EAGS-style: Gaussian only)
+# ============================================================
+Backend:
+  optimize_keyframe_pose: true
+  optimize_keyframe_exposure: false
+  backend_pose_sanity_check: true
+  backend_restore_pose_if_changed: true
+  backend_pose_check_eps_t: 1.0e-8
+  backend_pose_check_eps_r_deg: 1.0e-6
+  pose_check_log_every: 99999
 
 # ============================================================
 # Submap Configuration
@@ -112,21 +123,14 @@ Submap:
   # ===== Submap Cut Thresholds (motion-only, relative to submap start frame) =====
   trans_thre: 0.5
   rot_thre: 50
-
-  # ===== Backend Submap Parameters =====
-  seed_init_iters: 700
-  enable_cut_local_ba: true
-  cut_local_ba_iters: 40
-  cut_local_prune_iters: 8
-  cut_refine_iters: 20
-  seed_init_iters: 700
+  use_global_seed_submap: true
+  seed_init_iters: 1500
 
 # ============================================================
 # Loop Closure Configuration
 # ============================================================
 LoopClosure:
   registration_method: "2dgs_gsreg"  # choices: icp, 2dgs_gsreg
-  enable_legacy_icp_fallback: false
   allow_identity_loop_init: false
 
   gsreg_overlap_radius: 0.10
@@ -144,6 +148,7 @@ LoopClosure:
   gsreg_max_delta_r_from_init: 30.0
 
   # ===== Basic Parameters =====
+  keep_recent_submaps: 3
   min_interval: 3
   voxel_size: 0.05
   max_search_range: 5 #限制参与位姿图优化（PGO）的最近子图数量，控制搜索范围、计算量和内存占用
@@ -155,8 +160,16 @@ LoopClosure:
 
   # ===== PGO Parameters =====
   default_odom_info_scale: 120.0
+  global_seed_default_odom_info_scale: 1.0e-3
   recent_query_submaps: 2
   pgo_edge_prune_thres: 0.25
+
+  # PGO protection
+  debug_disable_pgo_for_fftvo_test: true
+  min_loop_fitness_for_pgo: 0.40
+  max_loop_rmse_for_pgo: 0.04
+  max_loop_delta_t_for_pgo: 1.5
+  max_loop_delta_r_for_pgo: 45.0
 
 # ============================================================
 # Gaussian Optimization Parameters

@@ -63,6 +63,7 @@ Training:
   kf_translation: 0.04
   kf_min_translation: 0.02
   kf_overlap: 0.95
+  kf_cutoff: 0.3
 
   # ===== Window Parameters =====
   window_size: 10 #关键帧滑动窗口
@@ -80,7 +81,8 @@ Training:
   single_thread: False
   spherical_harmonics: False
   #近景幕布gs+雾片挡相机，限制gs尺寸
-  low_freq_scale_multiplier: 1.05
+  alpha: 0.9
+  low_freq_scale_multiplier: 2.0
   min_init_gaussian_scale: 0.002
   max_init_gaussian_scale: 0.06
 
@@ -89,7 +91,7 @@ Training:
 # ============================================================
 FFTEdgeVO:
   use_fft_edge_vo: true
-  tracking_refine_iters: 20
+  tracking_refine_iters: 120
   tracking_fallback_iters: 100
   num_levels: 3
   level_scale: 0.5
@@ -97,24 +99,22 @@ FFTEdgeVO:
   max_iters_fine: 15
   dt_max_dist: 50.0
   dt_huber_delta: 5.0
-  max_ref_points: 8000
-  min_ref_points: 300
-  ref_downsample: 2
   dt_mean_fail_threshold: 15.0
   require_visible_ratio: 0.3
   min_dt_mean: 0.5
-  debug_log: true
+  debug_log: false
 
 # ============================================================
 # Backend Mapping Configuration (EAGS-style: Gaussian only)
 # ============================================================
 Backend:
-  optimize_keyframe_pose: false
+  optimize_keyframe_pose: true
   optimize_keyframe_exposure: false
-  backend_pose_sanity_check: true
+  backend_pose_sanity_check: false
   backend_restore_pose_if_changed: true
   backend_pose_check_eps_t: 1.0e-8
   backend_pose_check_eps_r_deg: 1.0e-6
+  pose_check_log_every: 99999
 
 # ============================================================
 # Submap Configuration
@@ -124,13 +124,13 @@ Submap:
   trans_thre: 1.5
   rot_thre: 60
   use_global_seed_submap: true
+  seed_init_iters: 1500
 
 # ============================================================
 # Loop Closure Configuration
 # ============================================================
 LoopClosure:
   registration_method: "2dgs_gsreg"  # choices: icp, 2dgs_gsreg
-  enable_legacy_icp_fallback: false
   allow_identity_loop_init: false
 
   gsreg_overlap_radius: 0.10
@@ -151,7 +151,7 @@ LoopClosure:
   keep_recent_submaps: 3         # 显存中只保留最近 3 个子图
   min_interval: 3
   voxel_size: 0.05
-  feature_keep_ratio: 0.30
+  global_seed_default_odom_info_scale: 1.0e-3
 
   # ===== Loop Detection Thresholds =====
   max_loop_delta_translation: 0.80
@@ -164,7 +164,7 @@ LoopClosure:
   pgo_edge_prune_thres: 0.25
 
   # PGO protection
-  debug_disable_pgo_for_fftvo_test: false
+  debug_disable_pgo_for_fftvo_test: true
   min_loop_fitness_for_pgo: 0.60
   max_loop_rmse_for_pgo: 0.022
   max_loop_delta_t_for_pgo: 0.08
@@ -231,4 +231,4 @@ Ablation:
   use_fdn: True              # (5) 是否开启有限差分法线监督及相关 Loss 衰减
   use_fft_mask: True         # (6) 是否开启 FFT 高低频掩膜指导采样与初始尺度设定
   use_error_mask: True       # (6) 是否开启渲染误差掩膜指导动态补点
-  use_color_refinement: True   # (8) 是否开启颜色优化（如果开启，则在每次优化迭代中同时优化颜色相关参数；如果关闭，则只优化几何相关参数，颜色参数保持不变）
+  use_color_refinement: False   # (8) 是否开启颜色优化（如果开启，则在每次优化迭代中同时优化颜色相关参数；如果关闭，则只优化几何相关参数，颜色参数保持不变）
