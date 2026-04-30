@@ -56,19 +56,23 @@ class GPUMemoryMonitor:
     def __init__(self, physical_gpu_id=0):
         self.keep_measuring = True
         self.peak_memory = 0
+        self.baseline_memory = 0
         self.physical_gpu_id = physical_gpu_id
         self.thread = threading.Thread(target=self.measure_usage, daemon=True)
+
+    def _query_gpu_mem(self):
+        result = subprocess.check_output(
+            [
+                'nvidia-smi', f'--id={self.physical_gpu_id}',
+                '--query-gpu=memory.used',
+                '--format=csv,nounits,noheader'
+            ], encoding='utf-8')
+        return int(result.strip())
 
     def measure_usage(self):
         while self.keep_measuring:
             try:
-                result = subprocess.check_output(
-                    [
-                        'nvidia-smi', f'--id={self.physical_gpu_id}',
-                        '--query-gpu=memory.used',
-                        '--format=csv,nounits,noheader'
-                    ], encoding='utf-8')
-                current_mem = int(result.strip())
+                current_mem = self._query_gpu_mem()
                 if current_mem > self.peak_memory:
                     self.peak_memory = current_mem
             except Exception:
@@ -76,12 +80,16 @@ class GPUMemoryMonitor:
             time.sleep(2.0)
 
     def start(self):
+        try:
+            self.baseline_memory = self._query_gpu_mem()
+        except Exception:
+            self.baseline_memory = 0
         self.thread.start()
 
     def stop(self):
         self.keep_measuring = False
         time.sleep(0.1)
-        return self.peak_memory
+        return max(0, self.peak_memory - self.baseline_memory)
 
 
 # ============================================================================
