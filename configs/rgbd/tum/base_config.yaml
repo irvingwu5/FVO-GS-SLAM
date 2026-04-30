@@ -68,7 +68,7 @@ Training:
   single_thread: False
   spherical_harmonics: False
   #近景幕布gs+雾片挡相机，限制gs尺寸
-  low_freq_scale_multiplier: 1.05
+  low_freq_scale_multiplier: 2.0
   min_init_gaussian_scale: 0.002
   max_init_gaussian_scale: 0.06
 
@@ -79,7 +79,7 @@ FFTEdgeVO:
   use_fft_edge_vo: true
 
   # Refinement control
-  tracking_refine_iters: 20
+  tracking_refine_iters: 120
   tracking_fallback_iters: 100
 
   # Pyramid
@@ -126,6 +126,7 @@ Submap:
   trans_thre: 1.5
   rot_thre: 60
   use_global_seed_submap: true
+  seed_init_iters: 1500     # 新子图 seed 帧初始化迭代数（原默认 500）
 
 # ============================================================
 # Loop Closure Configuration
@@ -231,7 +232,7 @@ pipeline_params:
 # Ablation Switches
 # ============================================================
 Ablation:
-  use_submap: False         # (2) 是否开启子图切图策略 (关闭时退化为全局单地图)
+  use_submap: True         # (2) 是否开启子图切图策略 (关闭时退化为全局单地图)
   use_loop_closure: True    # (3)&(4) 是否开启回环检测与全局 PGO 修正
   use_fdn: True              # (5) 是否开启有限差分法线监督及相关 Loss 衰减
   use_fft_mask: True         # (6) 是否开启 FFT 高低频掩膜指导采样与初始尺度设定
