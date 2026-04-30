@@ -123,7 +123,7 @@ Submap:
   # ===== Submap Cut Thresholds (motion-only, relative to submap start frame) =====
   trans_thre: 0.5
   rot_thre: 50
-  use_global_seed_submap: true
+
   seed_init_iters: 1500
 
 # ============================================================
@@ -160,7 +160,6 @@ LoopClosure:
 
   # ===== PGO Parameters =====
   default_odom_info_scale: 120.0
-  global_seed_default_odom_info_scale: 1.0e-3
   recent_query_submaps: 2
   pgo_edge_prune_thres: 0.25
 

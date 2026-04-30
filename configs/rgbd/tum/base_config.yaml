@@ -120,7 +120,7 @@ Submap:
   # ===== Submap Cut Thresholds (motion-only, relative to submap start frame) =====
   trans_thre: 0.8
   rot_thre: 50
-  use_global_seed_submap: true
+
   seed_init_iters: 1500     # 新子图 seed 帧初始化迭代数（原默认 500）
 
 # ============================================================
@@ -157,16 +157,15 @@ LoopClosure:
 
   # ===== PGO Parameters =====
   default_odom_info_scale: 120.0
-  global_seed_default_odom_info_scale: 1.0e-3
   recent_query_submaps: 4
   pgo_edge_prune_thres: 0.25
 
   # PGO protection
   debug_disable_pgo_for_fftvo_test: true
-  min_loop_fitness_for_pgo: 0.40
-  max_loop_rmse_for_pgo: 0.04
-  max_loop_delta_t_for_pgo: 1.5
-  max_loop_delta_r_for_pgo: 45.0
+  min_loop_fitness_for_pgo: 0.60
+  max_loop_rmse_for_pgo: 0.03
+  max_loop_delta_t_for_pgo: 0.30
+  max_loop_delta_r_for_pgo: 10.0
 
 
 # ============================================================

@@ -58,7 +58,6 @@ class FrontEnd(mp.Process):
         self.frame_to_submap = {}  # <--- 记录每帧属于哪个子图
         # ========== LoopSplat-style submap handoff ==========
         # 新子图 seed 帧不再重置到单位阵，而是继承旧子图 tracking 后的全局估计位姿。
-        self.use_global_seed_submap = self.config.get("Submap", {}).get("use_global_seed_submap", True)
         # 每个子图 seed 的全局 c2w，用于保存子图间 transition 和后续 PGO。
         self.submap_seed_global_c2w = {0: np.eye(4, dtype=np.float64)}
         self.last_submap_seed_global_c2w = None
@@ -643,7 +642,7 @@ class FrontEnd(mp.Process):
     # 12. Coordinate Utility
     # ========================================================================
     def _camera_to_global_copy(self, cam):
-        """Return a deep copy of cam. Cameras are already global (use_global_seed_submap=True)."""
+        """Return a deep copy of cam. Cameras are already in global coordinates."""
         return clone_obj(cam)
 
     # ========================================================================

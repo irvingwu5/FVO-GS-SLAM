@@ -123,7 +123,7 @@ Submap:
   # ===== Submap Cut Thresholds (motion-only, relative to submap start frame) =====
   trans_thre: 1.5
   rot_thre: 60
-  use_global_seed_submap: true
+
   seed_init_iters: 1500
 
 # ============================================================
@@ -151,7 +151,6 @@ LoopClosure:
   keep_recent_submaps: 3         # 显存中只保留最近 3 个子图
   min_interval: 3
   voxel_size: 0.05
-  global_seed_default_odom_info_scale: 1.0e-3
 
   # ===== Loop Detection Thresholds =====
   max_loop_delta_translation: 0.80
@@ -231,4 +230,4 @@ Ablation:
   use_fdn: True              # (5) 是否开启有限差分法线监督及相关 Loss 衰减
   use_fft_mask: True         # (6) 是否开启 FFT 高低频掩膜指导采样与初始尺度设定
   use_error_mask: True       # (6) 是否开启渲染误差掩膜指导动态补点
-  use_color_refinement: False   # (8) 是否开启颜色优化（如果开启，则在每次优化迭代中同时优化颜色相关参数；如果关闭，则只优化几何相关参数，颜色参数保持不变）
+  use_color_refinement: True   # (8) 是否开启颜色优化（如果开启，则在每次优化迭代中同时优化颜色相关参数；如果关闭，则只优化几何相关参数，颜色参数保持不变）

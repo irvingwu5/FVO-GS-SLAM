@@ -234,8 +234,6 @@ class LoopClosureProcess(mp.Process):
 
         # ===== PGO 参数 =====
         self.default_odom_info_scale = self.config.get("LoopClosure", {}).get("default_odom_info_scale", 120.0)
-        self.global_seed_default_odom_info_scale = self.config.get("LoopClosure", {}).get("global_seed_default_odom_info_scale", 1.0e-3)
-        self.use_global_seed_submap = self.config.get("Submap", {}).get("use_global_seed_submap", False)
 
         # ===== PGO 保护参数 (EAGS 风格) =====
         self.debug_disable_pgo_for_fftvo_test = self.config.get("LoopClosure", {}).get(
@@ -604,6 +602,19 @@ class LoopClosureProcess(mp.Process):
             curr_sid = all_submap_ids[i]
 
             rel_prev_from_curr = self._load_prev_to_curr_transition(prev_sid, curr_sid)
+
+            # Reject degenerate odom edges
+            odom_t = np.linalg.norm(rel_prev_from_curr[:3, 3])
+            odom_r = self._rotation_error_deg(rel_prev_from_curr, np.eye(4))
+            if odom_t < 0.001 and odom_r < 0.01:
+                Log(f"[LoopClosure] 跳过退化 odom 边 {prev_sid}→{curr_sid} "
+                    f"(near-identity, t={odom_t:.4f}m r={odom_r:.2f}deg)")
+                continue
+            if odom_t > 5.0 or odom_r > 120.0:
+                Log(f"[LoopClosure] 跳过异常 odom 边 {prev_sid}→{curr_sid} "
+                    f"(implausible, t={odom_t:.3f}m r={odom_r:.1f}deg)")
+                continue
+
             # Open3D convention: node_j = node_i @ T_ij
             # T_odom = inv(seed_prev) @ seed_curr = rel_prev_from_curr (already source→target)
             odom_source_to_target = rel_prev_from_curr.copy()
@@ -621,7 +632,7 @@ class LoopClosureProcess(mp.Process):
 
         recent_query_submaps = self.config.get("LoopClosure", {}).get("recent_query_submaps", 2)
         query_ids = all_submap_ids[-min(recent_query_submaps, len(all_submap_ids)):]
-        loop_found = False
+        loop_edges_added = 0
 
         for query_id in query_ids:
             matched_ids = self.detect_closure(query_id)
@@ -664,11 +675,11 @@ class LoopClosureProcess(mp.Process):
                                 uncertain=True,
                             )
                         )
-                        loop_found = True
+                        loop_edges_added += 1
                         Log(f"[LoopClosure] 添加回环边: 子图 {query_id} <-> {target_id}")
 
-        if not loop_found:
-            Log("[LoopClosure] 当前无有效非相邻闭环，跳过 full-graph PGO")
+        if loop_edges_added < 3:
+            Log(f"[LoopClosure] 回环边不足 ({loop_edges_added} < 3)，跳过 full-graph PGO")
             return []
 
         Log(f"[LoopClosure] 检测到有效闭环，启动全图 PGO ({len(all_submap_ids)} 个子图)...")
