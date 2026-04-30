@@ -725,8 +725,8 @@ class BackEnd(mp.Process):
 
                 elif data[0] == "new_submap":
                     completed_submap_id = data[1]
-                    relative_pose = data[2] if len(data) > 2 else np.eye(4, dtype=np.float64)
-                    relative_pose = np.array(relative_pose, dtype=np.float64)
+                    relative_pose_prev_seed_to_curr_seed = data[2] if len(data) > 2 else np.eye(4, dtype=np.float64)
+                    relative_pose_prev_seed_to_curr_seed = np.array(relative_pose_prev_seed_to_curr_seed, dtype=np.float64)
                     new_seed_global_c2w = (
                         data[3] if len(data) > 3 else np.eye(4, dtype=np.float64)
                     )
@@ -754,7 +754,7 @@ class BackEnd(mp.Process):
                         "submap_keyframes": submap_keyframes,
                         "seed_global_c2w": completed_seed_global_c2w,
                         "submap_keyframe_poses": self.pack_submap_keyframe_poses(),
-                        "relative_pose": relative_pose,
+                        "relative_pose": relative_pose_prev_seed_to_curr_seed,
                         "correct_tsfm": np.eye(4, dtype=np.float64),
                     }
 

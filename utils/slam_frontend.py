@@ -48,9 +48,11 @@ class FrontEnd(mp.Process):
         self.device = "cuda:0"
         self.pause = False
         self.use_gui = config["Results"]["use_gui"]  # 新增
+        # Pose convention (global mode):
+        #   cam.T is always global W2C.  inv(cam.T) is always global C2W.
+        #   Submaps are memory/optimization partitions, NOT coordinate partitions.
         # ========== 子图策略状态变量 ==========
         self.current_submap_id = 0
-        self.submap_anchor_poses = {0: np.eye(4)}  # 子图 0 的锚点就是全局原点
         self.submap_trans_thre = self.config["Submap"]["trans_thre"]
         self.submap_rot_thre = self.config["Submap"]["rot_thre"]
         self.frame_to_submap = {}  # <--- 记录每帧属于哪个子图
@@ -61,7 +63,7 @@ class FrontEnd(mp.Process):
         self.submap_seed_global_c2w = {0: np.eye(4, dtype=np.float64)}
         self.last_submap_seed_global_c2w = None
         # ================================================
-        self.submap_anchor_pose = None #运动监控锚点
+        self.submap_motion_anchor_global_c2w = None #运动监控锚点（global C2W）
         self.submap_start_frame_idx = 0
         self.fft_filter = None  # 频域滤波器实例
         # 消融实验开关
@@ -486,11 +488,11 @@ class FrontEnd(mp.Process):
     # ========================================================================
     # 8. Submap Cutting — Motion Utility
     # ========================================================================
-    def compute_submap_motion(self, current_c2w, anchor_c2w):
-        if anchor_c2w is None:
+    def compute_submap_motion(self, current_c2w, anchor_global_c2w):
+        if anchor_global_c2w is None:
             return 0.0, 0.0
 
-        delta_T = torch.linalg.inv(anchor_c2w) @ current_c2w
+        delta_T = torch.linalg.inv(anchor_global_c2w) @ current_c2w
         translation = torch.norm(delta_T[0:3, 3]).item()
 
         R = delta_T[0:3, 0:3]
@@ -507,7 +509,7 @@ class FrontEnd(mp.Process):
         if not self.use_submap:
             return False, None
 
-        if self.submap_anchor_pose is None:
+        if self.submap_motion_anchor_global_c2w is None:
             return False, None
 
         # guard: minimum frames between cuts (prevents infinite cut loops)
@@ -515,7 +517,7 @@ class FrontEnd(mp.Process):
         if cur_frame_idx - self.submap_start_frame_idx < min_frames:
             return False, None
 
-        translation, angle_deg = self.compute_submap_motion(current_c2w, self.submap_anchor_pose)
+        translation, angle_deg = self.compute_submap_motion(current_c2w, self.submap_motion_anchor_global_c2w)
 
         if translation > self.submap_trans_thre or angle_deg > self.submap_rot_thre:
             metrics = {
@@ -559,7 +561,7 @@ class FrontEnd(mp.Process):
         if self.last_submap_seed_global_c2w is None:
             self.last_submap_seed_global_c2w = seed_global_c2w.copy()
 
-        relative_pose = (
+        relative_pose_prev_seed_to_curr_seed = (
                 np.linalg.inv(self.last_submap_seed_global_c2w) @ seed_global_c2w
         ).astype(np.float64)
 
@@ -569,14 +571,12 @@ class FrontEnd(mp.Process):
         self.submap_seed_global_c2w[new_submap_id] = seed_global_c2w.copy()
         self.last_submap_seed_global_c2w = seed_global_c2w.copy()
 
-        self.submap_anchor_poses[new_submap_id] = np.eye(4, dtype=np.float64)
-
         # 3) 通知后端冻结旧子图。
         self.backend_queue.put(
             [
                 "new_submap",
                 completed_submap_id,
-                relative_pose,
+                relative_pose_prev_seed_to_curr_seed,
                 seed_global_c2w,
             ]
         )
@@ -605,7 +605,7 @@ class FrontEnd(mp.Process):
         viewpoint.cam_trans_delta.requires_grad_(False)
 
         # 新子图运动监控锚点就是 seed 的全局位姿
-        self.submap_anchor_pose = current_c2w.clone()
+        self.submap_motion_anchor_global_c2w = current_c2w.clone()
         self.submap_start_frame_idx = cur_frame_idx
 
         # 5) 用当前 seed 帧初始化新子图。
@@ -646,27 +646,8 @@ class FrontEnd(mp.Process):
     # 12. Coordinate Utility
     # ========================================================================
     def _camera_to_global_copy(self, cam):
-        cam_g = clone_obj(cam)
-
-        if self.config.get("Submap", {}).get("use_global_seed_submap", True):
-            return cam_g
-
-        sid = self.frame_to_submap.get(cam.uid, self.current_submap_id)
-        anchor_c2w = self.submap_anchor_poses.get(sid, np.eye(4))
-
-        if isinstance(anchor_c2w, torch.Tensor):
-            anchor_c2w = anchor_c2w.cpu().numpy()
-
-        anchor_c2w = np.array(anchor_c2w, dtype=np.float64)
-
-        local_w2c = cam.T.detach().cpu().numpy()
-        local_c2w = np.linalg.inv(local_w2c)
-
-        global_c2w = anchor_c2w @ local_c2w
-        global_w2c = np.linalg.inv(global_c2w)
-
-        cam_g.T = torch.from_numpy(global_w2c).to(cam.T.device).type_as(cam.T)
-        return cam_g
+        """Return a deep copy of cam. Cameras are already global (use_global_seed_submap=True)."""
+        return clone_obj(cam)
 
     # ========================================================================
     # 13. Cleanup
@@ -712,7 +693,6 @@ class FrontEnd(mp.Process):
                 tic.record()
                 if cur_frame_idx >= len(self.dataset):
                     torch.save(self.frame_to_submap, os.path.join(self.save_dir, "frame_to_submap.pt"))
-                    torch.save(self.submap_anchor_poses, os.path.join(self.save_dir, "submap_anchor_poses.pt"))
                     break
 
                 if self.requested_init:
@@ -765,8 +745,8 @@ class FrontEnd(mp.Process):
                         c2w_np = current_c2w.cpu().numpy().astype(np.float64)
                         self.fft_edge_vo.set_reference(rgb_bgr, depth_np, c2w_np)
 
-                if self.submap_anchor_pose is None:
-                    self.submap_anchor_pose = current_c2w.clone()
+                if self.submap_motion_anchor_global_c2w is None:
+                    self.submap_motion_anchor_global_c2w = current_c2w.clone()
 
                     seed_np = current_c2w.detach().cpu().numpy().astype(np.float64)
                     self.last_submap_seed_global_c2w = seed_np.copy()
