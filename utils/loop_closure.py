@@ -217,9 +217,7 @@ class LoopClosureProcess(mp.Process):
         self.voxel_size = self.config.get("LoopClosure", {}).get("voxel_size", 0.05)
         self.icp_fitness_threshold = self.config.get("LoopClosure", {}).get("icp_fitness_threshold", 0.40)
 
-        # ===== LRU 缓存参数 =====
-        self.max_cached_submaps = self.config.get("LoopClosure", {}).get("keep_recent_submaps", 3)
-        self.submap_access_order = []
+
 
         # ===== CosPlace 模型配置 =====
         self.cosplace_backbone = self.config.get("LoopClosure", {}).get("backbone", "ResNet18")
@@ -251,6 +249,9 @@ class LoopClosureProcess(mp.Process):
         self.max_loop_delta_r_for_pgo = self.config.get("LoopClosure", {}).get(
             "max_loop_delta_r_for_pgo", 45.0
         )
+
+        # PGO 增量门控：仅在新 loop edge 出现时运行
+        self.last_loop_edge_count = 0
 
     # ========================================================================
     # 4.2 Feature Extraction
@@ -346,33 +347,10 @@ class LoopClosureProcess(mp.Process):
             dense_pcd, feature_pcd = self.extract_pcd_from_2dgs_ckpt(ckpt_path)
             self.submap_dense_pcds[submap_id] = dense_pcd
             self.submap_pcds[submap_id] = feature_pcd
-
-            if submap_id in self.submap_access_order:
-                self.submap_access_order.remove(submap_id)
-            self.submap_access_order.append(submap_id)
             return True
         except Exception as e:
             Log(f"[LoopClosure] 重新加载子图 {submap_id} 点云失败: {e}")
             return False
-
-    def cleanup_old_submaps(self):
-        if len(self.submap_access_order) > self.max_cached_submaps:
-            to_evict = self.submap_access_order[:-self.max_cached_submaps]
-
-            for submap_id in to_evict:
-                if submap_id in self.submap_pcds:
-                    del self.submap_pcds[submap_id]
-                if submap_id in self.submap_dense_pcds:
-                    del self.submap_dense_pcds[submap_id]
-                Log(f"[LoopClosure] LRU 清理子图 {submap_id} 的 dense/feature 点云缓存（视觉特征保留）")
-
-            self.submap_access_order = self.submap_access_order[-self.max_cached_submaps:]
-            torch.cuda.empty_cache()
-            Log(
-                f"[LoopClosure] 点云缓存清理完毕，当前缓存: "
-                f"{len(self.submap_access_order)} 个子图 dense/feature 点云, "
-                f"{len(self.submap_features)} 个子图特征"
-            )
 
     # ========================================================================
     # 4.4 Loop Detection (Visual)
@@ -682,6 +660,10 @@ class LoopClosureProcess(mp.Process):
             Log(f"[LoopClosure] 回环边不足 ({loop_edges_added} < 3)，跳过 full-graph PGO")
             return []
 
+        if loop_edges_added <= self.last_loop_edge_count:
+            Log(f"[LoopClosure] 无新增回环边 ({loop_edges_added} ≤ {self.last_loop_edge_count})，跳过重复 PGO")
+            return []
+
         Log(f"[LoopClosure] 检测到有效闭环，启动全图 PGO ({len(all_submap_ids)} 个子图)...")
 
         prune_threshold = self.config.get("LoopClosure", {}).get("pgo_edge_prune_thres", 0.25)
@@ -708,6 +690,7 @@ class LoopClosureProcess(mp.Process):
                 "correct_tsfm": correction,
             })
 
+        self.last_loop_edge_count = loop_edges_added
         return correction_list
 
     # ========================================================================
@@ -764,10 +747,6 @@ class LoopClosureProcess(mp.Process):
 
                     Log(f"[LoopClosure] 接收并处理新子图: ID {submap_id} (包含 {len(img_paths)} 个关键帧)")
 
-                    if submap_id in self.submap_access_order:
-                        self.submap_access_order.remove(submap_id)
-                    self.submap_access_order.append(submap_id)
-
                     if self.debug_disable_pgo_for_fftvo_test:
                         Log("[LoopClosure] PGO disabled for FFTVO ablation test")
                         # 仍运行回环检测（仅日志输出）
@@ -779,7 +758,5 @@ class LoopClosureProcess(mp.Process):
                             self.apply_correction_to_submaps(correction_list)
                             Log("==> PGO 闭环校正及硬盘回写完毕！ <==")
 
-                    # 清理旧子图缓存
-                    self.cleanup_old_submaps()
             else:
                 time.sleep(0.5)

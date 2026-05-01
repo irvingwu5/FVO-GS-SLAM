@@ -148,7 +148,6 @@ LoopClosure:
   gsreg_max_delta_r_from_init: 30.0
 
   # ===== Basic Parameters =====
-  keep_recent_submaps: 3
   min_interval: 3
   voxel_size: 0.05
   max_search_range: 5 #限制参与位姿图优化（PGO）的最近子图数量，控制搜索范围、计算量和内存占用

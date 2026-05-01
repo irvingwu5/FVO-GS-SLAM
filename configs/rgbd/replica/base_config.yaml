@@ -148,7 +148,6 @@ LoopClosure:
   gsreg_max_delta_r_from_init: 30.0
 
   # ===== Basic Parameters =====
-  keep_recent_submaps: 3         # 显存中只保留最近 3 个子图
   min_interval: 3
   voxel_size: 0.05
 
@@ -226,7 +225,7 @@ pipeline_params:
 # ============================================================
 Ablation:
   use_submap: True          # (2) 是否开启子图切图策略 (关闭时退化为全局单地图)
-  use_loop_closure: True     # (3)&(4) 是否开启回环检测与全局 PGO 修正
+  use_loop_closure: False     # (3)&(4) 是否开启回环检测与全局 PGO 修正
   use_fdn: True              # (5) 是否开启有限差分法线监督及相关 Loss 衰减
   use_fft_mask: True         # (6) 是否开启 FFT 高低频掩膜指导采样与初始尺度设定
   use_error_mask: True       # (6) 是否开启渲染误差掩膜指导动态补点
