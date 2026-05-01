@@ -134,7 +134,7 @@ LoopClosure:
   allow_identity_loop_init: false
 
   gsreg_overlap_radius: 0.10
-  gsreg_min_overlap: 0.05
+  gsreg_min_overlap: 0.15
   gsreg_topk_views: 3
   gsreg_max_iters: 80
   gsreg_lr_rot: 0.002
@@ -143,7 +143,8 @@ LoopClosure:
   gsreg_depth_weight: 1.0
   gsreg_normal_weight: 0.1
   gsreg_max_loss: 0.10
-  gsreg_min_successful_views: 1
+  gsreg_use_render_target: false
+  gsreg_min_successful_views: 2
   gsreg_max_delta_t_from_init: 0.50
   gsreg_max_delta_r_from_init: 30.0
 

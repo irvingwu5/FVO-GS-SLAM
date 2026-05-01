@@ -64,46 +64,67 @@ def registration_2dgs_gsreg(src_ckpt, tgt_ckpt, init_guess, config,
         Log(f"[2DGS-GSReg] rejected {sid} -> {tid} reason=overlap_too_low {ov['overlap']:.3f} < {min_ov}")
         return {"success": False, "reason": "overlap_too_low", "overlap": ov["overlap"]}
 
-    # Viewpoint localization: auto-construct from saved keyframe data if not provided
-    if src_viewpoint is None or tgt_viewpoint is None:
-        from .gaussian_io_2dgs import select_best_keyframe_for_registration
-        if src_viewpoint is None:
-            src_viewpoint, src_kf = select_best_keyframe_for_registration(
-                src, src_ckpt, config, device="cuda")
-        if tgt_viewpoint is None:
-            tgt_viewpoint, tgt_kf = select_best_keyframe_for_registration(
-                tgt, tgt_ckpt, config, device="cuda")
-
-    if src_viewpoint is None or tgt_viewpoint is None:
-        Log(f"[2DGS-GSReg] cannot construct viewpoint for {sid}->{tid}, skipping render localization")
-        return {"success": False, "reason": "no_viewpoint", "overlap": ov["overlap"]}
-
-    # Build target Gaussian model from tgt ckpt (lightweight)
+    # Build target/source Gaussian models (lightweight)
     tgt_gm = _build_tmp_gaussian(tgt)
     src_gm = _build_tmp_gaussian(src)
 
+    use_render = config.get("gsreg_use_render_target", False)
     candidates = []
     iters_per = max_iters
+    min_views_effective = max(min_views, 2)  # 至少需要 2 次成功定位
 
-    # src->tgt: localize src viewpoint in tgt map
-    src_init_w2c = (torch.from_numpy(init_guess).float().cuda() @ src_viewpoint.T.cuda()).float()
-    r1 = viewpoint_localize_2dgs(src_viewpoint, tgt_gm, pipeline_params, bg_color,
-                                  src_init_w2c, config, max_iters=iters_per)
-    if r1["success"]:
-        candidates.append({"T": r1["T"], "loss": r1["loss"], "overlap": ov["overlap"], "similarity": 0.8})
+    # ---- Top-k 视角选择 (对齐 LoopSplat: 每侧 top-2 或 top-3) ----
+    from .gaussian_io_2dgs import select_topk_keyframes_for_registration
 
-    # tgt->src: localize tgt viewpoint in src map, then invert
+    if src_viewpoint is None or tgt_viewpoint is None:
+        actual_topk = max(topk, 2)
+        if src_viewpoint is None:
+            src_views, src_kf_ids = select_topk_keyframes_for_registration(
+                src, src_ckpt, config, topk=actual_topk, device="cuda")
+        else:
+            src_views, src_kf_ids = [src_viewpoint], [src_viewpoint.uid]
+        if tgt_viewpoint is None:
+            tgt_views, tgt_kf_ids = select_topk_keyframes_for_registration(
+                tgt, tgt_ckpt, config, topk=actual_topk, device="cuda")
+        else:
+            tgt_views, tgt_kf_ids = [tgt_viewpoint], [tgt_viewpoint.uid]
+    else:
+        src_views, src_kf_ids = [src_viewpoint], [src_viewpoint.uid]
+        tgt_views, tgt_kf_ids = [tgt_viewpoint], [tgt_viewpoint.uid]
+
+    if len(src_views) == 0 or len(tgt_views) == 0:
+        Log(f"[2DGS-GSReg] cannot construct viewpoints for {sid}->{tid}")
+        return {"success": False, "reason": "no_viewpoint", "overlap": ov["overlap"]}
+
+    Log(f"[2DGS-GSReg] {sid}->{tid} topk={topk}: src_views={len(src_views)} tgt_views={len(tgt_views)}")
+
+    # ---- 双向多视角定位 ----
+    # src->tgt: localize each src viewpoint in tgt map
+    for vp in src_views:
+        if use_render:
+            _replace_with_rendered(vp, tgt_gm, pipeline_params, bg_color)
+        init_w2c = (torch.from_numpy(init_guess).float().cuda() @ vp.T.cuda()).float()
+        r = viewpoint_localize_2dgs(vp, tgt_gm, pipeline_params, bg_color,
+                                     init_w2c, config, max_iters=iters_per)
+        if r["success"]:
+            candidates.append({"T": r["T"], "loss": r["loss"], "overlap": ov["overlap"], "similarity": 0.8})
+        del r
+
+    # tgt->src: localize each tgt viewpoint in src map, then invert
     inv_guess = np.linalg.inv(init_guess)
-    tgt_init_w2c = (torch.from_numpy(inv_guess).float().cuda() @ tgt_viewpoint.T.cuda())
-    r2 = viewpoint_localize_2dgs(tgt_viewpoint, src_gm, pipeline_params, bg_color,
-                                  tgt_init_w2c, config, max_iters=iters_per)
-    if r2["success"]:
-        T_inv = r2["T"]
-        T_dir = np.linalg.inv(T_inv)
-        candidates.append({"T": T_dir, "loss": r2["loss"], "overlap": ov["overlap"], "similarity": 0.8})
+    for vp in tgt_views:
+        if use_render:
+            _replace_with_rendered(vp, src_gm, pipeline_params, bg_color)
+        init_w2c = (torch.from_numpy(inv_guess).float().cuda() @ vp.T.cuda())
+        r = viewpoint_localize_2dgs(vp, src_gm, pipeline_params, bg_color,
+                                     init_w2c, config, max_iters=iters_per)
+        if r["success"]:
+            T_inv = r["T"]
+            candidates.append({"T": np.linalg.inv(T_inv), "loss": r["loss"],
+                               "overlap": ov["overlap"], "similarity": 0.8})
+        del r
 
-    Log(f"[2DGS-GSReg] {sid}->{tid} localization: src->tgt={'ok' if r1['success'] else 'fail'} "
-        f"tgt->src={'ok' if r2['success'] else 'fail'} n_candidates={len(candidates)}")
+    Log(f"[2DGS-GSReg] {sid}->{tid} localization: n_total={len(src_views)+len(tgt_views)} n_candidates={len(candidates)}")
 
     n_ok = len(candidates)
     if n_ok < min_views:
@@ -132,6 +153,19 @@ def registration_2dgs_gsreg(src_ckpt, tgt_ckpt, init_guess, config,
         "delta_t_from_init": dt_i,
         "delta_r_from_init": dr_i,
     }
+
+
+def _replace_with_rendered(viewpoint, gaussian_model, pipeline_params, bg_color):
+    """Replace viewpoint RGB/depth with rendered image from the target map.
+
+    Aligns with LoopSplat's use_render: eliminates lighting differences
+    between submap captures by using the rendered view as target.
+    """
+    with torch.no_grad():
+        pkg = gs_render(viewpoint, gaussian_model, pipeline_params, bg_color, surf=False)
+        viewpoint.original_image = pkg["render"].detach().clone()
+        if pkg.get("depth") is not None:
+            viewpoint.depth = pkg["depth"].squeeze().detach().cpu().numpy()
 
 
 def _build_tmp_gaussian(sub_data, device="cuda"):

@@ -222,3 +222,46 @@ def select_best_keyframe_for_registration(submap_data, ckpt_path, config, device
         # Fallback: try first candidate
         cam = load_keyframe_viewpoint_from_ckpt(ckpt_path, int(candidates[0]), config, device)
     return cam, int(best_kf)
+
+
+def select_topk_keyframes_for_registration(submap_data, ckpt_path, config, topk=2, device="cuda"):
+    """Select top-k keyframes from submap for multi-view GS registration.
+
+    Picks keyframes spread across the submap (beginning, middle, end) to
+    maximize viewpoint diversity. Falls back to fewer if loading fails.
+
+    Returns (list[Camera], list[int]).
+    """
+    kf_ids = submap_data.get("keyframe_ids", [])
+    if not kf_ids:
+        return [], []
+
+    kf_ids = sorted([int(k) for k in kf_ids])
+    n = len(kf_ids)
+
+    if n <= topk:
+        picks = kf_ids
+    else:
+        # Spread across submap timeline for diversity
+        picks = [kf_ids[0]]  # first
+        if topk >= 3 and n >= 3:
+            picks.append(kf_ids[n // 2])  # middle
+        if topk >= 2:
+            picks.append(kf_ids[-1])  # last
+        if topk >= 4 and n >= 4:
+            picks.append(kf_ids[n // 4])
+        if topk >= 5 and n >= 5:
+            picks.append(kf_ids[3 * n // 4])
+        # Deduplicate and limit
+        picks = list(dict.fromkeys(picks))[:topk]
+
+    views = []
+    valid_ids = []
+    for kf_id in picks:
+        cam = load_keyframe_viewpoint_from_ckpt(ckpt_path, int(kf_id), config, device)
+        if cam is not None:
+            views.append(cam)
+            valid_ids.append(int(kf_id))
+
+    Log(f"[2DGS-GSReg] selected {len(views)}/{topk} keyframes (ids={valid_ids}) from {n} total")
+    return views, valid_ids
