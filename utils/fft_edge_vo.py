@@ -280,8 +280,9 @@ class FFTEdgeVO:
         T_wc_init = init_c2w.astype(np.float64)
         T_rc_init = self.T_wr @ T_wc_init  # T_ref_cur
 
-        # parameterise T_ref_cur = exp(xi)  (xi = 0 → identity)
-        xi = torch.zeros(6, device="cuda", dtype=torch.float32)
+        # parameterise T_ref_cur = exp(xi) from actual initial guess
+        T_rc_init_t = torch.from_numpy(T_rc_init).float().cuda()
+        xi = _se3_log(T_rc_init_t)
 
         # ---- 3.  Coarse-to-fine LM -----------------------------------------
         num_levels = len(self.opt_struct_pyr)
