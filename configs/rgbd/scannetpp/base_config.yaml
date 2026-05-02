@@ -180,6 +180,24 @@ LoopClosure:
   recent_query_submaps: 2
   pgo_edge_prune_thres: 0.25
 
+  # ===== Reloc3R (future replacement for GSReg+ICP) =====
+  Reloc3R:
+    enabled: false
+    repo_path: third_party/reloc3r
+    checkpoint: Reloc3r-512
+    image_size: 512
+    use_amp: true
+    device: cuda
+    topk_pairs: 5
+    min_valid_pairs: 2
+    pair_selection: cosplace_cross_similarity
+    scale_mode: init_guess_norm
+    depth_scale_check: false
+    max_delta_t: 2.0
+    max_delta_r_deg: 45.0
+    max_pair_rot_std_deg: 15.0
+    max_pair_trans_angle_std_deg: 25.0
+
   # PGO protection
   debug_disable_pgo_for_fftvo_test: true
   min_loop_fitness_for_pgo: 0.40

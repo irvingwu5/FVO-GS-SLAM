@@ -253,6 +253,17 @@ class LoopClosureProcess(mp.Process):
         # PGO 增量门控：仅在新 loop edge 出现时运行
         self.last_loop_edge_count = 0
 
+        # ===== Reloc3R 配置（Stage 1: 仅加载配置，不加载模型） =====
+        reloc3r_cfg = self.config.get("LoopClosure", {}).get("Reloc3R", {})
+        self.reloc3r_enabled = reloc3r_cfg.get("enabled", False)
+        self.reloc3r_cfg = reloc3r_cfg
+        # 子图元数据缓存（Reloc3R 需要 seed C2W + keyframe poses + 图像路径）
+        self.submap_seed_c2w = {}          # {submap_id: 4x4 np.array}
+        self.submap_keyframe_poses = {}    # {submap_id: {kf_idx: 4x4 np.array}}
+        self.submap_image_paths = {}       # {submap_id: [str, ...]}
+        if self.reloc3r_enabled:
+            Log(f"[Reloc3R] config loaded (model NOT loaded in Stage 1) mode={reloc3r_cfg.get('scale_mode')}")
+
     # ========================================================================
     # 4.2 Feature Extraction
     # ========================================================================
@@ -735,6 +746,24 @@ class LoopClosureProcess(mp.Process):
                     img_paths = data[3]
 
                     self.submap_records[submap_id] = ckpt_path
+                    self.submap_image_paths[submap_id] = img_paths
+
+                    # 从 ckpt 读取 Reloc3R 所需的元数据（seed C2W + keyframe poses）
+                    try:
+                        ckpt = torch.load(ckpt_path, map_location="cpu")
+                        self.submap_seed_c2w[submap_id] = np.array(
+                            ckpt.get("seed_global_c2w", np.eye(4)), dtype=np.float64
+                        )
+                        kf_poses = ckpt.get("submap_keyframe_poses", {})
+                        self.submap_keyframe_poses[submap_id] = {
+                            int(k): np.array(v, dtype=np.float64) for k, v in kf_poses.items()
+                        }
+                        Log(f"[LoopClosure] 子图 {submap_id} 元数据: "
+                            f"seed_c2w={'set' if not np.allclose(self.submap_seed_c2w[submap_id], np.eye(4)) else 'identity'}, "
+                            f"kf_poses={len(self.submap_keyframe_poses[submap_id])}, "
+                            f"images={len(img_paths)}")
+                    except Exception as e:
+                        Log(f"[LoopClosure] 读取子图 {submap_id} ckpt 元数据失败: {e}")
 
                     Log(f"[LoopClosure] 提取并缓存子图 {submap_id} 的 3D 点云与特征...")
                     dense_pcd, feature_pcd = self.extract_pcd_from_2dgs_ckpt(ckpt_path)
