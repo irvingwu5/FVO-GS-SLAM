@@ -124,15 +124,15 @@ Backend:
 # ============================================================
 Submap:
   # ===== Submap Cut Thresholds (motion-only, relative to submap start frame) =====
-  trans_thre: 1.5
-  rot_thre: 60
+  trans_thre: 2.0
+  rot_thre: 80
 
   seed_init_iters: 1500     # 新子图 seed 帧初始化迭代数（原默认 500）
 
   # ===== Cross-Submap Covisibility Handoff =====
   use_handoff: true
   handoff_tail_kfs: 4
-  handoff_max_points: 80000 #80000-3000
+  handoff_max_points: 8000 #80000-3000
   handoff_min_support: 2
   handoff_opacity_min: 0.20
   handoff_warmup_frames: 20
@@ -178,7 +178,7 @@ LoopClosure:
   pgo_edge_prune_thres: 0.25
 
   # PGO protection
-  debug_disable_pgo_for_fftvo_test: true
+  debug_disable_pgo_for_fftvo_test: false
   min_loop_fitness_for_pgo: 0.60
   max_loop_rmse_for_pgo: 0.03
   max_loop_delta_t_for_pgo: 0.30
