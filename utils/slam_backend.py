@@ -1,3 +1,4 @@
+import copy
 import random
 import time
 
@@ -7,6 +8,7 @@ from tqdm import tqdm
 import os
 import numpy as np
 from gaussian_splatting.gaussian_renderer import render
+from gaussian_splatting.scene.gaussian_model import GaussianModel
 from utils.logging_utils import Log
 from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
@@ -61,6 +63,23 @@ class BackEnd(mp.Process):
 
         # ===== 子图切割参数 =====
         self.seed_init_iters = self.config.get("Submap", {}).get("seed_init_iters", 500)
+
+        # ===== Cross-Submap Covisibility Handoff =====
+        submap_cfg = self.config.get("Submap", {})
+        self.use_handoff = submap_cfg.get("use_handoff", False)
+        self.handoff_tail_kfs = submap_cfg.get("handoff_tail_kfs", 4)
+        self.handoff_max_points = submap_cfg.get("handoff_max_points", 80000)
+        self.handoff_min_support = submap_cfg.get("handoff_min_support", 2)
+        self.handoff_opacity_min = submap_cfg.get("handoff_opacity_min", 0.20)
+        self.handoff_warmup_frames = submap_cfg.get("handoff_warmup_frames", 20)
+        self.handoff_warmup_keyframes = submap_cfg.get("handoff_warmup_keyframes", 3)
+        self.handoff_new_coverage_th = submap_cfg.get("handoff_new_coverage_th", 0.85)
+        self.handoff_depth_consistency_th = submap_cfg.get("handoff_depth_consistency_th", 0.08)
+        # Handoff runtime state (Stage 4+)
+        self.handoff_gaussians = None
+        self.handoff_active = False
+        self.handoff_age_frames = 0
+        Log(f"[Handoff] use_handoff={self.use_handoff}")
 
         # ===== Backend pose policy (EAGS 风格: Gaussian only) =====
         self.optimize_keyframe_pose = self.config.get("Backend", {}).get(
@@ -610,6 +629,90 @@ class BackEnd(mp.Process):
         return submap_keyframe_poses
 
     # ========================================================================
+    # 7.1 Cross-Submap Covisibility Handoff
+    # ========================================================================
+    def _make_handoff_seed_viewpoint(self, c2w_np):
+        """从现有 viewpoint 复制内参，设置新 C2W 位姿，构造临时渲染用 viewpoint。"""
+        if len(self.viewpoints) == 0:
+            return None
+        src = next(iter(self.viewpoints.values()))
+        vp = copy.copy(src)
+        vp.T = torch.from_numpy(np.linalg.inv(c2w_np)).float().cuda()
+        vp.fixed_pose = True
+        return vp
+
+    @staticmethod
+    def _select_topk_mask(mask, score, max_points):
+        """从 mask 中按 score 选最多 max_points 个元素，返回 bool mask。"""
+        indices = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+        if indices.numel() <= max_points:
+            return mask
+        topk = torch.topk(score[indices], max_points, largest=True)
+        selected = indices[topk.indices]
+        result = torch.zeros_like(mask)
+        result[selected] = True
+        return result
+
+    def build_boundary_handoff(self, new_seed_global_c2w):
+        """
+        在旧子图被清除前，基于 seed frame + 尾部关键帧共视关系选择边界 Handoff Gaussian。
+        返回 (handoff_params_dict | None, valid_tail_ids | list)。
+        """
+        if not self.use_handoff:
+            return None, []
+
+        if self.gaussians.get_xyz.shape[0] == 0:
+            return None, []
+
+        seed_vp = self._make_handoff_seed_viewpoint(new_seed_global_c2w)
+        if seed_vp is None:
+            return None, []
+
+        with torch.no_grad():
+            render_pkg = render(
+                seed_vp, self.gaussians, self.pipeline_params, self.background, surf=False
+            )
+            seed_visible = render_pkg["visibility_filter"]  # (N,) bool
+            N = seed_visible.shape[0]
+
+            support = seed_visible.long().clone()
+
+            tail_ids = list(self.current_window)[-self.handoff_tail_kfs:]
+            valid_tail_ids = []
+            for kf_id in tail_ids:
+                if kf_id not in self.viewpoints:
+                    continue
+                kf_vp = self.viewpoints[kf_id]
+                kf_render = render(
+                    kf_vp, self.gaussians, self.pipeline_params, self.background, surf=False
+                )
+                kf_visible = kf_render["visibility_filter"]
+                if kf_visible.shape[0] == N:
+                    support += kf_visible.long()
+                    valid_tail_ids.append(kf_id)
+
+            opacity = self.gaussians.get_opacity.squeeze()
+            mask = (
+                seed_visible
+                & (support >= self.handoff_min_support)
+                & (opacity > self.handoff_opacity_min)
+            )
+
+            score = support.float() + 0.2 * opacity.float()
+            selected = self._select_topk_mask(mask, score, self.handoff_max_points)
+
+            handoff_params = self.gaussians.capture_masked(selected)
+
+        Log(f"[Handoff] old_gaussians={N}")
+        Log(f"[Handoff] seed_visible={int(seed_visible.sum().item())}")
+        Log(f"[Handoff] tail_kfs={tail_ids}  valid_tail={valid_tail_ids}")
+        Log(f"[Handoff] support>={self.handoff_min_support} count={int((support >= self.handoff_min_support).sum().item())}")
+        Log(f"[Handoff] selected_points={int(selected.sum().item())} "
+            f"selected_ratio={selected.float().mean().item():.4f}")
+
+        return handoff_params, valid_tail_ids
+
+    # ========================================================================
     # 8. Color Refinement (offline)
     # ========================================================================
     # ========================================================================
@@ -631,7 +734,19 @@ class BackEnd(mp.Process):
                 keyframes.append((latest_kf_idx, kf.T.clone()))
         if tag is None:
             tag = "sync_backend"
-        msg = [tag, clone_obj(self.gaussians), self.occ_aware_visibility, keyframes]
+        # Handoff: 传递 frozen GaussianModel（multiprocessing queue 自动序列化，无需手动 clone）
+        if self.use_handoff and self.handoff_gaussians is not None and self.handoff_active:
+            handoff_data = (self.handoff_gaussians, self.handoff_age_frames, self.handoff_warmup_frames)
+        else:
+            handoff_data = None
+        # 过滤 shape 不一致的 occ_aware_visibility 条目（densify 后可能残留旧 shape）
+        n_curr = self.gaussians._xyz.shape[0]
+        if n_curr > 0:
+            safe_occ = {k: v for k, v in self.occ_aware_visibility.items()
+                        if isinstance(v, torch.Tensor) and v.shape[0] == n_curr}
+        else:
+            safe_occ = {}
+        msg = [tag, clone_obj(self.gaussians), safe_occ, keyframes, handoff_data]
         self.frontend_queue.put(msg)
 
     # ========================================================================
@@ -741,6 +856,14 @@ class BackEnd(mp.Process):
 
                     self.viewpoints[cur_frame_idx] = viewpoint
                     self.current_window = current_window
+                    if self.handoff_active:
+                        self.handoff_age_frames += 1
+                        if len(self.current_window) >= self.handoff_warmup_keyframes:
+                            Log(f"[Handoff] keyframe count {len(self.current_window)} >= {self.handoff_warmup_keyframes}, "
+                                f"deactivating handoff (backend)")
+                            self.handoff_active = False
+                            self.handoff_gaussians = None
+                            torch.cuda.empty_cache()
                     self.add_next_kf(cur_frame_idx, viewpoint, depth_map=depth_map)
 
                     opt_params = []
@@ -849,6 +972,27 @@ class BackEnd(mp.Process):
                     if hasattr(self, 'loop_queue') and self.loop_queue is not None and len(kf_image_paths) > 0:
                         self.loop_queue.put(["submap_saved", completed_submap_id, ckpt_path, kf_image_paths])
                         Log(f"✓ Submap {completed_submap_id} sent to loop closure")
+
+                    if self.use_handoff:
+                        handoff_params, valid_tail_ids = self.build_boundary_handoff(
+                            new_seed_global_c2w
+                        )
+                        if handoff_params is not None:
+                            n_handoff = handoff_params["_xyz"].shape[0]
+                            Log(f"[Handoff] selected {n_handoff} boundary Gaussians for submap {completed_submap_id}→{self.current_submap_id}")
+                            sh_degree = self.gaussians.active_sh_degree if hasattr(self.gaussians, "active_sh_degree") else 0
+                            self.handoff_gaussians = GaussianModel.create_frozen_from_params(
+                                handoff_params, sh_degree=sh_degree
+                            )
+                            self.handoff_active = True
+                            self.handoff_age_frames = 0
+                            Log(f"[Handoff] frozen handoff created, points={n_handoff} device=cuda")
+                            Log("[Handoff] insertion uses active-only coverage (self.gaussians); "
+                                "handoff is separate frozen model")
+                        else:
+                            Log("[Handoff] no boundary Gaussians selected (empty mask)")
+                    else:
+                        Log("[Handoff] disabled, using original hard reset behavior")
 
                     self.gaussians.prune_points(self.gaussians.unique_kfIDs >= 0)
                     Log("✓ Pruned ALL Gaussian points for true independent submap")

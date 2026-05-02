@@ -31,6 +31,8 @@ The current system includes:
 - Motion-based submap cutting (translation/rotation threshold relative to submap anchor)
 - Independent submap initialization from seed frames
 - Submap checkpoint saving (Gaussian params, keyframe poses, seed global C2W, relative/correct tsfm)
+- Cross-submap covisibility handoff: frozen boundary Gaussians smooth submap transitions
+- Active-only coverage for correct hole detection after submap cut
 - CosPlace visual descriptor extraction from saved keyframe images
 - 2DGS-GSReg (LoopSplat-style render-based registration) as primary loop verification
 - ICP (point-to-plane with FDN normals) as fallback loop verification
@@ -101,6 +103,8 @@ Submap checkpoint fields:
 
 On submap cut, the back end prunes ALL Gaussian points and resets optimizer state for the next independent submap.
 
+When `use_handoff: true`, the system preserves a small set of boundary Gaussians from the old submap as short-term frozen tracking support (see [Handoff Mechanism](#7-cross-submap-covisibility-handoff)).
+
 ### 6. Loop closure and PGO
 
 The loop closure process runs as an independent process:
@@ -123,6 +127,29 @@ After front end finishes, the main process:
 5. Concatenates all submap Gaussians into a single global model
 6. Evaluates ATE and rendering quality
 7. Optionally saves final PLY
+
+### 8. Cross-Submap Covisibility Handoff
+
+To mitigate tracking degradation after submap cuts (caused by sudden loss of all old Gaussians), the system supports boundary handoff:
+
+1. **Selection**: At submap cut, the seed frame and old submap tail keyframes are rendered against the old Gaussian map. Boundary Gaussians visible from both the seed frame and tail keyframes are selected by support count and opacity score.
+2. **Frozen container**: Selected Gaussians are exported via `capture_masked()` and stored as a frozen `GaussianModel` (no optimizer, no training).
+3. **Tracking support**: During warmup, the front end creates a merged render model (`create_merged_for_render`) combining active new Gaussians with frozen handoff Gaussians, providing dense photometric constraints for tracking.
+4. **Active-only insertion**: Error masks for new Gaussian insertion use active-only render (`self.gaussians`), preventing handoff from masking coverage holes.
+5. **Auto-drop**: Handoff is removed when the new submap reaches `handoff_warmup_keyframes` keyframes, `handoff_warmup_frames` frames, or active opacity coverage exceeds `handoff_new_coverage_th`.
+6. **Ckpt isolation**: Handoff Gaussians are never saved to new submap checkpoints and are cleared on handoff deactivation.
+
+Configuration (all under `Submap`):
+```yaml
+use_handoff: false          # master switch
+handoff_tail_kfs: 4         # old submap tail keyframes for covisibility
+handoff_max_points: 3000    # max boundary Gaussians to retain
+handoff_min_support: 2      # min keyframes that must observe a Gaussian
+handoff_opacity_min: 0.20   # min opacity threshold
+handoff_warmup_frames: 20   # max frames before forced drop
+handoff_warmup_keyframes: 3 # max keyframes before forced drop
+handoff_new_coverage_th: 0.85  # active coverage threshold for early drop
+```
 
 ---
 
@@ -199,7 +226,9 @@ BackEnd (independent process)
     ├── RGB + depth + normal (FDN) loss
     ├── Densify / prune / opacity reset
     ├── occ_aware_visibility + pose sanity check
-    ├── Push Gaussian snapshot → FrontEnd
+    ├── Push Gaussian snapshot + Handoff → FrontEnd
+    ├── Cross-submap boundary Handoff selection (seed + tail-kf covisibility)
+    ├── Frozen Handoff: short-term read-only tracking support
     └── Save submap ckpt + notify loop closure
     ↓ saved submap checkpoints
 LoopClosureProcess (independent process)
@@ -339,10 +368,12 @@ Front end → back end (multiprocessing Queue):
 Back end → front end:
 
 ```text
-["init", gaussians, occ_aware_visibility, keyframes]
-["keyframe", gaussians, occ_aware_visibility, keyframes]
-["sync_backend", gaussians, occ_aware_visibility, keyframes]
+["init", gaussians, occ_aware_visibility, keyframes, handoff_data]
+["keyframe", gaussians, occ_aware_visibility, keyframes, handoff_data]
+["sync_backend", gaussians, occ_aware_visibility, keyframes, handoff_data]
 ```
+
+`handoff_data` is `(frozen_gaussian_model, age_frames, warmup_frames)` or `None`.
 
 Back end → loop closure:
 
@@ -381,7 +412,7 @@ Important configuration groups:
 | `Training` | init/mapping/tracking iters, keyframe, window, LR, densify/prune |
 | `FFTEdgeVO` | Edge VO pyramid, optimization, quality thresholds |
 | `Backend` | keyframe pose policy, pose sanity check |
-| `Submap` | motion thresholds, seed init iters |
+| `Submap` | motion thresholds, seed init iters, cross-submap covisibility handoff |
 | `LoopClosure` | registration method, GSReg params, ICP params, PGO protection |
 | `opt_params` | Gaussian optimizer and densification params |
 | `model_params` | SH degree, data device |

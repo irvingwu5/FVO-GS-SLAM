@@ -570,6 +570,103 @@ class GaussianModel:
 
         return params_dict
 
+    def capture_masked(self, mask):
+        """
+        按 boolean mask 选择性导出 Gaussian 参数（detached, CPU）。
+        用于跨子图 Handoff：只导出边界共视 Gaussian，不携带 optimizer state。
+        返回 None 当 mask 为空时。
+        """
+        if mask is None or mask.sum() == 0:
+            return None
+
+        valid_mask = mask.to(device="cuda")
+        N_total = self.get_xyz.shape[0]
+
+        params = {
+            "_xyz": self._xyz.detach()[valid_mask].cpu(),
+            "_features_dc": self._features_dc.detach()[valid_mask].cpu(),
+            "_features_rest": self._features_rest.detach()[valid_mask].cpu(),
+            "_scaling": self._scaling.detach()[valid_mask].cpu(),
+            "_rotation": self._rotation.detach()[valid_mask].cpu(),
+            "_opacity": self._opacity.detach()[valid_mask].cpu(),
+            "unique_kfIDs": self.unique_kfIDs[valid_mask.cpu()].clone(),
+            "n_obs": self.n_obs[valid_mask.cpu()].clone(),
+        }
+
+        # _normal 可能长度不一致，安全处理
+        if len(self._normal) == N_total:
+            params["_normal"] = self._normal.detach()[valid_mask].cpu()
+        else:
+            params["_normal"] = torch.empty(0, device="cpu")
+
+        return params
+
+    @classmethod
+    def create_frozen_from_params(cls, params, sh_degree=0):
+        """
+        从 detached params dict 创建只读 GaussianModel（无 optimizer，不可训练）。
+        用于跨子图 Handoff：旧子图边界 Gaussian 只参与短期 tracking render。
+        """
+        if params is None:
+            return None
+        g = cls(sh_degree=sh_degree)
+        g.active_sh_degree = sh_degree
+        g.spatial_lr_scale = 1.0
+        N = params["_xyz"].shape[0]
+
+        g._xyz = params["_xyz"].cuda().detach()
+        g._features_dc = params["_features_dc"].cuda().detach()
+        g._features_rest = params["_features_rest"].cuda().detach()
+        g._scaling = params["_scaling"].cuda().detach()
+        g._rotation = params["_rotation"].cuda().detach()
+        g._opacity = params["_opacity"].cuda().detach()
+
+        g.max_radii2D = torch.zeros(N, device="cuda")
+        g.xyz_gradient_accum = torch.zeros(N, 1, device="cuda")
+        g.denom = torch.zeros(N, 1, device="cuda")
+        g.unique_kfIDs = params.get("unique_kfIDs", torch.zeros(N).int())
+        g.n_obs = params.get("n_obs", torch.zeros(N).int())
+        if "_normal" in params and params["_normal"].shape[0] > 0:
+            g._normal = params["_normal"].cuda().detach()
+        else:
+            g._normal = torch.empty(0, device="cuda")
+
+        # 不调用 training_setup — 无 optimizer，参数不会更新
+        return g
+
+    @staticmethod
+    def _cat_or_a(a_tensor, b_tensor):
+        if a_tensor.shape[0] == 0:
+            return b_tensor
+        if b_tensor.shape[0] == 0:
+            return a_tensor
+        b = b_tensor.to(dtype=a_tensor.dtype, device=a_tensor.device)
+        return torch.cat([a_tensor, b], dim=0)
+
+    @classmethod
+    def create_merged_for_render(cls, active_model, frozen_model):
+        """拼接 active 和 frozen GaussianModel 为临时渲染模型（无 optimizer，用完即弃）。"""
+        merged = cls(sh_degree=active_model.active_sh_degree)
+        merged.active_sh_degree = active_model.active_sh_degree
+
+        merged._xyz = cls._cat_or_a(active_model._xyz, frozen_model._xyz)
+        merged._features_dc = cls._cat_or_a(active_model._features_dc, frozen_model._features_dc)
+        merged._features_rest = cls._cat_or_a(active_model._features_rest, frozen_model._features_rest)
+        merged._scaling = cls._cat_or_a(active_model._scaling, frozen_model._scaling)
+        merged._rotation = cls._cat_or_a(active_model._rotation, frozen_model._rotation)
+        merged._opacity = cls._cat_or_a(active_model._opacity, frozen_model._opacity)
+
+        N = merged._xyz.shape[0]
+        merged.max_radii2D = torch.zeros(N, device="cuda")
+        merged.xyz_gradient_accum = torch.zeros(N, 1, device="cuda")
+        merged.denom = torch.zeros(N, 1, device="cuda")
+
+        a_n = active_model._normal if len(active_model._normal) > 0 else torch.empty(0, device="cuda")
+        b_n = frozen_model._normal if len(frozen_model._normal) > 0 else torch.empty(0, device="cuda")
+        merged._normal = cls._cat_or_a(a_n, b_n)
+
+        return merged
+
     def reset_for_new_submap(self):
         """
         彻底重置高斯模型，为新子图做准备。

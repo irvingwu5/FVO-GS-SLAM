@@ -5,6 +5,7 @@ import torch
 import torch.multiprocessing as mp
 import os
 from gaussian_splatting.gaussian_renderer import render
+from gaussian_splatting.scene.gaussian_model import GaussianModel
 from gaussian_splatting.utils.graphics_utils import getProjectionMatrix2
 from gui import gui_utils
 from utils.camera_utils import Camera
@@ -64,6 +65,11 @@ class FrontEnd(mp.Process):
         # ================================================
         self.submap_motion_anchor_global_c2w = None #运动监控锚点（global C2W）
         self.submap_start_frame_idx = 0
+        # ===== Cross-Submap Covisibility Handoff =====
+        self.handoff_gaussians = None  # frozen GaussianModel from old submap boundary
+        self.handoff_age_frames = 0
+        self.handoff_warmup_frames = 20
+        self._handoff_eval = {}  # per-submap eval stats
         self.fft_filter = None  # 频域滤波器实例
         # 消融实验开关
         self.use_submap = self.config.get("Ablation", {}).get("use_submap", True)
@@ -244,6 +250,45 @@ class FrontEnd(mp.Process):
 
         return error_mask
 
+    def _get_render_model(self):
+        if self.handoff_gaussians is not None and self.handoff_age_frames < self.handoff_warmup_frames:
+            return GaussianModel.create_merged_for_render(self.gaussians, self.handoff_gaussians)
+        return self.gaussians
+
+    def _maybe_drop_handoff(self, cur_frame_idx):
+        """满足任一条件则释放 Handoff。返回 (dropped: bool, reason: str)。"""
+        if self.handoff_gaussians is None:
+            return False, ""
+
+        # 条件 1: warmup 帧数到期
+        if self.handoff_age_frames >= self.handoff_warmup_frames:
+            return True, "age_frames"
+
+        # 条件 2: 新子图关键帧数达标（每 10 帧检查一次，减少渲染开销）
+        if cur_frame_idx % 10 == 0 and self.gaussians is not None and len(self.gaussians._xyz) > 0:
+            with torch.no_grad():
+                viewpoint = self.cameras.get(cur_frame_idx)
+                if viewpoint is None:
+                    return False, ""
+                render_pkg = render(
+                    viewpoint, self.gaussians, self.pipeline_params, self.background, surf=False
+                )
+                opacity = render_pkg["opacity"]
+                coverage = (opacity > 0.95).float().mean().item()
+                if coverage >= self.config.get("Submap", {}).get("handoff_new_coverage_th", 0.85):
+                    Log(f"[Handoff] active-only coverage={coverage:.3f} >= threshold, dropping")
+                    return True, "coverage"
+
+        return False, ""
+
+    def _drop_handoff(self, reason):
+        n_handoff = self.handoff_gaussians._xyz.shape[0] if self.handoff_gaussians is not None else 0
+        n_active = self.gaussians._xyz.shape[0] if self.gaussians is not None else 0
+        Log(f"[Handoff] dropped: reason={reason} age_frames={self.handoff_age_frames} "
+            f"handoff_points={n_handoff} active_points={n_active}")
+        self.handoff_gaussians = None
+        self.handoff_age_frames = 0
+
     # ========================================================================
     # 5. Tracking (FFT Edge VO + render refinement)
     # ========================================================================
@@ -251,7 +296,7 @@ class FrontEnd(mp.Process):
         if viewpoint.fixed_pose:
             with torch.no_grad():
                 render_pkg = render(
-                    viewpoint, self.gaussians, self.pipeline_params, self.background, surf=False
+                    viewpoint, self._get_render_model(), self.pipeline_params, self.background, surf=False
                 )
             self.median_depth = get_median_depth(
                 render_pkg["depth"], render_pkg["opacity"]
@@ -315,9 +360,10 @@ class FrontEnd(mp.Process):
         pose_optimizer = torch.optim.Adam(opt_params)
         best_T, best_loss, best_render_pkg = None, float("inf"), None
 
+        render_model = self._get_render_model()  # 一次创建，整帧复用
         for tracking_itr in range(refine_iters):
             render_pkg = render(
-                viewpoint, self.gaussians, self.pipeline_params, self.background, surf=False
+                viewpoint, render_model, self.pipeline_params, self.background, surf=False
             )
             image, depth, opacity = (
                 render_pkg["render"], render_pkg["depth"], render_pkg["opacity"],
@@ -381,6 +427,10 @@ class FrontEnd(mp.Process):
             Log(f"[Warning] Keyframe {last_keyframe_idx} lost in visibility dict! Forcing a new keyframe to heal state.")
             return True
 
+        last_vis = occ_aware_visibility[last_keyframe_idx]
+        if last_vis.shape[0] != cur_frame_visibility_filter.shape[0]:
+            return True  # densify 后 shape 变化，静默强制关键帧自愈
+
         pose_CW = curr_frame.T
         last_kf_CW = last_kf.T
         last_kf_WC = torch.linalg.inv(last_kf_CW)
@@ -389,10 +439,10 @@ class FrontEnd(mp.Process):
         dist_check2 = dist > kf_min_translation * self.median_depth
 
         union = torch.logical_or(
-            cur_frame_visibility_filter, occ_aware_visibility[last_keyframe_idx]
+            cur_frame_visibility_filter, last_vis
         ).count_nonzero()
         intersection = torch.logical_and(
-            cur_frame_visibility_filter, occ_aware_visibility[last_keyframe_idx]
+            cur_frame_visibility_filter, last_vis
         ).count_nonzero()
         point_ratio_2 = intersection / union
 
@@ -422,6 +472,9 @@ class FrontEnd(mp.Process):
                 continue
 
             kf_visibility = occ_aware_visibility[kf_idx]
+            if kf_visibility.shape[0] != cur_frame_visibility_filter.shape[0]:
+                to_remove.append(kf_idx)
+                continue
 
             intersection = torch.logical_and(
                 cur_frame_visibility_filter, kf_visibility
@@ -633,10 +686,28 @@ class FrontEnd(mp.Process):
             self.occ_aware_visibility = {}
 
         if isinstance(backend_occ, dict) and len(backend_occ) > 0:
-            self.occ_aware_visibility.update(backend_occ)
+            if self.gaussians is not None and self.gaussians._xyz.shape[0] > 0:
+                n_curr = self.gaussians._xyz.shape[0]
+                self.occ_aware_visibility = {
+                    k: v for k, v in backend_occ.items()
+                    if isinstance(v, torch.Tensor) and v.shape[0] == n_curr
+                }
+            else:
+                self.occ_aware_visibility = dict(backend_occ)
 
         for kf_id, kf_T in keyframes:
             self.cameras[kf_id].T = kf_T
+
+        # Handoff: 接收 frozen GaussianModel（Stage 5）
+        if len(data) > 4 and data[4] is not None:
+            handoff_clone, _, warmup_frames = data[4]
+            if self.handoff_gaussians is None:
+                self.handoff_age_frames = 0  # 首次收到 Handoff 时重置 age
+            self.handoff_gaussians = handoff_clone
+            self.handoff_warmup_frames = warmup_frames
+        elif len(data) <= 4 or data[4] is None:
+            self.handoff_gaussians = None
+            self.handoff_age_frames = 0
 
     # ========================================================================
     # 12. Coordinate Utility
@@ -726,7 +797,24 @@ class FrontEnd(mp.Process):
                 )
 
                 # Tracking
+                if self.handoff_gaussians is not None:
+                    self.handoff_age_frames += 1
                 render_pkg = self.tracking(cur_frame_idx, viewpoint)
+
+                if self.handoff_gaussians is not None:
+                    if self.handoff_age_frames <= 20 and self.handoff_age_frames % 5 == 0:
+                        with torch.no_grad():
+                            active_pkg = render(viewpoint, self.gaussians,
+                                                self.pipeline_params, self.background, surf=False)
+                            active_cov = (active_pkg["opacity"] > 0.95).float().mean().item()
+                        hf_pts = self.handoff_gaussians._xyz.shape[0]
+                        Log(f"[HandoffEval] submap={self.current_submap_id} frame={cur_frame_idx} "
+                            f"age={self.handoff_age_frames} active_cov={active_cov:.3f} "
+                            f"handoff_pts={hf_pts}")
+
+                    dropped, reason = self._maybe_drop_handoff(cur_frame_idx)
+                    if dropped:
+                        self._drop_handoff(reason)
 
                 current_c2w = torch.linalg.inv(viewpoint.T)
 
@@ -771,6 +859,12 @@ class FrontEnd(mp.Process):
                 last_keyframe_idx = self.current_window[0]
                 check_time = (cur_frame_idx - last_keyframe_idx) >= self.kf_interval
                 curr_visibility = (render_pkg["n_touched"] > 0).long()
+                # tracking render 使用 merged (active+handoff)，但 occ_aware_visibility 只有 active
+                # 切片到 active-only 部分避免 shape mismatch
+                if self.handoff_gaussians is not None and self.gaussians is not None:
+                    n_active = self.gaussians._xyz.shape[0]
+                    if n_active > 0 and n_active < curr_visibility.shape[0]:
+                        curr_visibility = curr_visibility[:n_active]
 
                 if last_keyframe_idx not in self.occ_aware_visibility:
                     Log(f"[Warning] Keyframe {last_keyframe_idx} visibility missing, skipping point_ratio check.")
@@ -786,24 +880,26 @@ class FrontEnd(mp.Process):
                 if len(self.current_window) < self.window_size:
                     if last_keyframe_idx in self.occ_aware_visibility:
                         last_visibility = self.occ_aware_visibility[last_keyframe_idx]
-
-                        union = torch.logical_or(
-                            curr_visibility, last_visibility
-                        ).count_nonzero()
-
-                        intersection = torch.logical_and(
-                            curr_visibility, last_visibility
-                        ).count_nonzero()
-
-                        if union > 0:
-                            point_ratio = intersection.float() / union.float()
+                        if last_visibility.shape[0] != curr_visibility.shape[0]:
+                            create_kf = check_time
                         else:
-                            point_ratio = torch.tensor(0.0, device=curr_visibility.device)
+                            union = torch.logical_or(
+                                curr_visibility, last_visibility
+                            ).count_nonzero()
 
-                        create_kf = (
-                                check_time
-                                and point_ratio < self.config["Training"]["kf_overlap"]
-                        )
+                            intersection = torch.logical_and(
+                                curr_visibility, last_visibility
+                            ).count_nonzero()
+
+                            if union > 0:
+                                point_ratio = intersection.float() / union.float()
+                            else:
+                                point_ratio = torch.tensor(0.0, device=curr_visibility.device)
+
+                            create_kf = (
+                                    check_time
+                                    and point_ratio < self.config["Training"]["kf_overlap"]
+                            )
                     else:
                         Log(
                             f"[Warning] Skip point_ratio check because keyframe "

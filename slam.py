@@ -308,6 +308,9 @@ class SLAM:
                 }
                 del gp_cuda, gp_corrected
 
+            n_pts = gp["_xyz"].shape[0] if "_xyz" in gp else 0
+            Log(f"[Fusion] submap {sid}: {n_pts} Gaussians")
+
             for key in final_params.keys():
                 if key in gp and isinstance(gp[key], torch.Tensor):
                     final_params[key].append(gp[key].detach().cpu())

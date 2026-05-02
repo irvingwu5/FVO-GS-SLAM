@@ -132,6 +132,17 @@ Submap:
 
   seed_init_iters: 1500
 
+  # ===== Cross-Submap Covisibility Handoff =====
+  use_handoff: false
+  handoff_tail_kfs: 4
+  handoff_max_points: 80000
+  handoff_min_support: 2
+  handoff_opacity_min: 0.20
+  handoff_warmup_frames: 20
+  handoff_warmup_keyframes: 3
+  handoff_new_coverage_th: 0.85
+  handoff_depth_consistency_th: 0.08
+
 # ============================================================
 # Loop Closure Configuration
 # ============================================================
