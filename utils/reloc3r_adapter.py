@@ -28,7 +28,8 @@ def _load_image_as_tensor(img_path, device="cuda"):
 
 
 def _load_reloc3r_model(config):
-    """Load Reloc3R model once. Called lazily on first use."""
+    """Load Reloc3R model once. Called lazily on first use.
+    Priority: local checkpoint > HF hub > mock fallback."""
     global _RELOC3R_MODEL
     if _RELOC3R_MODEL is not None:
         return _RELOC3R_MODEL
@@ -39,20 +40,40 @@ def _load_reloc3r_model(config):
 
     try:
         from reloc3r.reloc3r_relpose import Reloc3rRelpose
-    except ImportError as e:
+    except Exception as e:
         Log(f"[Reloc3R] import failed: {e}. Falling back to mock mode.")
         return None
 
-    checkpoint = config.get("checkpoint", "siyan824/reloc3r-224")
     dev = config.get("device", "cuda")
-    Log(f"[Reloc3R] loading model checkpoint={checkpoint} ...")
+    image_size = config.get("image_size", 224)
+    local_path = config.get("local_checkpoint", "")
+
+    # 优先加载本地 checkpoint（绕过 HF hub 下载）
+    if local_path and os.path.isfile(local_path):
+        Log(f"[Reloc3R] loading from local checkpoint: {local_path}")
+        try:
+            model = Reloc3rRelpose(img_size=image_size)
+            state_dict = torch.load(local_path, map_location="cpu")
+            model.load_state_dict(state_dict, strict=True)
+            model.to(dev)
+            model.eval()
+            _RELOC3R_MODEL = model
+            _RELOC3R_DEVICE = dev
+            Log(f"[Reloc3R] model loaded from local file, image_size={image_size}")
+            return model
+        except Exception as e:
+            Log(f"[Reloc3R] local checkpoint load failed: {e}. Trying HF hub...")
+
+    # 回退 HF hub
+    checkpoint = config.get("checkpoint", "siyan824/reloc3r-224")
+    Log(f"[Reloc3R] loading model from HF hub: {checkpoint} ...")
     try:
         model = Reloc3rRelpose.from_pretrained(checkpoint)
         model.to(dev)
         model.eval()
         _RELOC3R_MODEL = model
         _RELOC3R_DEVICE = dev
-        Log(f"[Reloc3R] model loaded successfully on {dev}")
+        Log(f"[Reloc3R] model loaded successfully from HF hub on {dev}")
         return model
     except Exception as e:
         Log(f"[Reloc3R] model load failed: {e}. Falling back to mock mode.")
@@ -113,8 +134,9 @@ class Reloc3RSubmapRegistrator:
             return self._fail_result("missing_keyframe_pose")
 
         try:
-            img1 = _load_image_as_tensor(src_img_path, self.config.get("device", "cuda"))
-            img2 = _load_image_as_tensor(tgt_img_path, self.config.get("device", "cuda"))
+            # view1=tgt, view2=src → reloc3r pose2to1 maps src_cam→tgt_cam
+            img1 = _load_image_as_tensor(tgt_img_path, self.config.get("device", "cuda"))
+            img2 = _load_image_as_tensor(src_img_path, self.config.get("device", "cuda"))
             H, W = self.image_size, self.image_size
             view1 = {"img": img1.cuda(), "true_shape": torch.tensor([[H, W]]).cuda()}
             view2 = {"img": img2.cuda(), "true_shape": torch.tensor([[H, W]]).cuda()}

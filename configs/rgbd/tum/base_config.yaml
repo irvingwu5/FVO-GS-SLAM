@@ -144,7 +144,7 @@ Submap:
 # Loop Closure Configuration
 # ============================================================
 LoopClosure:
-  registration_method: "reloc3r_mock"  # choices: icp, 2dgs_gsreg
+  registration_method: "reloc3r"  # choices: icp, 2dgs_gsreg, reloc3r, reloc3r_mock
   allow_identity_loop_init: false
 
   gsreg_overlap_radius: 0.10
@@ -179,10 +179,12 @@ LoopClosure:
 
   # ===== Reloc3R (future replacement for GSReg+ICP) =====
   Reloc3R:
-    enabled: false
+    enabled: true
+    mock_mode: false
     repo_path: third_party/reloc3r
-    checkpoint: Reloc3r-512
-    image_size: 512
+    checkpoint: siyan824/reloc3r-224
+    local_checkpoint: weights/reloc3r-224.pth
+    image_size: 224
     use_amp: true
     device: cuda
     topk_pairs: 5

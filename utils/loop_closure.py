@@ -438,7 +438,8 @@ class LoopClosureProcess(mp.Process):
                             f"method={metrics.get('method')} scale={metrics.get('scale_value', 0):.3f}"
                         )
                         return result["T_tgt_src"], result["information"], True, metrics
-                    Log(f"[Reloc3R] 子图 {source_id}->{target_id} failed: {metrics.get('failure_reason', 'unknown')}")
+                    r_metrics = result.get("metrics", {})
+                    Log(f"[Reloc3R] 子图 {source_id}->{target_id} failed: {r_metrics.get('failure_reason', 'unknown')}")
                 else:
                     Log(f"[Reloc3R] adapter not initialized, falling through to GSReg/ICP")
 
