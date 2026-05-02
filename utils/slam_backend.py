@@ -92,6 +92,16 @@ class BackEnd(mp.Process):
             f"pose_sanity_check={self.backend_pose_sanity_check}"
         )
 
+        # ===== RSKM (Random Sampling Keyframe Mapping) =====
+        self.use_rskm = self.config.get("Training", {}).get("use_rskm", False)
+        self.rskm_current_frame_interval = self.config.get("Training", {}).get("rskm_current_frame_interval", 4)
+        rskm_seed = self.config.get("Training", {}).get("rskm_seed", 42)
+        self.rskm_rng = random.Random(rskm_seed)
+        self.rskm_debug_log = self.config.get("Training", {}).get("rskm_debug_log", False)
+        self._rskm_stats = None
+        if self.use_rskm and self.rskm_debug_log:
+            Log(f"[RSKM] enabled interval={self.rskm_current_frame_interval} seed={rskm_seed}")
+
     # ========================================================================
     # 2. Hyperparameters
     # ========================================================================
@@ -323,12 +333,33 @@ class BackEnd(mp.Process):
             visibility_filter_acm = []
             radii_acm = []
             n_touched_acm = []
-            keyframes_opt = []
 
-            for i in range(len(current_window)):
-                viewpoint = viewpoint_stack[i]
-                keyframes_opt.append(viewpoint)
+            if self.use_rskm and not prune:
+                num_samples = len(current_window) + 2
+                supervised_kf_ids = self._select_rskm_keyframes(current_window, num_samples)
+                supervision_pairs = [(kf_idx, self.viewpoints[kf_idx]) for kf_idx in supervised_kf_ids]
+                keyframes_opt = viewpoint_stack[:]
+                current_kf_id = current_window[-1] if len(current_window) > 0 else None
+                if self._rskm_stats is None:
+                    self._rskm_stats = {
+                        "total_iters": 0, "n_current": 0, "n_history": 0,
+                        "history_kf_set": set(),
+                    }
+                self._rskm_stats["total_iters"] += 1
+                if current_kf_id is not None:
+                    for kf_idx in supervised_kf_ids:
+                        if kf_idx == current_kf_id:
+                            self._rskm_stats["n_current"] += 1
+                        else:
+                            self._rskm_stats["n_history"] += 1
+                            self._rskm_stats["history_kf_set"].add(kf_idx)
+            else:
+                supervision_pairs = [(kf_idx, self.viewpoints[kf_idx]) for kf_idx in current_window]
+                for cam_idx in torch.randperm(len(random_viewpoint_stack))[:2]:
+                    supervision_pairs.append((None, random_viewpoint_stack[cam_idx]))
+                keyframes_opt = viewpoint_stack[:]
 
+            for kf_idx, viewpoint in supervision_pairs:
                 render_pkg = render(
                     viewpoint, self.gaussians, self.pipeline_params, self.background, surf=False
                 )
@@ -372,46 +403,7 @@ class BackEnd(mp.Process):
                 viewspace_point_tensor_acm.append(viewspace_point_tensor)
                 visibility_filter_acm.append(visibility_filter)
                 radii_acm.append(radii)
-                n_touched_acm.append(n_touched)
-
-                del render_pkg
-
-                if i % 5 == 0:
-                    torch.cuda.empty_cache()
-
-            for cam_idx in torch.randperm(len(random_viewpoint_stack))[:2]:
-                viewpoint = random_viewpoint_stack[cam_idx]
-                render_pkg = render(
-                    viewpoint, self.gaussians, self.pipeline_params, self.background, surf=False
-                )
-                (
-                    image,
-                    viewspace_point_tensor,
-                    visibility_filter,
-                    radii,
-                    depth,
-                    opacity,
-                    n_touched,
-                ) = (
-                    render_pkg["render"],
-                    render_pkg["viewspace_points"],
-                    render_pkg["visibility_filter"],
-                    render_pkg["radii"],
-                    render_pkg["depth"],
-                    render_pkg["opacity"],
-                    render_pkg["n_touched"],
-                )
-
-                loss_view = get_loss_mapping(
-                    self.config, image, depth, viewpoint,
-                    apply_exposure=optimize_exposure,
-                )
-
-                loss_view.backward()
-
-                viewspace_point_tensor_acm.append(viewspace_point_tensor)
-                visibility_filter_acm.append(visibility_filter)
-                radii_acm.append(radii)
+                n_touched_acm.append((kf_idx, n_touched))
 
                 del render_pkg
                 torch.cuda.empty_cache()
@@ -420,10 +412,9 @@ class BackEnd(mp.Process):
 
             with torch.no_grad():
                 self.occ_aware_visibility = {}
-                for idx in range((len(current_window))):
-                    kf_idx = current_window[idx]
-                    n_touched = n_touched_acm[idx]
-                    self.occ_aware_visibility[kf_idx] = (n_touched > 0).long()
+                for kf_idx, n_touched in n_touched_acm:
+                    if kf_idx is not None and kf_idx in current_window_set:
+                        self.occ_aware_visibility[kf_idx] = (n_touched > 0).long()
 
                 if prune:
                     if len(current_window) == self.config["Training"]["window_size"]:
@@ -481,7 +472,7 @@ class BackEnd(mp.Process):
                         not update_gaussian
                 ):
                     Log("Resetting the opacity of non-visible Gaussians")
-                    actual_touched_filters = [(n_touched > 0) for n_touched in n_touched_acm]
+                    actual_touched_filters = [(n_touched > 0) for _, n_touched in n_touched_acm]
                     self.gaussians.reset_opacity_nonvisible(
                         actual_touched_filters,
                         target_opacity=self.nonvisible_reset_opacity,
@@ -567,7 +558,43 @@ class BackEnd(mp.Process):
                         f"dt={dt:.6e}m dr={dr:.6e}deg"
                     )
 
+        if self.use_rskm and self.rskm_debug_log and self._rskm_stats is not None and self._rskm_stats["total_iters"] > 0:
+            stats = self._rskm_stats
+            n_total = stats["n_current"] + stats["n_history"]
+            pool_size = len(self.viewpoints)
+            Log(f"[RSKM] submap={self.current_submap_id} "
+                f"current_kf={current_window[-1] if len(current_window) > 0 else 'N/A'} "
+                f"iters={stats['total_iters']} "
+                f"pool={pool_size}kfs "
+                f"total_samples={n_total} "
+                f"current_samples={stats['n_current']} "
+                f"history_samples={stats['n_history']} "
+                f"distinct_history={len(stats['history_kf_set'])}")
+            self._rskm_stats = None
+
         return gaussian_split
+
+    # ========================================================================
+    # 6.1 RSKM (Random Sampling Keyframe Mapping)
+    # ========================================================================
+    def _select_rskm_keyframes(self, current_window, num_samples):
+        active_kf_ids = sorted(list(self.viewpoints.keys()))
+        current_kf_id = current_window[-1] if len(current_window) > 0 else None
+
+        selected = []
+        for s in range(num_samples):
+            iter_id = self.iteration_count + s
+            if iter_id % self.rskm_current_frame_interval == 0:
+                if current_kf_id is not None and current_kf_id in self.viewpoints:
+                    selected.append(current_kf_id)
+                    continue
+            if len(active_kf_ids) <= 1 and current_kf_id is not None:
+                selected.append(current_kf_id)
+            elif len(active_kf_ids) > 0:
+                selected.append(self.rskm_rng.choice(active_kf_ids))
+            elif current_kf_id is not None:
+                selected.append(current_kf_id)
+        return selected
 
     # ========================================================================
     # 7. Submap Helpers

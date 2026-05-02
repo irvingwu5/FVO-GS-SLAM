@@ -86,6 +86,12 @@ Training:
   min_init_gaussian_scale: 0.002
   max_init_gaussian_scale: 0.06
 
+  # ===== RSKM (Random Sampling Keyframe Mapping) =====
+  use_rskm: false
+  rskm_current_frame_interval: 4
+  rskm_seed: 42
+  rskm_debug_log: false
+
 # ============================================================
 # FFT Edge VO Configuration (dense DT alignment, Edge VO style)
 # ============================================================

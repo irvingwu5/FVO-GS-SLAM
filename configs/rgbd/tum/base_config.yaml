@@ -72,6 +72,12 @@ Training:
   min_init_gaussian_scale: 0.002
   max_init_gaussian_scale: 0.06
 
+  # ===== RSKM (Random Sampling Keyframe Mapping) =====
+  use_rskm: True
+  rskm_current_frame_interval: 4
+  rskm_seed: 42
+  rskm_debug_log: false
+
 # ============================================================
 # FFT Edge VO Configuration (dense DT alignment, Edge VO style)
 # ============================================================
@@ -118,8 +124,8 @@ Backend:
 # ============================================================
 Submap:
   # ===== Submap Cut Thresholds (motion-only, relative to submap start frame) =====
-  trans_thre: 0.8
-  rot_thre: 50
+  trans_thre: 1.5
+  rot_thre: 60
 
   seed_init_iters: 1500     # 新子图 seed 帧初始化迭代数（原默认 500）
 
@@ -229,4 +235,4 @@ Ablation:
   use_fdn: True              # (5) 是否开启有限差分法线监督及相关 Loss 衰减
   use_fft_mask: True         # (6) 是否开启 FFT 高低频掩膜指导采样与初始尺度设定
   use_error_mask: True        # (6) 是否开启渲染误差掩膜指导动态补点
-  use_color_refinement: False   # (8) 是否开启颜色优化（如果开启，则在每次优化迭代中同时优化颜色相关参数；如果关闭，则只优化几何相关参数，颜色参数保持不变）
+  use_color_refinement: True   # (8) 是否开启颜色优化（如果开启，则在每次优化迭代中同时优化颜色相关参数；如果关闭，则只优化几何相关参数，颜色参数保持不变）
