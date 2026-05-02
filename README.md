@@ -31,6 +31,7 @@ The current system includes:
 - Motion-based submap cutting (translation/rotation threshold relative to submap anchor)
 - Independent submap initialization from seed frames
 - Submap checkpoint saving (Gaussian params, keyframe poses, seed global C2W, relative/correct tsfm)
+- RSKM (Random Sampling Keyframe Mapping): random keyframe replay within active submap
 - Cross-submap covisibility handoff: frozen boundary Gaussians smooth submap transitions
 - Active-only coverage for correct hole detection after submap cut
 - CosPlace visual descriptor extraction from saved keyframe images
@@ -226,6 +227,7 @@ BackEnd (independent process)
     ├── RGB + depth + normal (FDN) loss
     ├── Densify / prune / opacity reset
     ├── occ_aware_visibility + pose sanity check
+    ├── RSKM: randomly sampled keyframe supervision
     ├── Push Gaussian snapshot + Handoff → FrontEnd
     ├── Cross-submap boundary Handoff selection (seed + tail-kf covisibility)
     ├── Frozen Handoff: short-term read-only tracking support
@@ -301,11 +303,12 @@ Key responsibilities:
 - Receive `init`, `keyframe`, `new_submap` messages from front end
 - Initialize Gaussian map from seed keyframe
 - Add new keyframes with FFT mask + error mask guided point insertion
-- Optimize Gaussian parameters with mapping loss (RGB + depth + FDN normal)
+- Optimize Gaussian parameters with RSKM-sampled keyframe supervision
 - Collect visibility and densification statistics
 - Densify, reset opacity, and prune Gaussian points
+- Select boundary handoff Gaussians for submap transitions (frozen, read-only)
 - Maintain `occ_aware_visibility` keyed by keyframe index
-- Push Gaussian snapshots and keyframe poses to front end
+- Push Gaussian snapshots, keyframe poses, and handoff to front end
 - Save submap checkpoints on `new_submap` and `stop`
 - Notify loop closure on submap save
 - Prune ALL Gaussian points and reset state for independent submap init
@@ -409,10 +412,10 @@ Important configuration groups:
 |---|---|
 | `Results` | save path, trajectory saving, GUI, rendering eval, W&B |
 | `Dataset` | dataset type, sensor type, camera params, point sampling |
-| `Training` | init/mapping/tracking iters, keyframe, window, LR, densify/prune |
+| `Training` | init/mapping/tracking iters, keyframe, window, LR, densify/prune, RSKM |
 | `FFTEdgeVO` | Edge VO pyramid, optimization, quality thresholds |
 | `Backend` | keyframe pose policy, pose sanity check |
-| `Submap` | motion thresholds, seed init iters, cross-submap covisibility handoff |
+| `Submap` | motion thresholds (TUM: 2.0m/80°), seed init, handoff |
 | `LoopClosure` | registration method, GSReg params, ICP params, PGO protection |
 | `opt_params` | Gaussian optimizer and densification params |
 | `model_params` | SH degree, data device |
@@ -530,7 +533,7 @@ Backend:
 
 LoopClosure:
   registration_method: "2dgs_gsreg"  # "2dgs_gsreg" or "icp"
-  debug_disable_pgo_for_fftvo_test: true  # disable PGO (TUM only, for VO ablation)
+  debug_disable_pgo_for_fftvo_test: false  # PGO enabled by default (set true for FFTVO ablation)
 ```
 
 For debugging FFTEdgeVO alone, disable PGO with `debug_disable_pgo_for_fftvo_test: true` — evaluates whether FFTEdgeVO improves tracking before global corrections are introduced.
