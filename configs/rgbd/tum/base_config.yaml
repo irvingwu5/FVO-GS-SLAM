@@ -144,7 +144,7 @@ Submap:
 # Loop Closure Configuration
 # ============================================================
 LoopClosure:
-  registration_method: "2dgs_gsreg"  # choices: icp, 2dgs_gsreg
+  registration_method: "reloc3r_mock"  # choices: icp, 2dgs_gsreg
   allow_identity_loop_init: false
 
   gsreg_overlap_radius: 0.10

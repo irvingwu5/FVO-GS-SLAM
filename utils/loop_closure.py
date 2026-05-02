@@ -7,6 +7,7 @@ import torch.multiprocessing as mp
 import roma
 from utils.logging_utils import Log
 from utils.gsr_2dgs.solver_2dgs import registration_2dgs_gsreg
+from utils.reloc3r_adapter import Reloc3RSubmapRegistrator
 import torchvision.transforms as T
 import torchvision.models as models
 import torch.nn as nn
@@ -261,8 +262,11 @@ class LoopClosureProcess(mp.Process):
         self.submap_seed_c2w = {}          # {submap_id: 4x4 np.array}
         self.submap_keyframe_poses = {}    # {submap_id: {kf_idx: 4x4 np.array}}
         self.submap_image_paths = {}       # {submap_id: [str, ...]}
+        self.reloc3r_registrator = None
         if self.reloc3r_enabled:
             Log(f"[Reloc3R] config loaded (model NOT loaded in Stage 1) mode={reloc3r_cfg.get('scale_mode')}")
+            self.reloc3r_registrator = Reloc3RSubmapRegistrator(reloc3r_cfg)
+            Log(f"[Reloc3R] adapter initialized (mock={self.reloc3r_registrator.mock_mode})")
 
     # ========================================================================
     # 4.2 Feature Extraction
@@ -409,6 +413,35 @@ class LoopClosureProcess(mp.Process):
             # 2DGS-GSReg registration (LoopSplat-style render-based)
             reg_method = self.config.get("LoopClosure", {}).get("registration_method", "2dgs_gsreg")
             src_ckpt, tgt_ckpt = self.submap_records.get(source_id), self.submap_records.get(target_id)
+
+            # Reloc3R / reloc3r_mock branch (Stage 2)
+            if reg_method == "reloc3r" or reg_method == "reloc3r_mock":
+                if self.reloc3r_registrator is not None:
+                    src_imgs = self.submap_image_paths.get(source_id, [])
+                    tgt_imgs = self.submap_image_paths.get(target_id, [])
+                    src_seed = self.submap_seed_c2w.get(source_id, np.eye(4))
+                    tgt_seed = self.submap_seed_c2w.get(target_id, np.eye(4))
+                    src_kf_poses = self.submap_keyframe_poses.get(source_id, {})
+                    tgt_kf_poses = self.submap_keyframe_poses.get(target_id, {})
+
+                    result = self.reloc3r_registrator.register_submaps(
+                        source_id, target_id,
+                        src_seed, tgt_seed,
+                        src_kf_poses, tgt_kf_poses,
+                        src_imgs, tgt_imgs,
+                        init_guess,
+                    )
+                    if result["success"]:
+                        metrics = result["metrics"]
+                        Log(
+                            f"[Reloc3R] 子图 {source_id}->{target_id} "
+                            f"method={metrics.get('method')} scale={metrics.get('scale_value', 0):.3f}"
+                        )
+                        return result["T_tgt_src"], result["information"], True, metrics
+                    Log(f"[Reloc3R] 子图 {source_id}->{target_id} failed: {metrics.get('failure_reason', 'unknown')}")
+                else:
+                    Log(f"[Reloc3R] adapter not initialized, falling through to GSReg/ICP")
+
             if (reg_method == "2dgs_gsreg" and src_ckpt and tgt_ckpt
                     and os.path.exists(src_ckpt) and os.path.exists(tgt_ckpt)):
                 # Merge camera intrinsics into the LC config for viewpoint construction
