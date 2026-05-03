@@ -205,6 +205,10 @@ LoopClosure:
   max_loop_delta_t_for_pgo: 1.5
   max_loop_delta_r_for_pgo: 45.0
 
+  # Reloc3R edge quality filters
+  min_raw_vs_init_dot_for_pgo: 0.7
+  max_loop_delta_t_for_pgo_reloc3r: 2.0
+
 # ============================================================
 # Gaussian Optimization Parameters
 # ============================================================

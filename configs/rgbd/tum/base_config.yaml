@@ -173,7 +173,7 @@ LoopClosure:
   icp_fitness_threshold: 0.40
 
   # ===== PGO Parameters =====
-  default_odom_info_scale: 120.0
+  default_odom_info_scale: 60.0 #20-40-60
   recent_query_submaps: 4
   pgo_edge_prune_thres: 0.25
 
@@ -196,12 +196,21 @@ LoopClosure:
     max_pair_rot_std_deg: 15.0
     max_pair_trans_angle_std_deg: 25.0
 
+  # ===== PGO safety valve =====
+  pgo_safety:
+    enabled: true
+    max_correction_t: 2.0
+
   # PGO protection
   debug_disable_pgo_for_fftvo_test: false
   min_loop_fitness_for_pgo: 0.60
   max_loop_rmse_for_pgo: 0.03
   max_loop_delta_t_for_pgo: 0.30
   max_loop_delta_r_for_pgo: 10.0
+
+  # Reloc3R edge quality filters
+  min_raw_vs_init_dot_for_pgo: 0.7
+  max_loop_delta_t_for_pgo_reloc3r: 2.0
 
 
 # ============================================================

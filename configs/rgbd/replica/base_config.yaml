@@ -181,10 +181,12 @@ LoopClosure:
 
   # ===== Reloc3R (future replacement for GSReg+ICP) =====
   Reloc3R:
-    enabled: false
+    enabled: true
+    mock_mode: false
     repo_path: third_party/reloc3r
-    checkpoint: Reloc3r-512
-    image_size: 512
+    checkpoint: siyan824/reloc3r-224
+    local_checkpoint: weights/reloc3r-224.pth
+    image_size: 224
     use_amp: true
     device: cuda
     topk_pairs: 5
@@ -203,6 +205,10 @@ LoopClosure:
   max_loop_rmse_for_pgo: 0.022
   max_loop_delta_t_for_pgo: 0.08
   max_loop_delta_r_for_pgo: 5.0
+
+  # Reloc3R edge quality filters
+  min_raw_vs_init_dot_for_pgo: 0.7
+  max_loop_delta_t_for_pgo_reloc3r: 2.0
 
 # ============================================================
 # Gaussian Optimization Parameters

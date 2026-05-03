@@ -152,13 +152,14 @@ class Reloc3RSubmapRegistrator:
         T_tgt_seed_to_kf = np.linalg.inv(C2W_tgt_seed) @ C2W_tgt_kf
         T_src_seed_to_kf = np.linalg.inv(C2W_src_seed) @ C2W_src_kf
 
-        T_s2t = T_tgt_seed_to_kf @ T_cam @ np.linalg.inv(T_src_seed_to_kf)
-        T_s2t = np.array(T_s2t, dtype=np.float64)
+        # init_guess_norm: scale Reloc3R's translation first, then chain
+        raw_norm = float(np.linalg.norm(T_cam[:3, 3]))
+        scale = init_norm / raw_norm if raw_norm > 1e-6 else 1.0
+        T_cam_scaled = T_cam.copy()
+        T_cam_scaled[:3, 3] *= scale
 
-        # init_guess_norm: odometry chain provides metric translation scale
-        reloc3r_norm = float(np.linalg.norm(T_s2t[:3, 3]))
-        scale = init_norm / reloc3r_norm if reloc3r_norm > 1e-6 else 1.0
-        T_s2t[:3, 3] *= scale
+        T_s2t = T_tgt_seed_to_kf @ T_cam_scaled @ np.linalg.inv(T_src_seed_to_kf)
+        T_s2t = np.array(T_s2t, dtype=np.float64)
         return T_s2t, scale
 
     # ---- consistency verification ----
@@ -250,6 +251,23 @@ class Reloc3RSubmapRegistrator:
             if T_cam is None:
                 continue
 
+            # ---- Reloc3R raw output diagnostic ----
+            raw_R_det = float(np.linalg.det(T_cam[:3, :3]))
+            raw_t_vec = T_cam[:3, 3].copy()
+            raw_t_norm = float(np.linalg.norm(raw_t_vec))
+            raw_t_unit = raw_t_vec / (raw_t_norm + 1e-8) if raw_t_norm > 1e-8 else raw_t_vec
+            init_gt_vec = init_guess[:3, 3].copy()
+            init_gt_norm = float(np.linalg.norm(init_gt_vec))
+            init_gt_unit = init_gt_vec / (init_gt_norm + 1e-8) if init_gt_norm > 1e-8 else init_gt_vec
+            raw_vs_init_dot = float(np.dot(raw_t_unit, init_gt_unit))
+            Log(f"[Reloc3R-Diag] pair ({src_kf},{tgt_kf}): "
+                f"input_order=view1(tgt)_view2(src) "
+                f"raw_R_det={raw_R_det:.4f} raw_t_norm={raw_t_norm:.3f}m "
+                f"raw_t_unit=[{raw_t_unit[0]:.3f},{raw_t_unit[1]:.3f},{raw_t_unit[2]:.3f}] "
+                f"init_guess_t_unit=[{init_gt_unit[0]:.3f},{init_gt_unit[1]:.3f},{init_gt_unit[2]:.3f}] "
+                f"raw_vs_init_dot={raw_vs_init_dot:.3f} "
+                f"raw_vs_init_ratio={raw_t_norm / (init_gt_norm + 1e-8):.3f}")
+
             try:
                 T_sub, scale = self._pair_to_submap_transform(
                     T_cam, src_kf, tgt_kf,
@@ -257,12 +275,26 @@ class Reloc3RSubmapRegistrator:
                     source_keyframe_poses, target_keyframe_poses,
                     init_norm)
                 candidates.append({"T": T_sub, "src_kf": src_kf, "tgt_kf": tgt_kf,
-                                   "scale": scale})
+                                   "scale": scale, "raw_vs_init_dot": raw_vs_init_dot})
+
+                # ---- Post-transform diagnostic ----
+                dr_vs_init = self._rot_error_deg(
+                    np.vstack([np.hstack([T_sub[:3,:3], np.zeros((3,1), dtype=T_sub.dtype)]),
+                               np.array([[0,0,0,1]], dtype=T_sub.dtype)]),
+                    init_guess)
+                dt_vs_init = float(np.linalg.norm((T_sub @ np.linalg.inv(init_guess))[:3, 3]))
+                Log(f"[Reloc3R-Diag] pair ({src_kf},{tgt_kf}) post_transform: "
+                    f"T_s2t_norm={float(np.linalg.norm(T_sub[:3,3])):.3f}m "
+                    f"scale={scale:.3f} dt_vs_init={dt_vs_init:.3f}m dr_vs_init={dr_vs_init:.1f}deg")
             except Exception as e:
                 Log(f"[Reloc3R] pair ({src_kf},{tgt_kf}) transform error: {e}")
                 continue
 
         Log(f"[Reloc3R] {source_id}->{target_id}: {len(candidates)}/{len(pairs)} valid pairs")
+
+        # Aggregate raw Reloc3R direction alignment across pairs
+        min_raw_dot = min((c["raw_vs_init_dot"] for c in candidates), default=None)
+        mean_raw_dot = float(np.mean([c["raw_vs_init_dot"] for c in candidates])) if candidates else None
 
         # Top-K consistency or single-pair fallback
         if len(candidates) >= 2:
@@ -291,7 +323,9 @@ class Reloc3RSubmapRegistrator:
                          "delta_t": dt, "delta_r": dr,
                          "failure_reason": "delta_too_large",
                          "rot_std_deg": consistency.get("rot_std_deg"),
-                         "trans_dir_std_deg": consistency.get("trans_dir_std_deg")}
+                         "trans_dir_std_deg": consistency.get("trans_dir_std_deg"),
+                         "min_raw_vs_init_dot": min_raw_dot,
+                         "mean_raw_vs_init_dot": mean_raw_dot}
             return {"success": False, "T_tgt_src": np.eye(4), "information": np.eye(6),
                     "metrics": r_metrics}
 
@@ -318,6 +352,8 @@ class Reloc3RSubmapRegistrator:
                 "rot_std_deg": consistency.get("rot_std_deg"),
                 "trans_dir_std_deg": consistency.get("trans_dir_std_deg"),
                 "pair_kf_ids": consistency.get("pair_kf_ids", []),
+                "min_raw_vs_init_dot": min_raw_dot,
+                "mean_raw_vs_init_dot": mean_raw_dot,
             },
         }
 

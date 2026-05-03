@@ -251,6 +251,14 @@ class LoopClosureProcess(mp.Process):
             "max_loop_delta_r_for_pgo", 45.0
         )
 
+        # ===== Reloc3R edge quality filters =====
+        self.min_raw_vs_init_dot_for_pgo = self.config.get("LoopClosure", {}).get(
+            "min_raw_vs_init_dot_for_pgo", 0.7
+        )
+        self.max_loop_delta_t_for_pgo_reloc3r = self.config.get("LoopClosure", {}).get(
+            "max_loop_delta_t_for_pgo_reloc3r", 2.0
+        )
+
         # PGO 增量门控：仅在新 loop edge 出现时运行
         self.last_loop_edge_count = 0
 
@@ -404,11 +412,13 @@ class LoopClosureProcess(mp.Process):
         trace_val = np.clip((np.trace(R) - 1.0) * 0.5, -1.0, 1.0)
         return np.degrees(np.arccos(trace_val))
 
-    def compute_relative_transform(self, source_id, target_id, current_pose_guesses):
+    def compute_relative_transform(self, source_id, target_id, current_pose_guesses,
+                                    init_guess_override=None):
         try:
+            pose_ref = init_guess_override if init_guess_override is not None else current_pose_guesses
             init_guess = (
-                    np.linalg.inv(current_pose_guesses[target_id]) @
-                    current_pose_guesses[source_id]
+                    np.linalg.inv(pose_ref[target_id]) @
+                    pose_ref[source_id]
             )
 
             # 2DGS-GSReg registration (LoopSplat-style render-based)
@@ -677,19 +687,35 @@ class LoopClosureProcess(mp.Process):
                     delta_t = metrics.get("delta_t", 99)
                     delta_r = metrics.get("delta_r", 999)
 
+                    is_reloc3r = metrics.get("method", "").startswith("reloc3r")
                     if fitness < self.min_loop_fitness_for_pgo:
                         Log(f"[LoopClosure] 回环边 {query_id}<->{target_id} PGO过滤: "
                             f"fitness={fitness:.3f} < {self.min_loop_fitness_for_pgo}")
                     elif rmse > self.max_loop_rmse_for_pgo:
                         Log(f"[LoopClosure] 回环边 {query_id}<->{target_id} PGO过滤: "
                             f"rmse={rmse:.4f} > {self.max_loop_rmse_for_pgo}")
-                    elif delta_t > self.max_loop_delta_t_for_pgo:
+                    elif is_reloc3r and metrics.get("min_raw_vs_init_dot", 1.0) is not None \
+                            and metrics.get("min_raw_vs_init_dot", 1.0) < self.min_raw_vs_init_dot_for_pgo:
+                        Log(f"[LoopClosure] 回环边 {query_id}<->{target_id} PGO过滤: "
+                            f"raw_vs_init_dot={metrics['min_raw_vs_init_dot']:.3f} < {self.min_raw_vs_init_dot_for_pgo}")
+                    elif is_reloc3r and delta_t is not None \
+                            and delta_t > self.max_loop_delta_t_for_pgo_reloc3r:
+                        Log(f"[LoopClosure] 回环边 {query_id}<->{target_id} PGO过滤: "
+                            f"delta_t={delta_t:.3f}m > {self.max_loop_delta_t_for_pgo_reloc3r} (reloc3r)")
+                    elif not is_reloc3r and delta_t > self.max_loop_delta_t_for_pgo:
                         Log(f"[LoopClosure] 回环边 {query_id}<->{target_id} PGO过滤: "
                             f"delta_t={delta_t:.3f}m > {self.max_loop_delta_t_for_pgo}")
                     elif delta_r > self.max_loop_delta_r_for_pgo:
                         Log(f"[LoopClosure] 回环边 {query_id}<->{target_id} PGO过滤: "
                             f"delta_r={delta_r:.2f}deg > {self.max_loop_delta_r_for_pgo}")
                     else:
+                        # Open3D convention: node_j = node_i @ T_ij
+                        # Reloc3R outputs T_source_to_target = inv(C2W_tgt) @ C2W_src
+                        # Open3D needs T_ij = inv(C2W_src) @ C2W_tgt = inv(T_source_to_target)
+                        if is_reloc3r:
+                            t_before = float(np.linalg.norm(trans[:3, 3]))
+                            trans = np.linalg.inv(trans)
+                            t_after = float(np.linalg.norm(trans[:3, 3]))
                         pose_graph.edges.append(
                             o3d.pipelines.registration.PoseGraphEdge(
                                 id_mapping[query_id],
@@ -700,7 +726,11 @@ class LoopClosureProcess(mp.Process):
                             )
                         )
                         loop_edges_added += 1
-                        Log(f"[LoopClosure] 添加回环边: 子图 {query_id} <-> {target_id}")
+                        if is_reloc3r:
+                            Log(f"[LoopClosure] 添加回环边: 子图 {query_id} <-> {target_id} "
+                                f"(trans_original_t={t_before:.3f}m → inverted_t={t_after:.3f}m)")
+                        else:
+                            Log(f"[LoopClosure] 添加回环边: 子图 {query_id} <-> {target_id}")
 
         if loop_edges_added < 3:
             Log(f"[LoopClosure] 回环边不足 ({loop_edges_added} < 3)，跳过 full-graph PGO")
@@ -711,6 +741,9 @@ class LoopClosureProcess(mp.Process):
             return []
 
         Log(f"[LoopClosure] 检测到有效闭环，启动全图 PGO ({len(all_submap_ids)} 个子图)...")
+        for sid in all_submap_ids[:4]:
+            t = float(np.linalg.norm(current_pose_guesses[sid][:3, 3]))
+            Log(f"[LoopClosure] PGO前 submap {sid} pose: t={t:.3f}m")
 
         prune_threshold = self.config.get("LoopClosure", {}).get("pgo_edge_prune_thres", 0.25)
         option = o3d.pipelines.registration.GlobalOptimizationOption(
@@ -735,6 +768,36 @@ class LoopClosureProcess(mp.Process):
                 "submap_id": sid,
                 "correct_tsfm": correction,
             })
+
+        # PGO safety valve: reject if any correction exceeds max threshold
+        safety_cfg = self.config.get("LoopClosure", {}).get("pgo_safety", {})
+        if safety_cfg.get("enabled", False):
+            max_correction_t = safety_cfg.get("max_correction_t", 1.0)
+            for c in correction_list:
+                dt = np.linalg.norm(c["correct_tsfm"][:3, 3])
+                if dt > max_correction_t:
+                    Log(f"[LoopClosure] PGO safety: submap {c['submap_id']} correction dt={dt:.3f}m > {max_correction_t}m, REJECTING PGO")
+                    return []
+            Log("[LoopClosure] PGO safety: all corrections within threshold, accepted")
+
+        # PGO summary: per-submap corrections + aggregate stats
+        corrections_t = [np.linalg.norm(c["correct_tsfm"][:3, 3]) for c in correction_list]
+        corrections_r = [
+            self._rotation_error_deg(c["correct_tsfm"], np.eye(4))
+            for c in correction_list
+        ]
+        Log(f"[LoopClosure] PGO summary: {len(correction_list)} submaps, "
+            f"{loop_edges_added} loop edges, "
+            f"mean_correction_t={np.mean(corrections_t):.3f}m "
+            f"max_correction_t={np.max(corrections_t):.3f}m "
+            f"mean_correction_r={np.mean(corrections_r):.1f}deg "
+            f"max_correction_r={np.max(corrections_r):.1f}deg")
+        for i, sid in enumerate(all_submap_ids):
+            opt_pose = np.array(pose_graph.nodes[i].pose, dtype=np.float64)
+            opt_t = float(np.linalg.norm(opt_pose[:3, 3]))
+            pre_t = float(np.linalg.norm(current_pose_guesses[sid][:3, 3]))
+            Log(f"[LoopClosure] PGO后 submap {sid}: t={opt_t:.3f}m "
+                f"(delta={opt_t - pre_t:+.3f}m, corr_t={corrections_t[i]:.3f}m)")
 
         self.last_loop_edge_count = loop_edges_added
         return correction_list
