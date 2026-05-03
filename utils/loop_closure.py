@@ -262,6 +262,7 @@ class LoopClosureProcess(mp.Process):
         self.submap_seed_c2w = {}          # {submap_id: 4x4 np.array}
         self.submap_keyframe_poses = {}    # {submap_id: {kf_idx: 4x4 np.array}}
         self.submap_image_paths = {}       # {submap_id: [str, ...]}
+
         self.reloc3r_registrator = None
         if self.reloc3r_enabled:
             Log(f"[Reloc3R] config loaded (model NOT loaded in Stage 1) mode={reloc3r_cfg.get('scale_mode')}")

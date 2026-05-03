@@ -796,7 +796,8 @@ class BackEnd(mp.Process):
                     kf_image_paths = []
                     if len(submap_keyframes) > 0:
                         for kf_idx in submap_keyframes:
-                            kf_image = self.viewpoints[kf_idx].original_image.cpu()
+                            vp = self.viewpoints[kf_idx]
+                            kf_image = vp.original_image.cpu()
                             img_path = os.path.join(submaps_dir, f"{self.current_submap_id:06d}_img_{kf_idx}.pt")
                             torch.save(kf_image, img_path)
                             kf_image_paths.append(img_path)
@@ -964,7 +965,8 @@ class BackEnd(mp.Process):
                     kf_image_paths = []
                     if len(submap_keyframes) > 0:
                         for kf_idx in submap_keyframes:
-                            kf_image = self.viewpoints[kf_idx].original_image.cpu()
+                            vp = self.viewpoints[kf_idx]
+                            kf_image = vp.original_image.cpu()
                             img_path = os.path.join(submaps_dir, f"{completed_submap_id:06d}_img_{kf_idx}.pt")
                             torch.save(kf_image, img_path)
                             kf_image_paths.append(img_path)

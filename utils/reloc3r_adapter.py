@@ -142,7 +142,7 @@ class Reloc3RSubmapRegistrator:
     def _pair_to_submap_transform(self, T_cam, src_kf_id, tgt_kf_id,
                                    source_seed_c2w, target_seed_c2w,
                                    source_keyframe_poses, target_keyframe_poses,
-                                   init_norm):
+                                   init_norm, src_img_path=None, tgt_img_path=None):
         """Convert image-pair pose to submap-level T_source_to_target with scale."""
         C2W_src_seed = np.array(source_seed_c2w, dtype=np.float64)
         C2W_tgt_seed = np.array(target_seed_c2w, dtype=np.float64)
@@ -155,6 +155,7 @@ class Reloc3RSubmapRegistrator:
         T_s2t = T_tgt_seed_to_kf @ T_cam @ np.linalg.inv(T_src_seed_to_kf)
         T_s2t = np.array(T_s2t, dtype=np.float64)
 
+        # init_guess_norm: odometry chain provides metric translation scale
         reloc3r_norm = float(np.linalg.norm(T_s2t[:3, 3]))
         scale = init_norm / reloc3r_norm if reloc3r_norm > 1e-6 else 1.0
         T_s2t[:3, 3] *= scale
@@ -310,7 +311,7 @@ class Reloc3RSubmapRegistrator:
                 "rmse": 0.0,
                 "num_pairs": n_pairs,
                 "num_valid_pairs": n_valid,
-                "scale_mode": self.scale_mode,
+                "scale_mode": "init_guess_norm",
                 "scale_value": float(np.linalg.norm(best_T[:3, 3])),
                 "delta_t": dt, "delta_r": dr,
                 "failure_reason": None,

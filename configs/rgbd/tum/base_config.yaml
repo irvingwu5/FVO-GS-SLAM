@@ -191,7 +191,6 @@ LoopClosure:
     min_valid_pairs: 2
     pair_selection: cosplace_cross_similarity
     scale_mode: init_guess_norm
-    depth_scale_check: false
     max_delta_t: 2.0
     max_delta_r_deg: 45.0
     max_pair_rot_std_deg: 15.0
