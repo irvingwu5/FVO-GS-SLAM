@@ -1,5 +1,5 @@
 # utils/reloc3r_adapter.py
-# Stage 3: real Reloc3R single-pair inference with init_guess_norm scale.
+# Stage 4: top-K keyframe pairs + consistency verification.
 
 import os
 import sys
@@ -21,15 +21,12 @@ _IMG_TRANSFORM = T.Compose([
 
 
 def _load_image_as_tensor(img_path, device="cuda"):
-    """Load a keyframe image from .pt file and convert to RGB tensor [1,3,H,W]."""
-    img = torch.load(img_path, map_location="cpu")  # [3, H, W] float32 [0,1]
+    img = torch.load(img_path, map_location="cpu")
     img = _IMG_TRANSFORM(img).unsqueeze(0)
     return img
 
 
 def _load_reloc3r_model(config):
-    """Load Reloc3R model once. Called lazily on first use.
-    Priority: local checkpoint > HF hub > mock fallback."""
     global _RELOC3R_MODEL
     if _RELOC3R_MODEL is not None:
         return _RELOC3R_MODEL
@@ -48,7 +45,6 @@ def _load_reloc3r_model(config):
     image_size = config.get("image_size", 224)
     local_path = config.get("local_checkpoint", "")
 
-    # 优先加载本地 checkpoint（绕过 HF hub 下载）
     if local_path and os.path.isfile(local_path):
         Log(f"[Reloc3R] loading from local checkpoint: {local_path}")
         try:
@@ -64,7 +60,6 @@ def _load_reloc3r_model(config):
         except Exception as e:
             Log(f"[Reloc3R] local checkpoint load failed: {e}. Trying HF hub...")
 
-    # 回退 HF hub
     checkpoint = config.get("checkpoint", "siyan824/reloc3r-224")
     Log(f"[Reloc3R] loading model from HF hub: {checkpoint} ...")
     try:
@@ -81,11 +76,7 @@ def _load_reloc3r_model(config):
 
 
 class Reloc3RSubmapRegistrator:
-    """
-    Reloc3R-based submap registration backend.
-
-    Stage 3: real model loading (lazy) + single-pair inference + scale conversion.
-    """
+    """Reloc3R-based submap registration backend. Stage 4: top-K pairs + consistency."""
 
     def __init__(self, config):
         self.config = config
@@ -94,6 +85,8 @@ class Reloc3RSubmapRegistrator:
         self.scale_mode = config.get("scale_mode", "init_guess_norm")
         self.max_delta_t = config.get("max_delta_t", 2.0)
         self.max_delta_r_deg = config.get("max_delta_r_deg", 45.0)
+        self.max_pair_rot_std_deg = config.get("max_pair_rot_std_deg", 15.0)
+        self.max_pair_trans_angle_std_deg = config.get("max_pair_trans_angle_std_deg", 25.0)
         self.use_amp = config.get("use_amp", True)
         self.image_size = config.get("image_size", 224)
         self.mock_mode = config.get("mock_mode", False)
@@ -105,6 +98,116 @@ class Reloc3RSubmapRegistrator:
         if self.model is None:
             self.model = _load_reloc3r_model(self.config)
         return self.model
+
+    # ---- top-K pair construction ----
+
+    def _build_pair_candidates(self, src_img_paths, tgt_img_paths,
+                                src_kf_ids, tgt_kf_ids, K):
+        """Build up to K keyframe pairs, preferring tail source kfs × tail target kfs."""
+        pairs = []
+        src_ids = sorted(src_kf_ids)
+        tgt_ids = sorted(tgt_kf_ids)
+        n_src = min(len(src_ids), K)
+        n_tgt = min(len(tgt_ids), K)
+
+        for i, si in enumerate(src_ids[-n_src:]):
+            for j, ti in enumerate(tgt_ids[-n_tgt:]):
+                if len(pairs) >= K:
+                    break
+                pairs.append((int(si), src_img_paths[src_ids.index(si)]
+                                          if src_ids.index(si) < len(src_img_paths) else src_img_paths[-1],
+                              int(ti), tgt_img_paths[tgt_ids.index(ti)]
+                                          if tgt_ids.index(ti) < len(tgt_img_paths) else tgt_img_paths[-1]))
+            if len(pairs) >= K:
+                break
+        return pairs
+
+    # ---- single-pair inference core ----
+
+    def _infer_single_pair(self, model, src_img_path, tgt_img_path):
+        """Returns T_cam1_from_cam2 (src_cam → tgt_cam) or None."""
+        img1 = _load_image_as_tensor(tgt_img_path, self.config.get("device", "cuda"))
+        img2 = _load_image_as_tensor(src_img_path, self.config.get("device", "cuda"))
+        H, W = self.image_size, self.image_size
+        view1 = {"img": img1.cuda(), "true_shape": torch.tensor([[H, W]]).cuda()}
+        view2 = {"img": img2.cuda(), "true_shape": torch.tensor([[H, W]]).cuda()}
+
+        with torch.inference_mode():
+            with torch.cuda.amp.autocast(enabled=bool(self.use_amp)):
+                _, pose2 = model(view1, view2)
+        T = pose2["pose"].cpu().numpy().squeeze()
+        del img1, img2, view1, view2, pose2
+        return T if self._sanity_check(T) else None
+
+    def _pair_to_submap_transform(self, T_cam, src_kf_id, tgt_kf_id,
+                                   source_seed_c2w, target_seed_c2w,
+                                   source_keyframe_poses, target_keyframe_poses,
+                                   init_norm):
+        """Convert image-pair pose to submap-level T_source_to_target with scale."""
+        C2W_src_seed = np.array(source_seed_c2w, dtype=np.float64)
+        C2W_tgt_seed = np.array(target_seed_c2w, dtype=np.float64)
+        C2W_src_kf = np.array(source_keyframe_poses[src_kf_id], dtype=np.float64)
+        C2W_tgt_kf = np.array(target_keyframe_poses[tgt_kf_id], dtype=np.float64)
+
+        T_tgt_seed_to_kf = np.linalg.inv(C2W_tgt_seed) @ C2W_tgt_kf
+        T_src_seed_to_kf = np.linalg.inv(C2W_src_seed) @ C2W_src_kf
+
+        T_s2t = T_tgt_seed_to_kf @ T_cam @ np.linalg.inv(T_src_seed_to_kf)
+        T_s2t = np.array(T_s2t, dtype=np.float64)
+
+        reloc3r_norm = float(np.linalg.norm(T_s2t[:3, 3]))
+        scale = init_norm / reloc3r_norm if reloc3r_norm > 1e-6 else 1.0
+        T_s2t[:3, 3] *= scale
+        return T_s2t, scale
+
+    # ---- consistency verification ----
+
+    def _verify_consistency(self, candidates, init_guess):
+        """Check rotation/translation consistency across candidate transforms.
+        Returns (best_T, metrics) or (None, fail_metrics)."""
+        n = len(candidates)
+        if n < self.min_valid_pairs:
+            return None, {"failure_reason": f"too_few_valid_pairs_{n}"}
+
+        rotations = np.stack([c["T"][:3, :3] for c in candidates])
+        translations = np.stack([c["T"][:3, 3] for c in candidates])
+
+        # Rotation consistency: pairwise angular difference std
+        rot_angles = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                dr = self._rot_error_deg(
+                    np.vstack([np.hstack([rotations[i], np.zeros((3, 1))]),
+                               np.array([[0, 0, 0, 1]])]),
+                    np.vstack([np.hstack([rotations[j], np.zeros((3, 1))]),
+                               np.array([[0, 0, 0, 1]])]))
+                rot_angles.append(dr)
+        rot_std = float(np.std(rot_angles)) if rot_angles else 0.0
+
+        # Translation direction angular std
+        trans_dirs = translations / (np.linalg.norm(translations, axis=1, keepdims=True) + 1e-8)
+        mean_dir = np.mean(trans_dirs, axis=0)
+        mean_dir /= np.linalg.norm(mean_dir) + 1e-8
+        dir_angles = [float(np.degrees(np.arccos(np.clip(np.dot(d, mean_dir), -1.0, 1.0))))
+                      for d in trans_dirs]
+        dir_std = float(np.std(dir_angles))
+
+        if rot_std > self.max_pair_rot_std_deg:
+            return None, {"failure_reason": f"rot_std_{rot_std:.1f}deg", "num_valid_pairs": n,
+                          "rot_std_deg": rot_std}
+        if dir_std > self.max_pair_trans_angle_std_deg:
+            return None, {"failure_reason": f"trans_dir_std_{dir_std:.1f}deg", "num_valid_pairs": n,
+                          "rot_std_deg": rot_std, "trans_dir_std_deg": dir_std}
+
+        # Select best: closest rotation to mean, then average translation
+        best_idx = int(np.argmin(dir_angles))
+        best_T = candidates[best_idx]["T"]
+
+        return best_T, {"num_valid_pairs": n, "rot_std_deg": rot_std,
+                        "trans_dir_std_deg": dir_std, "best_pair_idx": best_idx,
+                        "pair_kf_ids": [(c["src_kf"], c["tgt_kf"]) for c in candidates]}
+
+    # ---- main entry ----
 
     def register_submaps(
         self,
@@ -123,87 +226,97 @@ class Reloc3RSubmapRegistrator:
             return self._mock_result(source_id, target_id, init_guess,
                                      source_image_paths, target_image_paths)
 
-        # Single-pair: use last source keyframe (closest to seed in time)
-        # and CosPlace top-1 target keyframe (the most similar one)
-        src_img_path = source_image_paths[-1]
-        tgt_img_path = target_image_paths[0]
-        src_kf_id = max(source_keyframe_poses.keys()) if source_keyframe_poses else None
-        tgt_kf_id = min(target_keyframe_poses.keys()) if target_keyframe_poses else None
+        init_norm = float(np.linalg.norm(init_guess[:3, 3]))
+        src_kf_ids = sorted(source_keyframe_poses.keys())
+        tgt_kf_ids = sorted(target_keyframe_poses.keys())
 
-        if src_kf_id is None or tgt_kf_id is None:
+        if len(src_kf_ids) == 0 or len(tgt_kf_ids) == 0:
             return self._fail_result("missing_keyframe_pose")
 
-        try:
-            # view1=tgt, view2=src → reloc3r pose2to1 maps src_cam→tgt_cam
-            img1 = _load_image_as_tensor(tgt_img_path, self.config.get("device", "cuda"))
-            img2 = _load_image_as_tensor(src_img_path, self.config.get("device", "cuda"))
-            H, W = self.image_size, self.image_size
-            view1 = {"img": img1.cuda(), "true_shape": torch.tensor([[H, W]]).cuda()}
-            view2 = {"img": img2.cuda(), "true_shape": torch.tensor([[H, W]]).cuda()}
+        # Build top-K pairs
+        pairs = self._build_pair_candidates(
+            source_image_paths, target_image_paths, src_kf_ids, tgt_kf_ids,
+            K=self.topk_pairs)
 
-            with torch.inference_mode():
-                with torch.cuda.amp.autocast(enabled=bool(self.use_amp)):
-                    _, pose2 = model(view1, view2)
-            T_cam1_from_cam2 = pose2["pose"].cpu().numpy().squeeze()  # 4x4
-            del img1, img2, view1, view2, pose2
-        except Exception as e:
-            Log(f"[Reloc3R] inference error {source_id}->{target_id}: {e}")
-            return self._fail_result(f"inference_error_{e}")
+        # Run inference on each pair
+        candidates = []
+        for src_kf, src_img, tgt_kf, tgt_img in pairs:
+            try:
+                T_cam = self._infer_single_pair(model, src_img, tgt_img)
+            except Exception as e:
+                Log(f"[Reloc3R] pair ({src_kf},{tgt_kf}) inference error: {e}")
+                continue
+            if T_cam is None:
+                continue
 
-        # Sanity checks
-        if not self._sanity_check(T_cam1_from_cam2):
-            return self._fail_result("sanity_check_failed")
+            try:
+                T_sub, scale = self._pair_to_submap_transform(
+                    T_cam, src_kf, tgt_kf,
+                    source_seed_c2w, target_seed_c2w,
+                    source_keyframe_poses, target_keyframe_poses,
+                    init_norm)
+                candidates.append({"T": T_sub, "src_kf": src_kf, "tgt_kf": tgt_kf,
+                                   "scale": scale})
+            except Exception as e:
+                Log(f"[Reloc3R] pair ({src_kf},{tgt_kf}) transform error: {e}")
+                continue
 
-        # Convert image-pair pose → submap-level T_source_to_target:
-        # T_cam1_from_cam2 = camera pose of src_kf in tgt_kf camera frame
-        # T_source_to_target = T_tgt_seed_to_kf @ T_cam1_from_cam2 @ inv(T_src_seed_to_kf)
-        C2W_src_seed = np.array(source_seed_c2w, dtype=np.float64)
-        C2W_tgt_seed = np.array(target_seed_c2w, dtype=np.float64)
-        C2W_src_kf = np.array(source_keyframe_poses[src_kf_id], dtype=np.float64)
-        C2W_tgt_kf = np.array(target_keyframe_poses[tgt_kf_id], dtype=np.float64)
+        Log(f"[Reloc3R] {source_id}->{target_id}: {len(candidates)}/{len(pairs)} valid pairs")
 
-        T_tgt_seed_to_kf = np.linalg.inv(C2W_tgt_seed) @ C2W_tgt_kf      # T_tgt_seed→kf
-        T_src_seed_to_kf = np.linalg.inv(C2W_src_seed) @ C2W_src_kf      # T_src_seed→kf
-
-        T_source_to_target = T_tgt_seed_to_kf @ T_cam1_from_cam2 @ np.linalg.inv(T_src_seed_to_kf)
-        T_source_to_target = np.array(T_source_to_target, dtype=np.float64)
-
-        # Scale: use init_guess_norm
-        init_norm = float(np.linalg.norm(init_guess[:3, 3]))
-        reloc3r_norm = float(np.linalg.norm(T_source_to_target[:3, 3]))
-        if reloc3r_norm > 1e-6:
-            scale = init_norm / reloc3r_norm
+        # Top-K consistency or single-pair fallback
+        if len(candidates) >= 2:
+            best_T, consistency = self._verify_consistency(candidates, init_guess)
+        elif len(candidates) == 1:
+            best_T = candidates[0]["T"]
+            consistency = {"num_valid_pairs": 1, "rot_std_deg": 0.0,
+                           "trans_dir_std_deg": 0.0, "best_pair_idx": 0,
+                           "pair_kf_ids": [(candidates[0]["src_kf"], candidates[0]["tgt_kf"])]}
         else:
-            scale = 1.0
-        T_source_to_target[:3, 3] *= scale
+            return self._fail_result("no_valid_pairs")
 
-        dt = float(np.linalg.norm((T_source_to_target @ np.linalg.inv(init_guess))[:3, 3]))
-        dr = self._rot_error_deg(T_source_to_target, init_guess)
+        if best_T is None:
+            return self._fail_result(consistency.get("failure_reason", "consistency_failed"))
+
+        dt = float(np.linalg.norm((best_T @ np.linalg.inv(init_guess))[:3, 3]))
+        dr = self._rot_error_deg(best_T, init_guess)
 
         if dt > self.max_delta_t or dr > self.max_delta_r_deg:
             Log(f"[Reloc3R] {source_id}->{target_id} rejected: "
-                f"dt={dt:.3f}m dr={dr:.1f}deg > thresholds")
-            return self._fail_result("delta_too_large")
+                f"dt={dt:.3f}m dr={dr:.1f}deg > thresholds "
+                f"(n_pairs={consistency.get('num_valid_pairs', 0)})")
+            r_metrics = {"method": "reloc3r_topk", "num_pairs": len(pairs),
+                         "num_valid_pairs": consistency.get("num_valid_pairs", 0),
+                         "scale_mode": self.scale_mode, "scale_value": None,
+                         "delta_t": dt, "delta_r": dr,
+                         "failure_reason": "delta_too_large",
+                         "rot_std_deg": consistency.get("rot_std_deg"),
+                         "trans_dir_std_deg": consistency.get("trans_dir_std_deg")}
+            return {"success": False, "T_tgt_src": np.eye(4), "information": np.eye(6),
+                    "metrics": r_metrics}
 
         Log(f"[Reloc3R] {source_id}->{target_id} success: "
-            f"dt={dt:.3f}m dr={dr:.1f}deg scale={scale:.3f} "
-            f"init_t={init_norm:.3f}m reloc3r_t_raw={reloc3r_norm:.3f}m")
+            f"dt={dt:.3f}m dr={dr:.1f}deg n_pairs={consistency.get('num_valid_pairs',0)} "
+            f"rot_std={consistency.get('rot_std_deg',0):.1f}deg")
 
+        n_pairs = len(pairs)
+        n_valid = consistency.get("num_valid_pairs", 1)
         return {
             "success": True,
-            "T_tgt_src": T_source_to_target,
+            "T_tgt_src": best_T,
             "information": np.eye(6),
             "metrics": {
-                "method": "reloc3r_single_pair",
-                "num_pairs": 1,
-                "num_valid_pairs": 1,
+                "method": "reloc3r_topk",
+                "fitness": float(n_valid) / max(n_pairs, 1),  # PGO gate needs fitness
+                "rmse": 0.0,
+                "num_pairs": n_pairs,
+                "num_valid_pairs": n_valid,
                 "scale_mode": self.scale_mode,
-                "scale_value": float(scale),
-                "delta_t": dt,
-                "delta_r": dr,
+                "scale_value": float(np.linalg.norm(best_T[:3, 3])),
+                "delta_t": dt, "delta_r": dr,
                 "failure_reason": None,
-                "src_kf": int(src_kf_id),
-                "tgt_kf": int(tgt_kf_id),
+                "rot_std_deg": consistency.get("rot_std_deg"),
+                "trans_dir_std_deg": consistency.get("trans_dir_std_deg"),
+                "pair_kf_ids": consistency.get("pair_kf_ids", []),
             },
         }
 
@@ -216,14 +329,10 @@ class Reloc3RSubmapRegistrator:
     def _sanity_check(self, T):
         det = np.linalg.det(T[:3, :3])
         if abs(det - 1.0) > 0.1:
-            Log(f"[Reloc3R] sanity failed: rotation det={det:.3f}")
             return False
         if np.any(np.isnan(T)) or np.any(np.isinf(T)):
-            Log("[Reloc3R] sanity failed: NaN/Inf in pose")
             return False
-        t_norm = np.linalg.norm(T[:3, 3])
-        if t_norm < 1e-8:
-            Log("[Reloc3R] sanity failed: zero translation")
+        if np.linalg.norm(T[:3, 3]) < 1e-8:
             return False
         return True
 
@@ -237,8 +346,7 @@ class Reloc3RSubmapRegistrator:
             "metrics": {
                 "method": "reloc3r_mock",
                 "num_pairs": 0, "num_valid_pairs": 0,
-                "scale_mode": self.scale_mode,
-                "scale_value": t,
+                "scale_mode": self.scale_mode, "scale_value": t,
                 "delta_t": 0.0, "delta_r": 0.0,
                 "failure_reason": None,
             },
@@ -247,14 +355,11 @@ class Reloc3RSubmapRegistrator:
     def _fail_result(self, reason):
         return {
             "success": False,
-            "T_tgt_src": np.eye(4),
-            "information": np.eye(6),
+            "T_tgt_src": np.eye(4), "information": np.eye(6),
             "metrics": {
-                "method": "reloc3r_single_pair",
-                "num_pairs": 1, "num_valid_pairs": 0,
+                "num_pairs": 0, "num_valid_pairs": 0,
                 "scale_mode": self.scale_mode,
-                "scale_value": None,
-                "delta_t": None, "delta_r": None,
+                "scale_value": None, "delta_t": None, "delta_r": None,
                 "failure_reason": reason,
             },
         }
