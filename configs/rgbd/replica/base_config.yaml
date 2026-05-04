@@ -148,7 +148,58 @@ Submap:
 # ============================================================
 LoopClosure:
   registration_method: "2dgs_gsreg"  # choices: icp, 2dgs_gsreg
+
+  # ===== Stage 0: LoopClosure mode control =====
+  mode: verify_only  # choices: off, detect_only, verify_only, keyframe_pgo
+  legacy_submap_pgo_enabled: false
+  pgo_granularity: keyframe
+
+  # ===== Stage 2: Keyframe retrieval =====
+  keyframe_retrieval_top_k: 10
+  keyframe_retrieval_min_score: 0.50
+  keyframe_retrieval_min_temporal_gap: 10
+  keyframe_retrieval_mutual_nearest: true
+  keyframe_retrieval_mutual_top_n: 20
+
+  # ===== Stage 4: Depth verification =====
+  depth_verify:
+    enabled: true
+    min_overlap: 0.20
+    max_depth_rmse: 0.06
+    min_inlier_ratio: 0.35
+    depth_inlier_threshold: 0.10
+    scale_search_min: 0.1
+    scale_search_max: 20.0
+    depth_sample_count: 5000
+    scale_search_steps: 10
+
+  # ===== Stage 5: Render refinement =====
+  render_refine:
+    enabled: false
+    max_delta_t_from_odom: 1.0
+    max_delta_r_deg_from_odom: 30.0
+    max_final_depth_rmse: 0.05
+    allow_depth_verified_edge_without_render_refine: true
+
+  # ===== Stage 7: Keyframe PGO safety =====
+  keyframe_pgo_odom_info_scale: 100.0
+  keyframe_pgo_handoff_info_scale: 50.0
+  keyframe_pgo_safety:
+    max_correction_t: 0.30
+    max_correction_r_deg: 8.0
+    max_odom_residual_increase_ratio: 1.20
+    min_loop_residual_decrease_ratio: 0.30
+    max_single_loop_residual_after_t: 0.15
+    max_single_loop_residual_after_r_deg: 5.0
+    min_verified_loop_edges: 1
+    max_pgo_retries: 2
+
   allow_identity_loop_init: false
+
+  # ===== Stage 9: Map correction from keyframe PGO =====
+  MapCorrection:
+    mode: submap_median_from_keyframes  # choices: none, submap_median_from_keyframes, owner_keyframe
+    apply_online: false
 
   gsreg_overlap_radius: 0.10
   gsreg_min_overlap: 0.15

@@ -111,14 +111,22 @@ When `use_handoff: true`, the system preserves a small set of boundary Gaussians
 
 The loop closure process runs as an independent process:
 
-1. **Visual retrieval**: Extract CosPlace descriptors (ResNet18 backbone + GeM pooling, weights loaded from disk) from saved keyframe images. Adaptive threshold from self-similarity.
-2. **Reloc3R verification** (lightweight alternative): DUSt3R-variant submap registration via top-K keyframe pairs. Consistency verification on rotation std / translation direction std. `init_guess_norm` scale normalization from odometry chain. `raw_vs_init_dot` filter rejects edges where Reloc3R's raw translation direction contradicts odometry.
-3. **2DGS-GSReg verification**: LoopSplat-style render-based multi-view bidirectional registration. Top-k viewpoint selection, render loss optimization, weighted pose fusion.
-4. **ICP verification** (fallback): Point-to-plane ICP using FDN normals from 2DGS rotation quaternions. Consistency check on delta translation/rotation.
-5. **PGO**: Builds pose graph from odometry edges (`relative_pose`) and loop edges (Reloc3R, GSReg, or ICP). Open3D `GlobalOptimizationLevenbergMarquardt`. Incremental gating avoids re-optimization when no new loop edges appear. Requires ≥3 valid loop edges. PGO safety valve rejects PGO when any submap correction exceeds `max_correction_t`.
-6. **Correction**: Writes `correct_tsfm` to subgraph checkpoints (only on PGO success).
+1. **Visual retrieval**: Extract CosPlace descriptors (ResNet18 backbone + GeM pooling, weights loaded from disk) from saved keyframe images. Adaptive threshold from self-similarity. **Stage 2**: keyframe-level retrieval produces keyframe pair candidates (not submap pairs).
+2. **Reloc3R keyframe pair estimation** (Stage 3): DUSt3R-variant coarse relative pose for each keyframe pair. Raw translation preserved; scale search delegated to depth verification.
+3. **RGB-D depth geometric verification** (Stage 4): Back-project source depth, transform with Reloc3R pose, project to target, compare depth. Log-spaced scale search (0.1-20×) to find optimal scale. Filters pairs by overlap, depth RMSE, and inlier ratio.
+4. **Refinement → VerifiedLoopEdge** (Stage 5): Delta gates (vs odometry, final depth RMSE). Optional 2DGS-GSReg refinement (disabled by default; incompatible with global-coordinate Gaussians). Produces `VerifiedLoopEdge` with `accepted_for_pgo` decision.
+5. **Keyframe pose graph construction** (Stage 6): Nodes = keyframe global C2W (not submap seeds). Edges = temporal (adjacent KFs), handoff (cross-submap boundary), loop (verified closures).
+6. **Keyframe PGO trial + safety evaluation** (Stage 7): Open3D `GlobalOptimizationLevenbergMarquardt` on keyframe graph. Safety gates: max correction t/r, odom residual increase ratio, loop residual decrease ratio, robust edge pruning (max 2 retries). Trial runs in memory only; does NOT write to ckpt by default.
+7. **Trajectory correction** (Stage 8): Accepted PGO → apply per-keyframe corrections (keyframes use optimized_c2w, non-keyframes use nearest-KF correction). Left-multiply: `corrected_c2w = delta @ original_c2w`.
+8. **Gaussian correction** (Stage 9): Per-submap median correction from keyframe corrections. Chordal-mean rotation, element-wise median translation.
 
-Odometry edges pass through validation gates (reject degenerate near-identity edges and implausible large jumps). Loop edges pass method-specific PGO thresholds on fitness, RMSE, delta_t, and delta_r. Reloc3R edges additionally pass `min_raw_vs_init_dot_for_pgo` and `max_loop_delta_t_for_pgo_reloc3r` filters.
+**LoopClosure mode control** (Stage 0):
+- `off`: loop closure process idles
+- `detect_only`: CosPlace retrieval only, no Reloc3R/PGO
+- `verify_only`: retrieval + Reloc3R + depth verify, NO correct_tsfm write
+- `keyframe_pgo`: full pipeline including PGO trial (write only when safety passes)
+
+**Legacy submap PGO** (`construct_and_optimize_pose_graph`) is deprecated and disabled by default (`legacy_submap_pgo_enabled: false`). Keyframe-level PGO is the recommended path.
 
 ### 7. Streaming global fusion
 
@@ -181,8 +189,11 @@ FVO-GS-SLAM
 │   ├── slam_backend.py             # Gaussian mapping, densify/prune, submap save
 │   ├── fft_edge_vo.py              # FFT Edge VO: dense DT alignment + LM optimization
 │   ├── fft_filter.py               # FFT high-frequency mask generation
-│   ├── loop_closure.py             # CosPlace, Reloc3R/GSReg/ICP verification, PGO correction
-│   ├── reloc3r_adapter.py          # Reloc3R top-K pair registration + consistency verification
+│   ├── loop_closure.py             # CosPlace, keyframe retrieval, Reloc3R/depth/PGO pipeline
+│   ├── reloc3r_adapter.py          # Reloc3R keyframe pair coarse pose estimation
+│   ├── keyframe_pgo.py             # keyframe graph build, PGO trial, safety eval, corrections
+│   ├── loop_depth_verifier.py      # RGB-D depth geometric verification with scale search
+│   ├── gaussian_state_manager.py   # active/inactive/handoff Gaussian lifecycle (Stage 10)
 │   ├── registration_2dgs.py        # normal-aware ICP for 2DGS submap registration
 │   ├── gsr_2dgs/                   # LoopSplat-style 2DGS render-based registration
 │   │   ├── solver_2dgs.py          # main registration entry
@@ -239,14 +250,16 @@ BackEnd (independent process)
 LoopClosureProcess (independent process)
     ├── Extract CosPlace descriptors from keyframe images
     ├── Extract point clouds from 2DGS ckpt (FDN normals)
-    ├── Detect loop candidates (cosine similarity + adaptive threshold)
-    ├── Verify: Reloc3R / 2DGS-GSReg / ICP
-    ├── Build + optimize pose graph (Open3D GlobalOptimization)
-    │     Odometry edges from relative_pose
-    │     Loop edges from Reloc3R/GSReg/ICP verification
-    │     Incremental gating: only re-optimize with new edges
-    │     PGO safety valve: reject if correction exceeds threshold
-    └── Write correct_tsfm to submap checkpoints
+    ├── Keyframe-level retrieval → keyframe pair candidates
+    ├── Reloc3R keyframe pair coarse pose estimation
+    ├── RGB-D depth geometric verification with scale search
+    ├── Refine → VerifiedLoopEdge (delta gates)
+    ├── Build keyframe pose graph (temporal/handoff/loop edges)
+    ├── Keyframe PGO trial + safety evaluation
+    │     Open3D LM optimization on keyframe nodes
+    │     Safety gates: max correction, residual ratios, edge pruning
+    ├── If accepted: save keyframe_pgo_result.json
+    └── Legacy submap PGO (deprecated, disabled by default)
     ↓
 Main process after tracking
     ├── Stop backend + loop closure

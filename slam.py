@@ -270,7 +270,12 @@ class SLAM:
 
         frame_to_submap = torch.load(os.path.join(save_dir, "frame_to_submap.pt"))
 
-        # Step A: Read PGO correction matrices (small)
+        # Step A: Read PGO correction matrices (small).
+        # NOTE: correct_tsfm is the LEGACY submap-level PGO correction field.
+        # When keyframe-level PGO is used, corrections are applied separately
+        # via apply_keyframe_pgo_to_trajectory. This field remains for backward
+        # compatibility with old experiments. New experiments using
+        # keyframe-level PGO will have correct_tsfm = identity.
         submap_tsfms = {}
         for ckpt_path in ckpt_files:
             sid = int(os.path.basename(ckpt_path).split('.')[0])
@@ -283,6 +288,45 @@ class SLAM:
             submap_tsfms[sid] = torch.from_numpy(correct_tsfm).float()
             del ckpt
 
+        # Load keyframe PGO result if available (Stage 7+)
+        kf_pgo_path = os.path.join(save_dir, "keyframe_pgo_result.json")
+        kf_pgo_corrections = {}
+        if os.path.isfile(kf_pgo_path):
+            import json
+            with open(kf_pgo_path) as f:
+                kf_pgo_data = json.load(f)
+            if kf_pgo_data.get("accepted"):
+                for kf_str, corr_list in kf_pgo_data.get("keyframe_corrections", {}).items():
+                    kf_pgo_corrections[int(kf_str)] = torch.from_numpy(
+                        np.array(corr_list, dtype=np.float64)
+                    ).float()
+                Log(f"Loaded {len(kf_pgo_corrections)} keyframe PGO corrections from {kf_pgo_path}")
+
+        # Build per-submap median correction from keyframe PGO result
+        submap_kf_corrections = {}
+        if kf_pgo_corrections:
+            for kf_id, delta in kf_pgo_corrections.items():
+                sid = frame_to_submap.get(kf_id, 0)
+                if sid not in submap_kf_corrections:
+                    submap_kf_corrections[sid] = []
+                submap_kf_corrections[sid].append(delta.numpy())
+
+        submap_kf_tsfms = {}
+        for sid, deltas in submap_kf_corrections.items():
+            if len(deltas) == 0:
+                continue
+            # Median translation, chordal-mean rotation
+            t_all = np.stack([d[:3, 3] for d in deltas])
+            R_sum = np.sum([d[:3, :3] for d in deltas], axis=0)
+            U, _, Vt = np.linalg.svd(R_sum)
+            R_mean = U @ Vt
+            if np.linalg.det(R_mean) < 0:
+                R_mean = -R_mean
+            T = np.eye(4)
+            T[:3, :3] = R_mean
+            T[:3, 3] = np.median(t_all, axis=0)
+            submap_kf_tsfms[sid] = torch.from_numpy(T).float()
+
         import gc
 
         # Step B: Stream, transform, accumulate
@@ -293,8 +337,12 @@ class SLAM:
             gp = ckpt["gaussian_params"]
 
             ct = submap_tsfms[sid].numpy()
-            # Gaussians 已在全局坐标系（global seed mode），只叠加 PGO correct_tsfm
+            # Gaussians 已在全局坐标系（global seed mode），叠加 legacy correct_tsfm
+            # 如果有 keyframe PGO 结果，再叠加 submap 级中位数 correction
             full_tsfm = ct
+            if sid in submap_kf_tsfms:
+                kf_tsfm = submap_kf_tsfms[sid].numpy()
+                full_tsfm = kf_tsfm @ ct
 
             if not np.allclose(full_tsfm, np.eye(4), atol=1e-4):
                 gp_cuda = {
@@ -406,9 +454,19 @@ class SLAM:
 
                 correct_tsfm = submap_tsfms.get(sid, torch.eye(4)).to(cam.T.device).float()
 
+                # Apply keyframe PGO correction if available
+                if frame_id in kf_pgo_corrections:
+                    delta_kf = kf_pgo_corrections[frame_id].to(cam.T.device).float()
+                elif kf_pgo_corrections:
+                    # Non-keyframe: use nearest keyframe correction
+                    nearest_kf = min(kf_pgo_corrections.keys(), key=lambda k: abs(k - frame_id))
+                    delta_kf = kf_pgo_corrections[nearest_kf].to(cam.T.device).float()
+                else:
+                    delta_kf = torch.eye(4, device=cam.T.device)
+
                 # cam.T 已经是全局 W2C（前端 global seed 模式下所有帧都在全局坐标系跟踪）
-                # 只叠加 PGO correct_tsfm，不叠加 submap anchor（否则会 double count）
-                global_c2w = correct_tsfm @ torch.linalg.inv(cam.T)
+                # 叠加 legacy correct_tsfm + keyframe PGO correction
+                global_c2w = delta_kf @ correct_tsfm @ torch.linalg.inv(cam.T)
 
                 with torch.no_grad():
                     cam.T = torch.linalg.inv(global_c2w)
@@ -423,7 +481,7 @@ class SLAM:
             columns = ["tag", "psnr", "ssim", "lpips", "Depth L1", "RMSE ATE", "FPS"]
             metrics_table = wandb.Table(columns=columns)
 
-            # Phase A: Evaluate current state (after PGO, before offline opt)
+            # Phase A: Evaluate ATE (after PGO, before offline opt)
             Log("Evaluating Tracking ATE (With PGO Correction if enabled)...")
             current_ATE = eval_ate(
                 self.frontend.cameras,
@@ -433,22 +491,7 @@ class SLAM:
                 final=True,
                 monocular=self.monocular,
             )
-
-            Log("Rendering Current Map Quality...")
-            rendering_result_current = eval_rendering(
-                self.frontend.cameras, self.gaussians, self.dataset, self.save_dir,
-                self.pipeline_params, self.background, kf_indices=kf_indices,
-                iteration="global_merged_before_opt",
-            )
-
-            metrics_table.add_data(
-                "Before_Offline_Opt",
-                rendering_result_current["mean_psnr"],
-                rendering_result_current["mean_ssim"],
-                rendering_result_current["mean_lpips"],
-                rendering_result_current.get("mean_depth_l1", 0.0),
-                current_ATE, FPS,
-            )
+            # Skip pre-opt rendering to save time; only ATE is computed in Phase A
 
             for cam in self.frontend.cameras.values():
                 if hasattr(cam, "release_mapping_payload"):

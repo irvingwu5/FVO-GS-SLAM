@@ -1,3 +1,4 @@
+import json
 import os
 import time
 import torch
@@ -7,7 +8,13 @@ import torch.multiprocessing as mp
 import roma
 from utils.logging_utils import Log
 from utils.gsr_2dgs.solver_2dgs import registration_2dgs_gsreg
-from utils.reloc3r_adapter import Reloc3RSubmapRegistrator
+from utils.reloc3r_adapter import Reloc3RSubmapRegistrator, estimate_keyframe_pair_pose
+from utils.keyframe_pgo import (KeyframeRecord, Reloc3RPairEstimate, VerifiedLoopEdge,
+                                 build_keyframe_database, build_keyframe_pose_graph,
+                                 keyframe_db_stats, retrieve_keyframe_loop_candidates,
+                                 KeyframeRetrievalCandidate, refine_keyframe_loop_edge,
+                                 run_keyframe_pgo_trial, evaluate_keyframe_pgo_result)
+from utils.loop_depth_verifier import verify_reloc3r_pair_with_rgbd
 import torchvision.transforms as T
 import torchvision.models as models
 import torch.nn as nn
@@ -209,8 +216,9 @@ class LoopClosureProcess(mp.Process):
         self.submap_dense_pcds = {}  # 相邻子图 refine 用 dense cloud
 
         # 视觉特征缓存（永不清理）
-        self.submap_features = {}      # [N, D]
-        self.submap_thresholds = {}    # [N]
+        self.submap_features = {}      # {submap_id: [N, D] tensor}
+        self.submap_thresholds = {}    # {submap_id: [N] tensor}
+        self.submap_keyframe_features = {}  # {submap_id: {kf_idx: (D,) np.ndarray}}
         self.min_similarity_ratio = 0.5
 
         # ===== 回环检测基本参数 =====
@@ -262,6 +270,20 @@ class LoopClosureProcess(mp.Process):
         # PGO 增量门控：仅在新 loop edge 出现时运行
         self.last_loop_edge_count = 0
 
+        # ===== Loop Closure Mode Control (Stage 0) =====
+        self.mode = self.config.get("LoopClosure", {}).get("mode", "verify_only")
+        self.legacy_submap_pgo_enabled = self.config.get("LoopClosure", {}).get(
+            "legacy_submap_pgo_enabled", False
+        )
+        self.pgo_granularity = self.config.get("LoopClosure", {}).get(
+            "pgo_granularity", "keyframe"
+        )
+        Log(
+            f"[LoopClosure] mode={self.mode} "
+            f"legacy_submap_pgo_enabled={self.legacy_submap_pgo_enabled} "
+            f"pgo_granularity={self.pgo_granularity}"
+        )
+
         # ===== Reloc3R 配置（Stage 1: 仅加载配置，不加载模型） =====
         reloc3r_cfg = self.config.get("LoopClosure", {}).get("Reloc3R", {})
         self.reloc3r_enabled = reloc3r_cfg.get("enabled", False)
@@ -270,6 +292,8 @@ class LoopClosureProcess(mp.Process):
         self.submap_seed_c2w = {}          # {submap_id: 4x4 np.array}
         self.submap_keyframe_poses = {}    # {submap_id: {kf_idx: 4x4 np.array}}
         self.submap_image_paths = {}       # {submap_id: [str, ...]}
+        self.submap_depth_paths = {}      # {submap_id: [str, ...]}
+        self.keyframe_db = {}             # {kf_idx: KeyframeRecord}
 
         self.reloc3r_registrator = None
         if self.reloc3r_enabled:
@@ -294,7 +318,14 @@ class LoopClosureProcess(mp.Process):
             T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
 
-    def extract_submap_features_and_threshold(self, img_paths):
+    def extract_submap_features_and_threshold(self, img_paths, kf_indices=None):
+        """Extract CosPlace features from keyframe images.
+
+        Returns:
+            submap_desc: (N, D) tensor of N keyframe descriptors.
+            dynamic_thresholds: (N,) tensor of per-keyframe thresholds.
+            kf_features: dict {kf_idx: (D,) np.ndarray} for per-keyframe storage.
+        """
         feats = []
         for img_path in img_paths:
             img_tensor = torch.load(img_path, map_location="cpu")
@@ -305,13 +336,24 @@ class LoopClosureProcess(mp.Process):
             del img_input
 
         submap_desc = torch.stack(feats)  # [N, D]
+
+        # Build per-keyframe descriptor dict
+        kf_features = {}
+        if kf_indices is not None and len(kf_indices) == len(feats):
+            for kf_idx, feat in zip(kf_indices, feats):
+                kf_features[int(kf_idx)] = feat.numpy().astype(np.float32)
+        elif len(feats) > 0:
+            # Fallback: assign descriptors by position
+            for i, feat in enumerate(feats):
+                kf_features[i] = feat.numpy().astype(np.float32)
+
         self_sim = torch.mm(submap_desc, submap_desc.T)
 
         k = max(int(len(submap_desc) * self.min_similarity_ratio), 1)
         score_min, _ = self_sim.topk(k, dim=1)
         dynamic_thresholds = score_min[:, -1]
 
-        return submap_desc, dynamic_thresholds
+        return submap_desc, dynamic_thresholds, kf_features
 
     # ========================================================================
     # 4.3 Point Cloud Extraction & Cache
@@ -614,6 +656,21 @@ class LoopClosureProcess(mp.Process):
 
     # --- PGO: Full Graph ---
     def construct_and_optimize_pose_graph(self):
+        # =====================================================================
+        # DEPRECATED since Stage 0: Legacy submap-level PGO.
+        # This path is disabled by default. Keyframe-level PGO via
+        # build_keyframe_pose_graph + run_keyframe_pgo_trial is the
+        # recommended path.
+        # =====================================================================
+        if not self.legacy_submap_pgo_enabled:
+            Log("[LoopClosure] legacy_submap_pgo_enabled=false, skipping legacy submap PGO. "
+                "Keyframe-level PGO is the recommended path. "
+                "Set LoopClosure.legacy_submap_pgo_enabled=true to re-enable legacy (debug only).")
+            return []
+
+        Log("[LoopClosure-DEPRECATED] Running legacy submap-level PGO. "
+            "This path is deprecated — consider using keyframe-level PGO instead.")
+
         all_submap_ids = sorted(self.submap_records.keys())
         if len(all_submap_ids) < 2:
             Log(f"[LoopClosure] 子图数量不足 ({len(all_submap_ids)})，跳过 PGO")
@@ -806,9 +863,24 @@ class LoopClosureProcess(mp.Process):
     # 4.7 Apply Correction to Submaps
     # ========================================================================
     def apply_correction_to_submaps(self, correction_list):
-        """只写入 correct_tsfm 字段，不修改 ckpt 内的 gaussian_params 和 keyframe_poses。
-        slam.py 终局合并时一次性应用 correct_tsfm，避免双重修正。
+        """DEPRECATED: Legacy submap-level PGO writeback.
+
+        Writes correct_tsfm field only, does not modify gaussian_params or
+        keyframe_poses within the ckpt. slam.py applies correct_tsfm at final
+        fusion time to avoid double correction.
+
+        This path is blocked by default (mode != keyframe_pgo and
+        legacy_submap_pgo_enabled=false). The recommended path is keyframe-level
+        PGO via apply_keyframe_pgo_to_trajectory + MapCorrection.
         """
+        Log("[LoopClosure-DEPRECATED] apply_correction_to_submaps called. "
+            "Legacy submap-level correct_tsfm writeback is deprecated. "
+            "Use keyframe-level PGO via apply_keyframe_pgo_to_trajectory instead.")
+        if self.mode != "keyframe_pgo":
+            Log(f"[LoopClosure] mode={self.mode}, BLOCKING correct_tsfm write. "
+                f"Set LoopClosure.mode=keyframe_pgo to enable PGO writeback.")
+            return
+
         for correction in correction_list:
             submap_id = correction["submap_id"]
             new_correct_tsfm = np.array(correction["correct_tsfm"], dtype=np.float64)
@@ -830,7 +902,21 @@ class LoopClosureProcess(mp.Process):
     # 4.9 Main Loop
     # ========================================================================
     def run(self):
-        Log("Loop Closure 进程已启动，后台静默监听中...")
+        Log(f"Loop Closure 进程已启动 mode={self.mode}")
+        if self.mode == "off":
+            Log("[LoopClosure] mode=off, idle loop (no feature extraction, no PGO)")
+            while True:
+                if not self.loop_queue.empty():
+                    data = self.loop_queue.get()
+                    if data[0] == "stop":
+                        Log("Loop Closure 进程退出.")
+                        break
+                    elif data[0] == "submap_saved":
+                        Log(f"[LoopClosure] mode=off, submap {data[1]} received but ignored")
+                else:
+                    time.sleep(0.5)
+            return
+
         self.init_feature_extractor()
         while True:
             if not self.loop_queue.empty():
@@ -842,9 +928,11 @@ class LoopClosureProcess(mp.Process):
                     submap_id = data[1]
                     ckpt_path = data[2]
                     img_paths = data[3]
+                    depth_paths = data[4] if len(data) > 4 else []
 
                     self.submap_records[submap_id] = ckpt_path
                     self.submap_image_paths[submap_id] = img_paths
+                    self.submap_depth_paths[submap_id] = depth_paths
 
                     # 从 ckpt 读取 Reloc3R 所需的元数据（seed C2W + keyframe poses）
                     try:
@@ -868,22 +956,305 @@ class LoopClosureProcess(mp.Process):
                     self.submap_dense_pcds[submap_id] = dense_pcd
                     self.submap_pcds[submap_id] = feature_pcd
 
-                    submap_desc, thresholds = self.extract_submap_features_and_threshold(img_paths)
+                    # Get keyframe indices for per-keyframe descriptor assignment
+                    kf_indices = sorted(self.submap_keyframe_poses.get(submap_id, {}).keys())
+                    submap_desc, thresholds, kf_features = self.extract_submap_features_and_threshold(
+                        img_paths, kf_indices=kf_indices
+                    )
                     self.submap_features[submap_id] = submap_desc
                     self.submap_thresholds[submap_id] = thresholds
+                    self.submap_keyframe_features[submap_id] = kf_features
 
                     Log(f"[LoopClosure] 接收并处理新子图: ID {submap_id} (包含 {len(img_paths)} 个关键帧)")
 
-                    if self.debug_disable_pgo_for_fftvo_test:
-                        Log("[LoopClosure] PGO disabled for FFTVO ablation test")
-                        # 仍运行回环检测（仅日志输出）
-                        self.detect_closure(submap_id)
-                    else:
-                        # 2) 尝试闭环 PGO
-                        correction_list = self.construct_and_optimize_pose_graph()
-                        if len(correction_list) > 0:
-                            self.apply_correction_to_submaps(correction_list)
-                            Log("==> PGO 闭环校正及硬盘回写完毕！ <==")
+                    # Rebuild unified keyframe database from all loaded submaps
+                    dataset_cfg = self.config.get("Dataset", {})
+                    calib = dataset_cfg.get("Calibration", {})
+                    intrinsics = {
+                        "fx": calib.get("fx") or dataset_cfg.get("fx"),
+                        "fy": calib.get("fy") or dataset_cfg.get("fy"),
+                        "cx": calib.get("cx") or dataset_cfg.get("cx"),
+                        "cy": calib.get("cy") or dataset_cfg.get("cy"),
+                        "width": calib.get("width") or dataset_cfg.get("width"),
+                        "height": calib.get("height") or dataset_cfg.get("height"),
+                    }
+                    self.keyframe_db = build_keyframe_database(
+                        self.submap_keyframe_poses,
+                        self.submap_image_paths,
+                        self.submap_seed_c2w,
+                        intrinsics,
+                        self.submap_depth_paths,
+                    )
+                    stats = keyframe_db_stats(self.keyframe_db)
+                    Log(f"[KeyframeDB] total={stats['total_keyframes']} "
+                        f"submaps={stats['submap_count']} "
+                        f"per_submap={stats['per_submap']} "
+                        f"seeds={stats['seed_keyframes']} "
+                        f"missing_rgb={stats['missing_rgb']} "
+                        f"missing_depth={stats['missing_depth']} "
+                        f"missing_descriptor={stats['missing_descriptor']}")
+
+                    # ---- Keyframe-level retrieval (Stage 2) ----
+                    if self.mode in ("detect_only", "verify_only", "keyframe_pgo"):
+                        retrieval_log_path = os.path.join(
+                            self.save_dir, "loop_keyframe_retrieval.jsonl"
+                        )
+                        # Query from the latest submap's keyframes (use tail kfs)
+                        query_kfs = kf_indices[-min(3, len(kf_indices)):]
+                        all_candidates = []
+                        for qkf in query_kfs:
+                            cands = retrieve_keyframe_loop_candidates(
+                                qkf, self.keyframe_db,
+                                submap_keyframe_features=self.submap_keyframe_features,
+                                config=self.config.get("LoopClosure", {}),
+                            )
+                            all_candidates.extend(cands)
+
+                        # Write JSONL log
+                        try:
+                            with open(retrieval_log_path, "a") as f:
+                                for cand in all_candidates:
+                                    record = {
+                                        "query_keyframe_id": cand.query_keyframe_id,
+                                        "target_keyframe_id": cand.target_keyframe_id,
+                                        "query_submap_id": cand.query_submap_id,
+                                        "target_submap_id": cand.target_submap_id,
+                                        "cosplace_score": round(cand.cosplace_score, 4),
+                                        "temporal_gap": cand.temporal_gap,
+                                        "is_mutual": cand.is_mutual,
+                                        "accepted_by_retrieval": cand.accepted_by_retrieval,
+                                        "rejection_reason": cand.rejection_reason,
+                                    }
+                                    f.write(json.dumps(record) + "\n")
+                        except Exception as e:
+                            Log(f"[LoopClosure] JSONL write failed: {e}")
+
+                        accepted = [c for c in all_candidates if c.accepted_by_retrieval]
+                        mutual = [c for c in accepted if c.is_mutual]
+                        Log(f"[KF Retrieval] {len(all_candidates)} candidates, "
+                            f"{len(accepted)} accepted, {len(mutual)} mutual "
+                            f"(query_kfs={query_kfs})")
+
+                    # ---- Reloc3R keyframe-pair estimation (Stage 3) ----
+                    if self.reloc3r_enabled and self.mode in ("verify_only", "keyframe_pgo"):
+                        reloc3r_log_path = os.path.join(
+                            self.save_dir, "reloc3r_keyframe_pairs.jsonl"
+                        )
+                        reloc3r_cfg = self.config.get("LoopClosure", {}).get("Reloc3R", {})
+                        top_cands = [c for c in all_candidates if c.accepted_by_retrieval][:5]
+                        reloc3r_accepted = 0
+                        reloc3r_estimates = []
+                        for cand in top_cands:
+                            src_rec = self.keyframe_db.get(cand.query_keyframe_id)
+                            tgt_rec = self.keyframe_db.get(cand.target_keyframe_id)
+                            if src_rec is None or tgt_rec is None:
+                                continue
+                            try:
+                                estimate = estimate_keyframe_pair_pose(src_rec, tgt_rec, reloc3r_cfg)
+                            except Exception as e:
+                                Log(f"[Reloc3R] pair ({cand.query_keyframe_id},{cand.target_keyframe_id}) crashed: {e}")
+                                continue
+                            reloc3r_estimates.append(estimate)
+                            if estimate.accepted_by_reloc3r:
+                                reloc3r_accepted += 1
+                            # Write JSONL
+                            try:
+                                with open(reloc3r_log_path, "a") as f:
+                                    f.write(json.dumps({
+                                        "source_keyframe_id": estimate.source_keyframe_id,
+                                        "target_keyframe_id": estimate.target_keyframe_id,
+                                        "source_submap_id": estimate.source_submap_id,
+                                        "target_submap_id": estimate.target_submap_id,
+                                        "raw_translation_norm": round(estimate.raw_translation_norm, 4),
+                                        "raw_vs_init_dot": round(estimate.raw_vs_init_dot, 4),
+                                        "scale_applied": round(estimate.scale_applied, 4),
+                                        "accepted_by_reloc3r": estimate.accepted_by_reloc3r,
+                                        "rejection_reason": estimate.rejection_reason,
+                                    }) + "\n")
+                            except Exception as e:
+                                Log(f"[LoopClosure] Reloc3R JSONL write failed: {e}")
+                        Log(f"[Reloc3R KF] {reloc3r_accepted}/{len(top_cands)} accepted")
+
+                    # ---- Depth verification (Stage 4) ----
+                    if self.mode in ("verify_only", "keyframe_pgo"):
+                        depth_cfg = self.config.get("LoopClosure", {}).get("depth_verify", {})
+                        depth_log_path = os.path.join(
+                            self.save_dir, "loop_depth_verify.jsonl"
+                        )
+                        depth_accepted = 0
+                        for est in reloc3r_estimates:
+                            if not est.accepted_by_reloc3r:
+                                continue
+                            src_rec = self.keyframe_db.get(est.source_keyframe_id)
+                            tgt_rec = self.keyframe_db.get(est.target_keyframe_id)
+                            src_dpt = src_rec.depth_path if src_rec else None
+                            tgt_dpt = tgt_rec.depth_path if tgt_rec else None
+                            try:
+                                verified = verify_reloc3r_pair_with_rgbd(
+                                    est, src_dpt, tgt_dpt, intrinsics, depth_cfg,
+                                )
+                            except Exception as e:
+                                Log(f"[Depth Verify] pair ({est.source_keyframe_id},{est.target_keyframe_id}) crashed: {e}")
+                                continue
+                            if verified.accepted_by_depth:
+                                depth_accepted += 1
+                            else:
+                                Log(f"[Depth Verify Diag] ({est.source_keyframe_id},{est.target_keyframe_id}) "
+                                    f"rejected: {verified.rejection_reason} "
+                                    f"overlap={verified.depth_overlap:.3f} rmse={verified.depth_rmse:.4f} "
+                                    f"inlier={verified.depth_inlier_ratio:.3f} valid_pts={verified.valid_projected_points}")
+                            # Write JSONL
+                            try:
+                                with open(depth_log_path, "a") as f:
+                                    f.write(json.dumps({
+                                        "source_kf": verified.source_keyframe_id,
+                                        "target_kf": verified.target_keyframe_id,
+                                        "scale_used": round(verified.scale_used, 4),
+                                        "depth_overlap": round(verified.depth_overlap, 4),
+                                        "depth_rmse": round(verified.depth_rmse, 4),
+                                        "depth_inlier_ratio": round(verified.depth_inlier_ratio, 4),
+                                        "valid_points": verified.valid_projected_points,
+                                        "accepted_by_depth": verified.accepted_by_depth,
+                                        "rejection_reason": verified.rejection_reason,
+                                    }) + "\n")
+                            except Exception as e:
+                                Log(f"[LoopClosure] Depth verify JSONL write failed: {e}")
+                        if depth_accepted < len(reloc3r_estimates):
+                            for est in reloc3r_estimates:
+                                if not est.accepted_by_reloc3r:
+                                    continue
+                                Log(f"[Depth Verify Diag] pair ({est.source_keyframe_id},{est.target_keyframe_id}) "
+                                    f"raw_t={est.raw_translation_norm:.3f}m scale={est.scale_applied:.3f}")
+                        Log(f"[Depth Verify] {depth_accepted}/{len(reloc3r_estimates)} accepted")
+
+                    # ---- Refinement → VerifiedLoopEdge (Stage 5) ----
+                    verified_loop_edges = []
+                    if self.mode in ("verify_only", "keyframe_pgo"):
+                        loop_cfg = self.config.get("LoopClosure", {})
+                        refine_cfg = loop_cfg.get("render_refine", {})
+                        refine_log_path = os.path.join(
+                            self.save_dir, "loop_verified_edges.jsonl"
+                        )
+                        refine_accepted = 0
+                        for est in reloc3r_estimates:
+                            if not est.accepted_by_reloc3r:
+                                continue
+                            src_rec = self.keyframe_db.get(est.source_keyframe_id)
+                            tgt_rec = self.keyframe_db.get(est.target_keyframe_id)
+                            if src_rec is None or tgt_rec is None:
+                                continue
+                            try:
+                                src_dpt = src_rec.depth_path if src_rec else None
+                                tgt_dpt = tgt_rec.depth_path if tgt_rec else None
+                                verified = verify_reloc3r_pair_with_rgbd(
+                                    est, src_dpt, tgt_dpt, intrinsics, depth_cfg,
+                                )
+                                if not verified.accepted_by_depth:
+                                    continue
+                                src_ckpt = self.submap_records.get(est.source_submap_id)
+                                tgt_ckpt = self.submap_records.get(est.target_submap_id)
+                                edge = refine_keyframe_loop_edge(
+                                    verified, src_rec, tgt_rec, loop_cfg,
+                                    src_ckpt_path=src_ckpt, tgt_ckpt_path=tgt_ckpt,
+                                )
+                            except Exception as e:
+                                Log(f"[Refine→Edge] pair ({est.source_keyframe_id},{est.target_keyframe_id}) crashed: {e}")
+                                continue
+                            verified_loop_edges.append(edge)
+                            if edge.accepted_for_pgo:
+                                refine_accepted += 1
+                            # Write JSONL
+                            try:
+                                with open(refine_log_path, "a") as f:
+                                    f.write(json.dumps({
+                                        "source_kf": edge.source_keyframe_id,
+                                        "target_kf": edge.target_keyframe_id,
+                                        "source_submap": edge.source_submap_id,
+                                        "target_submap": edge.target_submap_id,
+                                        "refinement_method": edge.verification_metrics.get("refinement_method", ""),
+                                        "delta_t_from_odom": edge.verification_metrics.get("delta_t_from_odom", -1),
+                                        "delta_r_from_odom": edge.verification_metrics.get("delta_r_deg_from_odom", -1),
+                                        "accepted_for_pgo": edge.accepted_for_pgo,
+                                        "rejection_reason": edge.rejection_reason,
+                                    }) + "\n")
+                            except Exception as e:
+                                Log(f"[LoopClosure] Verified edge JSONL write failed: {e}")
+                        Log(f"[Refine→Edge] {refine_accepted}/{len(reloc3r_estimates)} "
+                            f"verified loop edges accepted for PGO")
+
+                    # ---- Keyframe PGO trial (Stage 7) ----
+                    if self.mode == "keyframe_pgo" and len(verified_loop_edges) > 0:
+                        accepted_edges = [e for e in verified_loop_edges if e.accepted_for_pgo]
+                        if len(accepted_edges) > 0:
+                            Log(f"[KeyframePGO] {len(accepted_edges)} accepted edges, building graph...")
+                            graph = build_keyframe_pose_graph(
+                                self.keyframe_db, verified_loop_edges=accepted_edges,
+                                config=self.config.get("LoopClosure", {}),
+                            )
+                            Log(f"[KeyframePGO] graph: {len(graph.nodes)} nodes, "
+                                f"{graph.num_temporal_edges} temporal, "
+                                f"{graph.num_handoff_edges} handoff, "
+                                f"{graph.num_loop_edges} loop edges")
+
+                            trial_result = run_keyframe_pgo_trial(
+                                graph, config=self.config.get("LoopClosure", {}),
+                            )
+                            Log(f"[KeyframePGO] trial: max_corr_t={trial_result.max_correction_t:.3f}m "
+                                f"max_corr_r={trial_result.max_correction_r_deg:.1f}deg "
+                                f"odom_before={trial_result.odom_residual_before_mean:.4f} "
+                                f"odom_after={trial_result.odom_residual_after_mean:.4f} "
+                                f"loop_before={trial_result.loop_residual_before_mean:.4f} "
+                                f"loop_after={trial_result.loop_residual_after_mean:.4f}")
+
+                            trial_result = evaluate_keyframe_pgo_result(
+                                trial_result, graph,
+                                config=self.config.get("LoopClosure", {}),
+                            )
+                            if trial_result.accepted:
+                                Log(f"[KeyframePGO] ACCEPTED! Saving results...")
+                                pgo_result_path = os.path.join(
+                                    self.save_dir, "keyframe_pgo_result.json"
+                                )
+                                try:
+                                    with open(pgo_result_path, "w") as f:
+                                        json.dump({
+                                            "accepted": True,
+                                            "num_nodes": len(graph.nodes),
+                                            "num_loop_edges": graph.num_loop_edges,
+                                            "max_correction_t": trial_result.max_correction_t,
+                                            "max_correction_r_deg": trial_result.max_correction_r_deg,
+                                            "odom_residual_before": trial_result.odom_residual_before_mean,
+                                            "odom_residual_after": trial_result.odom_residual_after_mean,
+                                            "loop_residual_before": trial_result.loop_residual_before_mean,
+                                            "loop_residual_after": trial_result.loop_residual_after_mean,
+                                            "keyframe_corrections": {
+                                                str(k): v.tolist()
+                                                for k, v in trial_result.keyframe_corrections.items()
+                                            },
+                                            "optimized_keyframe_c2w": {
+                                                str(k): v.tolist()
+                                                for k, v in trial_result.optimized_keyframe_c2w.items()
+                                            },
+                                        }, f, indent=2)
+                                    Log(f"[KeyframePGO] result saved to {pgo_result_path}")
+                                except Exception as e:
+                                    Log(f"[KeyframePGO] save failed: {e}")
+                            else:
+                                Log(f"[KeyframePGO] REJECTED: {trial_result.rejection_reason}")
+                        else:
+                            Log(f"[KeyframePGO] no accepted edges, skipping trial")
+
+                    # ---- Mode-aware PGO dispatch ----
+                    if self.mode in ("detect_only", "verify_only", "keyframe_pgo"):
+                        if self.debug_disable_pgo_for_fftvo_test:
+                            Log("[LoopClosure] PGO disabled for FFTVO ablation test")
+                            self.detect_closure(submap_id)
+                        else:
+                            correction_list = self.construct_and_optimize_pose_graph()
+                            if len(correction_list) > 0:
+                                self.apply_correction_to_submaps(correction_list)
+                                Log("==> PGO 闭环校正及硬盘回写完毕！ <==")
+                    # mode == "off" is handled above, before feature extraction
 
             else:
                 time.sleep(0.5)

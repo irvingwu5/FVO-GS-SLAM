@@ -145,7 +145,60 @@ Submap:
 # ============================================================
 LoopClosure:
   registration_method: "reloc3r"  # choices: icp, 2dgs_gsreg, reloc3r, reloc3r_mock
+
+  # ===== Stage 0: LoopClosure mode control =====
+  mode: keyframe_pgo  # choices: off, detect_only, verify_only, keyframe_pgo
+  legacy_submap_pgo_enabled: false
+  pgo_granularity: keyframe
+
+  # ===== Stage 2: Keyframe retrieval =====
+  keyframe_retrieval_top_k: 10
+  keyframe_retrieval_min_score: 0.50
+  keyframe_retrieval_min_temporal_gap: 10
+  keyframe_retrieval_mutual_nearest: true
+  keyframe_retrieval_mutual_top_n: 20
+
+  # ===== Stage 4: Depth verification =====
+  depth_verify:
+    enabled: true
+    min_overlap: 0.20
+    max_depth_rmse: 0.80
+    min_inlier_ratio: 0.05
+    depth_inlier_threshold: 0.15
+    depth_sample_count: 5000
+    scale_search_steps: 20
+    scale_search_min: 0.1
+    scale_search_max: 20.0
+
+  # ===== Stage 5: Render refinement =====
+  render_refine:
+    enabled: false  # GSReg incompatible with global-coordinate Gaussians
+    max_delta_t_from_odom: 50.0
+    max_delta_r_deg_from_odom: 90.0
+    max_final_depth_rmse: 0.80
+    allow_depth_verified_edge_without_render_refine: true
+
+  # ===== Stage 7: Keyframe PGO safety =====
+  keyframe_pgo_odom_info_scale: 10.0
+  keyframe_pgo_handoff_info_scale: 5.0
+  keyframe_pgo_safety:
+    max_correction_t: 1.00
+    max_correction_r_deg: 15.0
+    max_odom_residual_increase_ratio: 2.00
+    min_loop_residual_decrease_ratio: 0.30
+    max_single_loop_residual_after_t: 0.30
+    max_single_loop_residual_after_r_deg: 5.0
+    min_verified_loop_edges: 3
+    max_pgo_retries: 2
+  pgo_voxel_size: 2.0
+  pgo_edge_prune_threshold: 5.0
+
   allow_identity_loop_init: false
+
+  # ===== Stage 9: Map correction from keyframe PGO =====
+  MapCorrection:
+    mode: submap_median_from_keyframes  # choices: none, submap_median_from_keyframes, owner_keyframe
+    apply_online: false
 
   gsreg_overlap_radius: 0.10
   gsreg_min_overlap: 0.15
@@ -202,7 +255,7 @@ LoopClosure:
     max_correction_t: 2.0
 
   # PGO protection
-  debug_disable_pgo_for_fftvo_test: false
+  debug_disable_pgo_for_fftvo_test: false  # DEPRECATED: use LoopClosure.mode=off instead
   min_loop_fitness_for_pgo: 0.60
   max_loop_rmse_for_pgo: 0.03
   max_loop_delta_t_for_pgo: 0.30

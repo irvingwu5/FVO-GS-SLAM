@@ -794,6 +794,7 @@ class BackEnd(mp.Process):
                     torch.save(ckpt_data, ckpt_path)
 
                     kf_image_paths = []
+                    kf_depth_paths = []
                     if len(submap_keyframes) > 0:
                         for kf_idx in submap_keyframes:
                             vp = self.viewpoints[kf_idx]
@@ -801,9 +802,15 @@ class BackEnd(mp.Process):
                             img_path = os.path.join(submaps_dir, f"{self.current_submap_id:06d}_img_{kf_idx}.pt")
                             torch.save(kf_image, img_path)
                             kf_image_paths.append(img_path)
+                            # Save depth map for Stage 4 depth verification
+                            if not self.monocular and vp.depth is not None:
+                                depth_tensor = torch.from_numpy(vp.depth.astype(np.float32))
+                                depth_path = os.path.join(submaps_dir, f"{self.current_submap_id:06d}_depth_{kf_idx}.pt")
+                                torch.save(depth_tensor, depth_path)
+                                kf_depth_paths.append(depth_path)
 
                     if hasattr(self, 'loop_queue') and self.loop_queue is not None and len(kf_image_paths) > 0:
-                        self.loop_queue.put(["submap_saved", self.current_submap_id, ckpt_path, kf_image_paths])
+                        self.loop_queue.put(["submap_saved", self.current_submap_id, ckpt_path, kf_image_paths, kf_depth_paths])
 
                     Log(f"==> 终局保存：最后一块子图 {self.current_submap_id} 已存入硬盘。 <==")
                     break
@@ -963,6 +970,7 @@ class BackEnd(mp.Process):
                     Log(f"✓ Submap {completed_submap_id} parameters saved to {ckpt_path}")
 
                     kf_image_paths = []
+                    kf_depth_paths = []
                     if len(submap_keyframes) > 0:
                         for kf_idx in submap_keyframes:
                             vp = self.viewpoints[kf_idx]
@@ -970,9 +978,15 @@ class BackEnd(mp.Process):
                             img_path = os.path.join(submaps_dir, f"{completed_submap_id:06d}_img_{kf_idx}.pt")
                             torch.save(kf_image, img_path)
                             kf_image_paths.append(img_path)
+                            # Save depth map for Stage 4 depth verification
+                            if not self.monocular and vp.depth is not None:
+                                depth_tensor = torch.from_numpy(vp.depth.astype(np.float32))
+                                depth_path = os.path.join(submaps_dir, f"{completed_submap_id:06d}_depth_{kf_idx}.pt")
+                                torch.save(depth_tensor, depth_path)
+                                kf_depth_paths.append(depth_path)
 
                     if hasattr(self, 'loop_queue') and self.loop_queue is not None and len(kf_image_paths) > 0:
-                        self.loop_queue.put(["submap_saved", completed_submap_id, ckpt_path, kf_image_paths])
+                        self.loop_queue.put(["submap_saved", completed_submap_id, ckpt_path, kf_image_paths, kf_depth_paths])
                         Log(f"✓ Submap {completed_submap_id} sent to loop closure")
 
                     if self.use_handoff:

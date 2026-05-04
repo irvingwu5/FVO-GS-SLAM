@@ -400,3 +400,100 @@ class Reloc3RSubmapRegistrator:
                 "failure_reason": reason,
             },
         }
+
+
+# ============================================================================
+# Stage 3: Keyframe-pair estimate (NOT submap-level)
+# ============================================================================
+
+def estimate_keyframe_pair_pose(source_record, target_record, config):
+    """Estimate coarse relative pose for a single keyframe pair using Reloc3R.
+
+    This function operates at KEYFRAME level. It does NOT produce submap
+    transforms and does NOT write PGO edges.
+
+    Args:
+        source_record: KeyframeRecord for the source keyframe.
+        target_record: KeyframeRecord for the target keyframe.
+        config: Reloc3R config dict (from LoopClosure.Reloc3R).
+
+    Returns:
+        Reloc3RPairEstimate with T_target_from_source_raw and diagnostics.
+    """
+    from utils.keyframe_pgo import Reloc3RPairEstimate
+
+    estimate = Reloc3RPairEstimate(
+        source_keyframe_id=source_record.keyframe_id,
+        target_keyframe_id=target_record.keyframe_id,
+        source_submap_id=source_record.submap_id,
+        target_submap_id=target_record.submap_id,
+        source_c2w_global=source_record.c2w_global.copy(),
+        target_c2w_global=target_record.c2w_global.copy(),
+    )
+
+    if source_record.rgb_path is None or target_record.rgb_path is None:
+        estimate.rejection_reason = "missing_rgb_path"
+        return estimate
+
+    if not os.path.isfile(source_record.rgb_path) or not os.path.isfile(target_record.rgb_path):
+        estimate.rejection_reason = "rgb_file_not_found"
+        return estimate
+
+    # Load model
+    model = _load_reloc3r_model(config)
+    if model is None:
+        estimate.rejection_reason = "model_load_failed"
+        return estimate
+
+    try:
+        # view1=target, view2=source → T_cam1_from_cam2 = T_target_from_source
+        img_tgt = _load_image_as_tensor(target_record.rgb_path, config.get("device", "cuda"))
+        img_src = _load_image_as_tensor(source_record.rgb_path, config.get("device", "cuda"))
+        H = W = config.get("image_size", 224)
+        view1 = {"img": img_tgt.cuda(), "true_shape": torch.tensor([[H, W]]).cuda()}
+        view2 = {"img": img_src.cuda(), "true_shape": torch.tensor([[H, W]]).cuda()}
+
+        with torch.inference_mode():
+            use_amp = config.get("use_amp", True)
+            with torch.cuda.amp.autocast(enabled=bool(use_amp)):
+                _, pose2 = model(view1, view2)
+        T_raw = pose2["pose"].cpu().numpy().squeeze()
+        del img_src, img_tgt, view1, view2, pose2
+    except Exception as e:
+        estimate.rejection_reason = f"inference_error: {e}"
+        return estimate
+
+    # Sanity check
+    det = np.linalg.det(T_raw[:3, :3])
+    if abs(det - 1.0) > 0.1 or np.any(np.isnan(T_raw)) or np.any(np.isinf(T_raw)):
+        estimate.rejection_reason = f"sanity_check_failed det={det:.4f}"
+        return estimate
+
+    raw_t_norm = float(np.linalg.norm(T_raw[:3, 3]))
+    if raw_t_norm < 1e-8:
+        estimate.rejection_reason = "zero_translation"
+        return estimate
+
+    estimate.T_target_from_source_raw = np.array(T_raw, dtype=np.float64)
+    estimate.raw_translation_norm = raw_t_norm
+
+    # Compute odometry-based T_target_from_source for comparison
+    estimate.odom_T_target_from_source = np.linalg.inv(target_record.c2w_global) @ source_record.c2w_global
+
+    # Direction alignment: raw vs odometry init (diagnostic only, scale NOT applied)
+    raw_t_unit = T_raw[:3, 3] / raw_t_norm
+    init_t = estimate.odom_T_target_from_source[:3, 3]
+    init_norm = float(np.linalg.norm(init_t))
+    if init_norm > 1e-6:
+        init_t_unit = init_t / init_norm
+        estimate.raw_vs_init_dot = float(np.dot(raw_t_unit, init_t_unit))
+
+    # Preserve raw Reloc3R translation — scale search is delegated to depth verifier.
+    # init_guess_norm is diagnostic only (direction check), NOT applied to T.
+    estimate.scale_applied = 1.0
+    estimate.T_target_from_source_raw = np.array(T_raw, dtype=np.float64)
+
+    estimate.accepted_by_reloc3r = True
+    estimate.num_valid_matches = 1
+    return estimate
+
