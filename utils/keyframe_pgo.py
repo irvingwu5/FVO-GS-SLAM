@@ -48,26 +48,6 @@ class KeyframeEdge:
     information: Optional[np.ndarray] = None  # 6x6
     diagnostics: Dict[str, Any] = field(default_factory=dict)
 
-
-@dataclass
-class LoopPairCandidate:
-    """A candidate loop pair produced by retrieval + Reloc3R coarse estimation.
-
-    NOT a final PGO edge — must pass depth verification and optional render/GSReg
-    refinement before becoming a VerifiedLoopEdge.
-    """
-    source_submap_id: int
-    target_submap_id: int
-    source_keyframe_id: int
-    target_keyframe_id: int
-    source_c2w_global: np.ndarray  # 4x4
-    target_c2w_global: np.ndarray  # 4x4
-    T_target_from_source_raw: np.ndarray  # 4x4, from Reloc3R
-    reloc3r_confidence: float = 0.0
-    retrieval_score: float = 0.0
-    diagnostics: Dict[str, Any] = field(default_factory=dict)
-
-
 @dataclass
 class Reloc3RPairEstimate:
     """Raw Reloc3R output for a single keyframe pair.
@@ -282,34 +262,32 @@ class KeyframeRetrievalCandidate:
 def retrieve_keyframe_loop_candidates(
     query_keyframe_id: int,
     keyframe_db: Dict[int, KeyframeRecord],
-    submap_keyframe_features: Optional[Dict[int, Dict[int, np.ndarray]]] = None,
     config: Optional[Dict[str, Any]] = None,
 ) -> List[KeyframeRetrievalCandidate]:
     """Retrieve loop closure candidates at keyframe level.
 
+    Reads CosPlace descriptors from KeyframeRecord.cosplace_descriptor.
+
     Args:
         query_keyframe_id: The query keyframe's ID (= frame_idx).
-        keyframe_db: Unified keyframe database.
-        submap_keyframe_features: {submap_id: {kf_idx: (D,) descriptor}}.
+        keyframe_db: Unified keyframe database with populated descriptors.
         config: LoopClosure config dict.
 
     Returns:
         List of KeyframeRetrievalCandidate sorted by cosplace_score descending.
     """
-    if submap_keyframe_features is None or config is None:
+    if config is None:
         return []
 
     if query_keyframe_id not in keyframe_db:
         return []
 
     query_rec = keyframe_db[query_keyframe_id]
-    query_submap = query_rec.submap_id
-
-    # Find query descriptor
-    query_kf_feats = submap_keyframe_features.get(query_submap, {})
-    query_desc = query_kf_feats.get(query_keyframe_id)
+    query_desc = query_rec.cosplace_descriptor
     if query_desc is None:
         return []
+
+    query_submap = query_rec.submap_id
 
     # Config
     top_k = config.get("keyframe_retrieval_top_k", 10)
@@ -324,29 +302,25 @@ def retrieve_keyframe_loop_candidates(
     if query_norm < 1e-10:
         return []
 
+    raw_matches = 0
     candidates: List[KeyframeRetrievalCandidate] = []
 
     for target_id, target_rec in keyframe_db.items():
-        # Skip same keyframe
         if target_id == query_keyframe_id:
             continue
-        # Skip same submap
         if target_rec.submap_id == query_submap:
             continue
-        # Skip submap gap too small
         submap_diff = abs(query_submap - target_rec.submap_id)
         if submap_diff < min_submap_gap:
             continue
-        # Skip temporal gap too small
         temporal_gap = abs(query_keyframe_id - target_id)
         if temporal_gap < min_temporal_gap:
             continue
 
-        # Get target descriptor
-        target_kf_feats = submap_keyframe_features.get(target_rec.submap_id, {})
-        target_desc = target_kf_feats.get(target_id)
+        target_desc = target_rec.cosplace_descriptor
         if target_desc is None:
             continue
+        raw_matches += 1
 
         target_desc = np.array(target_desc, dtype=np.float32)
         target_norm = np.linalg.norm(target_desc)
@@ -371,23 +345,17 @@ def retrieve_keyframe_loop_candidates(
 
         candidates.append(candidate)
 
-    # Sort by score descending
     candidates.sort(key=lambda c: c.cosplace_score, reverse=True)
 
     # Mutual nearest check (optional)
     if use_mutual and candidates:
         accepted = [c for c in candidates if c.accepted_by_retrieval]
         if len(accepted) >= 2:
-            # For each top accepted candidate, check if query appears in target's top-N
             top_accepted = accepted[:top_k]
             for cand in top_accepted:
-                # Re-run retrieval from target's perspective
                 target_neighbors = _find_nearest_keyframes(
-                    cand.target_keyframe_id,
-                    keyframe_db,
-                    submap_keyframe_features,
-                    top_n=mutual_top_n,
-                    min_submap_gap=min_submap_gap,
+                    cand.target_keyframe_id, keyframe_db,
+                    top_n=mutual_top_n, min_submap_gap=min_submap_gap,
                     min_temporal_gap=min_temporal_gap,
                 )
                 query_in_target_top = any(
@@ -395,10 +363,8 @@ def retrieve_keyframe_loop_candidates(
                 )
                 cand.is_mutual = query_in_target_top
 
-    # Return top K accepted
     result = [c for c in candidates if c.accepted_by_retrieval][:top_k]
     if not result:
-        # If none accepted, return top rejected for diagnostics
         result = candidates[:5]
 
     return result
@@ -407,22 +373,16 @@ def retrieve_keyframe_loop_candidates(
 def _find_nearest_keyframes(
     query_id: int,
     keyframe_db: Dict[int, KeyframeRecord],
-    submap_keyframe_features: Dict[int, Dict[int, np.ndarray]],
     top_n: int = 20,
     min_submap_gap: int = 3,
     min_temporal_gap: int = 10,
 ) -> List[tuple]:
-    """Find nearest keyframes by cosine similarity. Returns [(kf_id, score), ...]."""
+    """Find nearest keyframes by cosine similarity from KeyframeRecord descriptors."""
     query_rec = keyframe_db.get(query_id)
-    if query_rec is None:
+    if query_rec is None or query_rec.cosplace_descriptor is None:
         return []
 
-    query_kf_feats = submap_keyframe_features.get(query_rec.submap_id, {})
-    query_desc = query_kf_feats.get(query_id)
-    if query_desc is None:
-        return []
-
-    query_desc = np.array(query_desc, dtype=np.float32)
+    query_desc = np.array(query_rec.cosplace_descriptor, dtype=np.float32)
     query_norm = np.linalg.norm(query_desc)
     if query_norm < 1e-10:
         return []
@@ -433,19 +393,14 @@ def _find_nearest_keyframes(
             continue
         if target_rec.submap_id == query_rec.submap_id:
             continue
-        submap_diff = abs(query_rec.submap_id - target_rec.submap_id)
-        if submap_diff < min_submap_gap:
+        if abs(query_rec.submap_id - target_rec.submap_id) < min_submap_gap:
             continue
-        temporal_gap = abs(query_id - target_id)
-        if temporal_gap < min_temporal_gap:
+        if abs(query_id - target_id) < min_temporal_gap:
             continue
-
-        target_kf_feats = submap_keyframe_features.get(target_rec.submap_id, {})
-        target_desc = target_kf_feats.get(target_id)
-        if target_desc is None:
+        if target_rec.cosplace_descriptor is None:
             continue
 
-        target_desc = np.array(target_desc, dtype=np.float32)
+        target_desc = np.array(target_rec.cosplace_descriptor, dtype=np.float32)
         target_norm = np.linalg.norm(target_desc)
         if target_norm < 1e-10:
             continue
@@ -474,21 +429,14 @@ def refine_keyframe_loop_edge(
     source_record: KeyframeRecord,
     target_record: KeyframeRecord,
     config: Optional[Dict[str, Any]] = None,
-    src_ckpt_path: Optional[str] = None,
-    tgt_ckpt_path: Optional[str] = None,
 ) -> VerifiedLoopEdge:
     """Produce a VerifiedLoopEdge from a depth-verified pair.
-
-    When render_refine.enabled=True, runs 2DGS-GSReg refinement using submap
-    ckpts to produce a more accurate relative pose.
 
     Args:
         depth_verified_pair: DepthVerifiedPair with accepted_by_depth=True.
         source_record: KeyframeRecord for source keyframe.
         target_record: KeyframeRecord for target keyframe.
-        config: render_refine config dict.
-        src_ckpt_path: Path to source submap ckpt (for GSReg).
-        tgt_ckpt_path: Path to target submap ckpt (for GSReg).
+        config: LoopClosure config dict.
 
     Returns:
         VerifiedLoopEdge with accepted_for_pgo decision.
@@ -506,7 +454,6 @@ def refine_keyframe_loop_edge(
         config = {}
 
     refine_cfg = config.get("render_refine", {})
-    gsreg_enabled = refine_cfg.get("enabled", False)
     T_refined = depth_verified_pair.T_target_from_source.copy()  # T_target_from_source
 
     edge.verification_metrics = {
@@ -517,36 +464,10 @@ def refine_keyframe_loop_edge(
         "refinement_method": "depth_only",
     }
 
-    # ---- GSReg refinement (Stage 5) ----
-    if gsreg_enabled and src_ckpt_path and tgt_ckpt_path:
-        try:
-            from utils.gsr_2dgs.solver_2dgs import registration_2dgs_gsreg
-
-            init_guess = T_refined.copy()
-            gsreg_result = registration_2dgs_gsreg(
-                src_ckpt_path, tgt_ckpt_path, init_guess, config,
-                # config is full LoopClosure dict, GSReg reads gsreg_* keys from it
-            )
-            if gsreg_result.get("success"):
-                # GSReg returns T_tgt_src (target→source), invert to source→target
-                T_gsreg = np.linalg.inv(gsreg_result["T_tgt_src"])
-                dt_gsreg = float(gsreg_result.get("delta_t_from_init", 0))
-                dr_gsreg = float(gsreg_result.get("delta_r_from_init", 0))
-                edge.verification_metrics["refinement_method"] = "gsreg_refined"
-                edge.verification_metrics["gsreg_overlap"] = float(gsreg_result.get("overlap", 0))
-                edge.verification_metrics["gsreg_delta_t"] = dt_gsreg
-                edge.verification_metrics["gsreg_delta_r"] = dr_gsreg
-                T_refined = T_gsreg
-            else:
-                edge.verification_metrics["gsreg_failed"] = gsreg_result.get("reason", "unknown")
-        except Exception as e:
-            edge.verification_metrics["gsreg_error"] = str(e)
-
-    if not gsreg_enabled:
-        allow_depth_only = refine_cfg.get("allow_depth_verified_edge_without_render_refine", True)
-        if not allow_depth_only:
-            edge.rejection_reason = "render_refine_disabled_and_depth_only_not_allowed"
-            return edge
+    allow_depth_only = refine_cfg.get("allow_depth_verified_edge_without_render_refine", True)
+    if not allow_depth_only:
+        edge.rejection_reason = "render_refine_disabled_and_depth_only_not_allowed"
+        return edge
 
     # ---- Delta gate ----
     odom_T = np.linalg.inv(target_record.c2w_global) @ source_record.c2w_global

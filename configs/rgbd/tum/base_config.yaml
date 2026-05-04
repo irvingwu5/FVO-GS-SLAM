@@ -113,7 +113,7 @@ FFTEdgeVO:
 Backend:
   optimize_keyframe_pose: true
   optimize_keyframe_exposure: false
-  backend_pose_sanity_check: true
+  backend_pose_sanity_check: false
   backend_restore_pose_if_changed: true
   backend_pose_check_eps_t: 1.0e-8
   backend_pose_check_eps_r_deg: 1.0e-6
@@ -144,12 +144,9 @@ Submap:
 # Loop Closure Configuration
 # ============================================================
 LoopClosure:
-  registration_method: "reloc3r"  # choices: icp, 2dgs_gsreg, reloc3r, reloc3r_mock
 
   # ===== Stage 0: LoopClosure mode control =====
   mode: keyframe_pgo  # choices: off, detect_only, verify_only, keyframe_pgo
-  legacy_submap_pgo_enabled: false
-  pgo_granularity: keyframe
 
   # ===== Stage 2: Keyframe retrieval =====
   keyframe_retrieval_top_k: 10
@@ -172,7 +169,6 @@ LoopClosure:
 
   # ===== Stage 5: Render refinement =====
   render_refine:
-    enabled: false  # GSReg incompatible with global-coordinate Gaussians
     max_delta_t_from_odom: 50.0
     max_delta_r_deg_from_odom: 90.0
     max_final_depth_rmse: 0.80
@@ -193,44 +189,17 @@ LoopClosure:
   pgo_voxel_size: 2.0
   pgo_edge_prune_threshold: 5.0
 
-  allow_identity_loop_init: false
-
   # ===== Stage 9: Map correction from keyframe PGO =====
   MapCorrection:
     mode: submap_median_from_keyframes  # choices: none, submap_median_from_keyframes, owner_keyframe
     apply_online: false
 
-  gsreg_overlap_radius: 0.10
-  gsreg_min_overlap: 0.15
-  gsreg_topk_views: 3
-  gsreg_max_iters: 80
-  gsreg_lr_rot: 0.002
-  gsreg_lr_trans: 0.005
-  gsreg_rgb_weight: 1.0
-  gsreg_depth_weight: 1.0
-  gsreg_normal_weight: 0.1
-  gsreg_opacity_weight: 0.0
-  gsreg_max_loss: 0.08
-  gsreg_use_render_target: false
-  gsreg_min_successful_views: 2
-  gsreg_max_delta_t_from_init: 0.50
-  gsreg_max_delta_r_from_init: 30.0
 
   # ===== Basic Parameters =====
   min_interval: 3
   voxel_size: 0.02
 
-  # ===== Loop Detection Thresholds =====
-  max_loop_delta_translation: 1.5
-  max_loop_delta_rotation_deg: 60.0
-  icp_fitness_threshold: 0.40
-
-  # ===== PGO Parameters =====
-  default_odom_info_scale: 60.0 #20-40-60
-  recent_query_submaps: 4
-  pgo_edge_prune_thres: 0.25
-
-  # ===== Reloc3R (future replacement for GSReg+ICP) =====
+  # ===== Reloc3R =====
   Reloc3R:
     enabled: true
     mock_mode: false
@@ -248,22 +217,6 @@ LoopClosure:
     max_delta_r_deg: 45.0
     max_pair_rot_std_deg: 15.0
     max_pair_trans_angle_std_deg: 25.0
-
-  # ===== PGO safety valve =====
-  pgo_safety:
-    enabled: true
-    max_correction_t: 2.0
-
-  # PGO protection
-  debug_disable_pgo_for_fftvo_test: false  # DEPRECATED: use LoopClosure.mode=off instead
-  min_loop_fitness_for_pgo: 0.60
-  max_loop_rmse_for_pgo: 0.03
-  max_loop_delta_t_for_pgo: 0.30
-  max_loop_delta_r_for_pgo: 10.0
-
-  # Reloc3R edge quality filters
-  min_raw_vs_init_dot_for_pgo: 0.7
-  max_loop_delta_t_for_pgo_reloc3r: 2.0
 
 
 # ============================================================

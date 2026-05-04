@@ -1,6 +1,6 @@
 # FVO-GS-SLAM: FFT Edge VO Guided RGBD 2D Gaussian Splatting SLAM
 
-FVO-GS-SLAM is an RGBD SLAM system based on 2D Gaussian Splatting and differentiable surfel rendering. The system uses dense FFT Edge VO (EAGS-SLAM style DT alignment + LM optimization) for tracking initialization, render-based pose refinement, RGB/depth/normal joint Gaussian-only mapping, motion-based submap management, CosPlace retrieval + Reloc3R/2DGS-GSReg/ICP loop closure, pose graph optimization, and streaming global Gaussian fusion.
+FVO-GS-SLAM is an RGBD SLAM system based on 2D Gaussian Splatting and differentiable surfel rendering. The system uses dense FFT Edge VO (EAGS-SLAM style DT alignment + LM optimization) for tracking initialization, render-based pose refinement, RGB/depth/normal joint Gaussian-only mapping, motion-based submap management, CosPlace retrieval + Reloc3R keyframe pair estimation + RGB-D depth verification + keyframe-level PGO, and streaming global Gaussian fusion.
 
 The maintained direction is RGBD indoor SLAM on TUM RGBD, Replica, and ScanNet++ datasets.
 
@@ -35,11 +35,12 @@ The current system includes:
 - Cross-submap covisibility handoff: frozen boundary Gaussians smooth submap transitions
 - Active-only coverage for correct hole detection after submap cut
 - CosPlace visual descriptor extraction from saved keyframe images
-- Reloc3R (DUSt3R variant) top-K keyframe pair registration with consistency verification
-- 2DGS-GSReg (LoopSplat-style render-based registration) as registration option
-- ICP (point-to-plane with FDN normals) as fallback registration
-- Pose graph optimization (Open3D) with incremental gating and PGO safety valve
-- Reloc3R edge quality filters: raw_vs_init_dot direction alignment, delta_t/delta_r gates
+- Keyframe-level loop candidate retrieval (cross-submap pair selection)
+- Reloc3R (DUSt3R variant) keyframe pair coarse relative pose estimation
+- RGB-D depth geometric verification with log-spaced scale search
+- Keyframe-level pose graph construction (temporal/handoff/loop edges)
+- Keyframe PGO trial + safety evaluation (Open3D LM, correction/residual gates)
+- Per-keyframe trajectory correction + submap-median Gaussian correction
 - Streaming submap loading and global Gaussian concatenation
 - `rigid_transform_2dgs` for applying correction transforms to 2DGS params
 - ATE trajectory evaluation and rendering quality evaluation
@@ -114,7 +115,7 @@ The loop closure process runs as an independent process:
 1. **Visual retrieval**: Extract CosPlace descriptors (ResNet18 backbone + GeM pooling, weights loaded from disk) from saved keyframe images. Adaptive threshold from self-similarity. **Stage 2**: keyframe-level retrieval produces keyframe pair candidates (not submap pairs).
 2. **Reloc3R keyframe pair estimation** (Stage 3): DUSt3R-variant coarse relative pose for each keyframe pair. Raw translation preserved; scale search delegated to depth verification.
 3. **RGB-D depth geometric verification** (Stage 4): Back-project source depth, transform with Reloc3R pose, project to target, compare depth. Log-spaced scale search (0.1-20×) to find optimal scale. Filters pairs by overlap, depth RMSE, and inlier ratio.
-4. **Refinement → VerifiedLoopEdge** (Stage 5): Delta gates (vs odometry, final depth RMSE). Optional 2DGS-GSReg refinement (disabled by default; incompatible with global-coordinate Gaussians). Produces `VerifiedLoopEdge` with `accepted_for_pgo` decision.
+4. **Refinement → VerifiedLoopEdge** (Stage 5): Delta gates (vs odometry, final depth RMSE). Produces `VerifiedLoopEdge` with `accepted_for_pgo` decision.
 5. **Keyframe pose graph construction** (Stage 6): Nodes = keyframe global C2W (not submap seeds). Edges = temporal (adjacent KFs), handoff (cross-submap boundary), loop (verified closures).
 6. **Keyframe PGO trial + safety evaluation** (Stage 7): Open3D `GlobalOptimizationLevenbergMarquardt` on keyframe graph. Safety gates: max correction t/r, odom residual increase ratio, loop residual decrease ratio, robust edge pruning (max 2 retries). Trial runs in memory only; does NOT write to ckpt by default.
 7. **Trajectory correction** (Stage 8): Accepted PGO → apply per-keyframe corrections (keyframes use optimized_c2w, non-keyframes use nearest-KF correction). Left-multiply: `corrected_c2w = delta @ original_c2w`.
@@ -125,8 +126,6 @@ The loop closure process runs as an independent process:
 - `detect_only`: CosPlace retrieval only, no Reloc3R/PGO
 - `verify_only`: retrieval + Reloc3R + depth verify, NO correct_tsfm write
 - `keyframe_pgo`: full pipeline including PGO trial (write only when safety passes)
-
-**Legacy submap PGO** (`construct_and_optimize_pose_graph`) is deprecated and disabled by default (`legacy_submap_pgo_enabled: false`). Keyframe-level PGO is the recommended path.
 
 ### 7. Streaming global fusion
 
@@ -193,15 +192,6 @@ FVO-GS-SLAM
 │   ├── reloc3r_adapter.py          # Reloc3R keyframe pair coarse pose estimation
 │   ├── keyframe_pgo.py             # keyframe graph build, PGO trial, safety eval, corrections
 │   ├── loop_depth_verifier.py      # RGB-D depth geometric verification with scale search
-│   ├── gaussian_state_manager.py   # active/inactive/handoff Gaussian lifecycle (Stage 10)
-│   ├── registration_2dgs.py        # normal-aware ICP for 2DGS submap registration
-│   ├── gsr_2dgs/                   # LoopSplat-style 2DGS render-based registration
-│   │   ├── solver_2dgs.py          # main registration entry
-│   │   ├── gaussian_io_2dgs.py     # load 2DGS submap ckpt
-│   │   ├── overlap_2dgs.py         # full Gaussian overlap with normal filter
-│   │   ├── viewpoint_localizer_2dgs.py  # render-based viewpoint localization
-│   │   └── pose_fusion_2dgs.py     # weighted pose fusion from multiple candidates
-│   ├── tracking/                   # (future) HybridTracking: EdgeVO + RGB-D ICP
 │   ├── slam_utils.py               # tracking/mapping loss functions
 │   ├── pose_utils.py               # SE(3) pose update utilities
 │   ├── camera_utils.py             # Camera class (viewpoint.T = W2C)
@@ -249,7 +239,6 @@ BackEnd (independent process)
     ↓ saved submap checkpoints
 LoopClosureProcess (independent process)
     ├── Extract CosPlace descriptors from keyframe images
-    ├── Extract point clouds from 2DGS ckpt (FDN normals)
     ├── Keyframe-level retrieval → keyframe pair candidates
     ├── Reloc3R keyframe pair coarse pose estimation
     ├── RGB-D depth geometric verification with scale search
@@ -258,8 +247,7 @@ LoopClosureProcess (independent process)
     ├── Keyframe PGO trial + safety evaluation
     │     Open3D LM optimization on keyframe nodes
     │     Safety gates: max correction, residual ratios, edge pruning
-    ├── If accepted: save keyframe_pgo_result.json
-    └── Legacy submap PGO (deprecated, disabled by default)
+    └── If accepted: save keyframe_pgo_result.json
     ↓
 Main process after tracking
     ├── Stop backend + loop closure
@@ -332,50 +320,50 @@ Key responsibilities:
 
 ### `utils/loop_closure.py` — Loop Closure
 
-Submap-level global consistency (independent process).
+Keyframe-level global consistency (independent process).
 
 Key responsibilities:
 - Implement CosPlace visual retrieval network (ResNet18 + GeM pooling)
-- Maintain submap checkpoint records and point cloud caches
-- Extract image descriptors from saved keyframe images
-- Detect loop candidates (cosine similarity + adaptive threshold)
-- Verify: Reloc3R / 2DGS-GSReg / ICP with FDN normals
-- Reject unreliable loop edges (fitness, RMSE, delta_t, delta_r, raw_vs_init_dot)
-- Build pose graph with odometry edges + loop edges
-- Open3D GlobalOptimizationLevenbergMarquardt PGO
-- Incremental PGO gating + PGO safety valve (correction magnitude guard)
-- Write `correct_tsfm` to submap checkpoints (PGO success only)
-- Apply rigid transforms to 2DGS params via `rigid_transform_2dgs`
+- Maintain submap checkpoint records and keyframe database
+- Extract per-keyframe CosPlace descriptors from saved images
+- Keyframe-level retrieval → cross-submap pair candidates
+- Reloc3R keyframe pair coarse pose estimation
+- RGB-D depth geometric verification with log-scale search
+- Refine → VerifiedLoopEdge with delta gates
+- Build keyframe pose graph (temporal/handoff/loop edges)
+- Keyframe PGO trial + safety evaluation
+- Save keyframe_pgo_result.json when accepted
+- LoopClosure mode control (`off`/`detect_only`/`verify_only`/`keyframe_pgo`)
 
-### `utils/reloc3r_adapter.py` — Reloc3R Submap Registration
+### `utils/reloc3r_adapter.py` — Reloc3R Keyframe Pair Estimation
 
-Lightweight submap registration using Reloc3R (DUSt3R variant).
+Keyframe-level coarse relative pose estimation using Reloc3R (DUSt3R variant).
 
 Key responsibilities:
-- Load Reloc3R model once, reuse across all submap pairs
-- Build top-K keyframe pairs via CosPlace cross-similarity
-- Run Reloc3R inference on each pair
-- Convert per-pair camera-space transform to submap-level `T_src_to_tgt`
-- `init_guess_norm`: scale Reloc3R's translation to metric using odometry chain
-- Consistency verification: rotation std, translation direction std across pairs
-- Track `raw_vs_init_dot` (direction alignment between Reloc3R raw output and odometry)
-- Return metrics: `num_valid_pairs`, `rot_std_deg`, `min_raw_vs_init_dot`, `delta_t`, `delta_r`
+- Load Reloc3R model once, reuse across all keyframe pairs
+- Run Reloc3R inference on a single keyframe pair
+- Preserve raw Reloc3R translation (scale search delegated to depth verifier)
+- Return `Reloc3RPairEstimate` with direction alignment diagnostics
 
-### `utils/gsr_2dgs/` — 2DGS GSReg
+### `utils/keyframe_pgo.py` — Keyframe PGO
 
-LoopSplat-style render-based 2DGS submap registration.
+Keyframe-level pose graph optimization and correction module.
 
-| File | Role |
-|---|---|
-| `solver_2dgs.py` | Main entry: load ckpts, compute overlap, localize viewpoints, fuse poses |
-| `gaussian_io_2dgs.py` | Load full 2DGS Gaussian params from ckpt (no downsample) |
-| `overlap_2dgs.py` | Symmetric full-Gaussian overlap with optional normal-angle filter |
-| `viewpoint_localizer_2dgs.py` | Render-based viewpoint localization: optimize pose delta only |
-| `pose_fusion_2dgs.py` | Weighted pose fusion from multiple viewpoint candidates |
+Key responsibilities:
+- Build keyframe pose graph from unified keyframe database
+- Run O3D PGO trial with safety evaluation gates
+- Apply per-keyframe trajectory correction (left-multiply delta)
+- Apply submap-median Gaussian correction from keyframe deltas
 
-### `utils/registration_2dgs.py` — Normal-aware ICP
+### `utils/loop_depth_verifier.py` — Depth Verification
 
-Normal-aware ICP registration for 2DGS submap pairs. Extracts normals from ckpt `_normal` (FDN) or derives from `_rotation` quaternion (local z-axis). Used as a utility in loop closure.
+RGB-D geometric verification for Reloc3R keyframe pair estimates.
+
+Key responsibilities:
+- Back-project source depth to 3D point cloud
+- Transform, project, compare with target depth
+- Log-spaced scale search to find optimal translation scale
+- Three-gate acceptance: overlap, RMSE, inlier ratio
 
 ### `gaussian_splatting/scene/gaussian_model.py` — Gaussian Model
 
@@ -413,7 +401,7 @@ Back end → front end:
 Back end → loop closure:
 
 ```text
-["submap_saved", submap_id, ckpt_path, kf_image_paths]
+["submap_saved", submap_id, ckpt_path, kf_image_paths, kf_depth_paths]
 ["stop"]
 ```
 
@@ -448,7 +436,7 @@ Important configuration groups:
 | `FFTEdgeVO` | Edge VO pyramid, optimization, quality thresholds |
 | `Backend` | keyframe pose policy, pose sanity check |
 | `Submap` | motion thresholds (TUM: 2.0m/80°), seed init, handoff |
-| `LoopClosure` | registration method, GSReg params, ICP params, PGO protection |
+| `LoopClosure` | mode control, keyframe retrieval, depth verify, keyframe PGO safety, Reloc3R |
 | `opt_params` | Gaussian optimizer and densification params |
 | `model_params` | SH degree, data device |
 | `pipeline_params` | renderer settings |
@@ -564,16 +552,14 @@ Backend:
   optimize_keyframe_exposure: false   # keyframe exposure optimization
 
 LoopClosure:
-  registration_method: "2dgs_gsreg"  # "reloc3r", "2dgs_gsreg", "icp", or "reloc3r_mock"
-  debug_disable_pgo_for_fftvo_test: false  # PGO enabled by default (set true for FFTVO ablation)
-  pgo_safety:                           # PGO safety valve
-    enabled: true
-    max_correction_t: 2.0
-  min_raw_vs_init_dot_for_pgo: 0.7     # Reloc3R direction alignment filter
-  max_loop_delta_t_for_pgo_reloc3r: 2.0  # Reloc3R delta_t filter
+  mode: verify_only  # off / detect_only / verify_only / keyframe_pgo
+  keyframe_pgo_safety:
+    max_correction_t: 1.0
+    max_correction_r_deg: 15.0
+    min_verified_loop_edges: 3
 ```
 
-For debugging FFTEdgeVO alone, disable PGO with `debug_disable_pgo_for_fftvo_test: true` — evaluates whether FFTEdgeVO improves tracking before global corrections are introduced.
+For debugging FFTEdgeVO alone, set `LoopClosure.mode=off` — evaluates whether FFTEdgeVO improves tracking before global corrections are introduced.
 
 ---
 
@@ -589,7 +575,7 @@ For debugging FFTEdgeVO alone, disable PGO with `debug_disable_pgo_for_fftvo_tes
 
 ## Acknowledgement
 
-This project is developed based on the MonoGS style Gaussian SLAM framework. The repository adapts it toward RGBD 2D Gaussian SLAM with FFT Edge VO initialization, motion-based submaps, CosPlace + 2DGS-GSReg/ICP loop closure, PGO correction, and streaming global fusion.
+This project is developed based on the MonoGS style Gaussian SLAM framework. The repository adapts it toward RGBD 2D Gaussian SLAM with FFT Edge VO initialization, motion-based submaps, CosPlace + Reloc3R keyframe pair estimation + RGB-D depth verification + keyframe-level PGO, and streaming global fusion.
 
 ---
 

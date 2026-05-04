@@ -147,12 +147,9 @@ Submap:
 # Loop Closure Configuration
 # ============================================================
 LoopClosure:
-  registration_method: "2dgs_gsreg"  # choices: icp, 2dgs_gsreg
 
   # ===== Stage 0: LoopClosure mode control =====
   mode: verify_only  # choices: off, detect_only, verify_only, keyframe_pgo
-  legacy_submap_pgo_enabled: false
-  pgo_granularity: keyframe
 
   # ===== Stage 2: Keyframe retrieval =====
   keyframe_retrieval_top_k: 10
@@ -182,61 +179,41 @@ LoopClosure:
     allow_depth_verified_edge_without_render_refine: true
 
   # ===== Stage 7: Keyframe PGO safety =====
-  keyframe_pgo_odom_info_scale: 100.0
-  keyframe_pgo_handoff_info_scale: 50.0
+  keyframe_pgo_odom_info_scale: 10.0
+  keyframe_pgo_handoff_info_scale: 5.0
   keyframe_pgo_safety:
-    max_correction_t: 0.30
-    max_correction_r_deg: 8.0
-    max_odom_residual_increase_ratio: 1.20
+    max_correction_t: 1.00
+    max_correction_r_deg: 15.0
+    max_odom_residual_increase_ratio: 2.00
     min_loop_residual_decrease_ratio: 0.30
-    max_single_loop_residual_after_t: 0.15
+    max_single_loop_residual_after_t: 0.30
     max_single_loop_residual_after_r_deg: 5.0
-    min_verified_loop_edges: 1
+    min_verified_loop_edges: 3
     max_pgo_retries: 2
-
-  allow_identity_loop_init: false
+  pgo_voxel_size: 2.0
+  pgo_edge_prune_threshold: 5.0
 
   # ===== Stage 9: Map correction from keyframe PGO =====
   MapCorrection:
     mode: submap_median_from_keyframes  # choices: none, submap_median_from_keyframes, owner_keyframe
     apply_online: false
 
-  gsreg_overlap_radius: 0.10
-  gsreg_min_overlap: 0.15
-  gsreg_topk_views: 3
-  gsreg_max_iters: 80
-  gsreg_lr_rot: 0.002
-  gsreg_lr_trans: 0.005
-  gsreg_rgb_weight: 1.0
-  gsreg_depth_weight: 1.0
-  gsreg_normal_weight: 0.1
-  gsreg_max_loss: 0.10
-  gsreg_use_render_target: false
-  gsreg_min_successful_views: 2
-  gsreg_max_delta_t_from_init: 0.50
-  gsreg_max_delta_r_from_init: 30.0
 
   # ===== Basic Parameters =====
   min_interval: 3
   voxel_size: 0.05
   max_search_range: 5 #限制参与位姿图优化（PGO）的最近子图数量，控制搜索范围、计算量和内存占用
 
-  # ===== Loop Detection Thresholds =====
-  max_loop_delta_translation: 0.80
-  max_loop_delta_rotation_deg: 45.0
-  icp_fitness_threshold: 0.60
 
-  # ===== PGO Parameters =====
-  default_odom_info_scale: 120.0
-  recent_query_submaps: 2
-  pgo_edge_prune_thres: 0.25
 
   # ===== Reloc3R (future replacement for GSReg+ICP) =====
   Reloc3R:
     enabled: false
+    mock_mode: false
     repo_path: third_party/reloc3r
-    checkpoint: Reloc3r-512
-    image_size: 512
+    checkpoint: siyan824/reloc3r-224
+    local_checkpoint: weights/reloc3r-224.pth
+    image_size: 224
     use_amp: true
     device: cuda
     topk_pairs: 5
@@ -249,16 +226,7 @@ LoopClosure:
     max_pair_rot_std_deg: 15.0
     max_pair_trans_angle_std_deg: 25.0
 
-  # PGO protection
-  debug_disable_pgo_for_fftvo_test: true
-  min_loop_fitness_for_pgo: 0.40
-  max_loop_rmse_for_pgo: 0.04
-  max_loop_delta_t_for_pgo: 1.5
-  max_loop_delta_r_for_pgo: 45.0
 
-  # Reloc3R edge quality filters
-  min_raw_vs_init_dot_for_pgo: 0.7
-  max_loop_delta_t_for_pgo_reloc3r: 2.0
 
 # ============================================================
 # Gaussian Optimization Parameters
