@@ -59,8 +59,6 @@ class FrontEnd(mp.Process):
         self.frame_to_submap = {}  # <--- 记录每帧属于哪个子图
         # ========== LoopSplat-style submap handoff ==========
         # 新子图 seed 帧不再重置到单位阵，而是继承旧子图 tracking 后的全局估计位姿。
-        # 每个子图 seed 的全局 c2w，用于保存子图间 transition 和后续 PGO。
-        self.submap_seed_global_c2w = {0: np.eye(4, dtype=np.float64)}
         self.last_submap_seed_global_c2w = None
         # ================================================
         self.submap_motion_anchor_global_c2w = None #运动监控锚点（global C2W）
@@ -150,9 +148,8 @@ class FrontEnd(mp.Process):
         viewpoint.cam_rot_delta.requires_grad_(False)
         viewpoint.cam_trans_delta.requires_grad_(False)
 
-        # Record submap 0 seed C2W (actual seed frame, not overwritten later)
+        # Record submap 0 seed C2W for submap-to-submap transition computation
         seed_c2w = np.linalg.inv(viewpoint.T_gt.cpu().numpy()).astype(np.float64)
-        self.submap_seed_global_c2w[0] = seed_c2w.copy()
         self.last_submap_seed_global_c2w = seed_c2w.copy()
 
         self.kf_indices = []
@@ -617,7 +614,6 @@ class FrontEnd(mp.Process):
         completed_submap_id = self.current_submap_id
         new_submap_id = completed_submap_id + 1
 
-        self.submap_seed_global_c2w[new_submap_id] = seed_global_c2w.copy()
         self.last_submap_seed_global_c2w = seed_global_c2w.copy()
 
         # 3) 通知后端冻结旧子图。
@@ -648,7 +644,6 @@ class FrontEnd(mp.Process):
 
         viewpoint.fixed_pose = True
         viewpoint.is_submap_seed = True
-        viewpoint.seed_global_c2w = seed_global_c2w.copy()
         viewpoint.reset_pose_deltas()
         viewpoint.cam_rot_delta.requires_grad_(False)
         viewpoint.cam_trans_delta.requires_grad_(False)
