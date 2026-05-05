@@ -33,6 +33,7 @@ The current system includes:
 - Submap checkpoint saving (Gaussian params, keyframe poses, seed global C2W, relative/correct tsfm)
 - RSKM (Random Sampling Keyframe Mapping): random keyframe replay within active submap
 - Cross-submap covisibility handoff: frozen boundary Gaussians smooth submap transitions
+- RAP2DGS Lite: lightweight rule-based scoring for handoff selection (KNN + 6 geometric features)
 - Active-only coverage for correct hole detection after submap cut
 - CosPlace visual descriptor extraction from saved keyframe images
 - Keyframe-level loop candidate retrieval (cross-submap pair selection)
@@ -161,6 +162,29 @@ handoff_warmup_keyframes: 3 # max keyframes before forced drop
 handoff_new_coverage_th: 0.85  # active coverage threshold for early drop
 ```
 
+### 9. RAP2DGS Lite: Rule-Based Handoff Scoring
+
+To improve the quality of boundary Gaussian selection, the system includes RAP2DGS Lite (`utils/rap2dgs_lite/`), a lightweight rule-based scoring module that replaces the simple `support + 0.2 × opacity` heuristic in handoff selection:
+
+1. **Candidate generation**: Same visibility-based mask as original handoff (seed frame + tail keyframes).
+2. **Shared KNN**: Single chunked KNN on candidate positions, shared by all geometric features.
+3. **Six feature scores** (all normalized to [0,1]): support (percentile-norm), opacity (min-max norm), observation (log1p-norm), area (bounded midrange), normal consistency (mean |dot| with KNN), local density (bounded midrange of mean KNN distance).
+4. **Weighted fusion**: `S = 0.25·support + 0.20·opacity + 0.20·obs + 0.10·area + 0.15·normal + 0.10·density`.
+5. **Top-K selection**: Retain ρ=25% of candidates, capped at 8000.
+6. **Safety**: Never prunes active map. Auto-fallback to original heuristic on any failure. Default `enable: false` preserves baseline.
+
+On TUM fr3_long_office_household, RAP2DGS Lite (k=16) achieves ATE 0.0237m (vs 0.0253 no-handoff, 0.0263 original) and PSNR 25.12 dB, ~680ms avg latency per transition, zero fallbacks across 35 events.
+
+```yaml
+RAP2DGSLite:
+  enable: false               # master switch; baseline unchanged when false
+  use_in_handoff: false
+  knn: {k: 16, chunk_size: 4096}
+  features: {use_support, use_opacity, use_observation, use_area, use_normal, use_density: true}
+  score_weights: {support: 0.25, opacity: 0.20, observation: 0.20, area: 0.10, normal: 0.15, density: 0.10}
+  selection: {keep_percent: 0.25, max_keep: 8000}
+```
+
 ---
 
 ## Repository Structure
@@ -186,6 +210,7 @@ FVO-GS-SLAM
 ├── utils/
 │   ├── slam_frontend.py            # tracking, keyframes, submap decisions, queue comms
 │   ├── slam_backend.py             # Gaussian mapping, densify/prune, submap save
+│   ├── rap2dgs_lite/               # lightweight rule-based handoff selection
 │   ├── fft_edge_vo.py              # FFT Edge VO: dense DT alignment + LM optimization
 │   ├── fft_filter.py               # FFT high-frequency mask generation
 │   ├── loop_closure.py             # CosPlace, keyframe retrieval, Reloc3R/depth/PGO pipeline
@@ -436,6 +461,7 @@ Important configuration groups:
 | `FFTEdgeVO` | Edge VO pyramid, optimization, quality thresholds |
 | `Backend` | keyframe pose policy, pose sanity check |
 | `Submap` | motion thresholds (TUM: 2.0m/80°), seed init, handoff |
+| `RAP2DGSLite` | rule-based handoff scoring: KNN k, features, weights, selection budget |
 | `LoopClosure` | mode control, keyframe retrieval, depth verify, keyframe PGO safety, Reloc3R |
 | `opt_params` | Gaussian optimizer and densification params |
 | `model_params` | SH degree, data device |
