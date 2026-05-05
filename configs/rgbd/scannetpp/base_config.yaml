@@ -144,6 +144,56 @@ Submap:
   handoff_depth_consistency_th: 0.08
 
 # ============================================================
+# RAP2DGS Lite Configuration (lightweight rule-based handoff scoring)
+# ============================================================
+RAP2DGSLite:
+  enable: false               # Master switch; baseline unchanged when false
+  mode: "rule"                # Scoring mode: "rule" only in v1
+  use_in_handoff: false       # Replace handoff scoring when true
+  fallback_to_original: true  # Fallback to support+opacity on error
+
+  candidate:
+    max_candidate_points: 20000          # Hard cap on candidates before scoring
+    prefilter_by_support_opacity: true   # Coarse prefilter when over max
+    prefilter_max_points: 20000          # Prefilter target
+
+  knn:
+    enable: true
+    k: 16
+    chunk_size: 4096
+
+  features:
+    use_support: true
+    use_opacity: true
+    use_observation: true
+    use_area: true
+    use_axis_ratio: true
+    use_normal: true
+    use_density: true
+    use_color: false
+    use_sh_anisotropy: false
+
+  score_weights:
+    support: 0.25
+    opacity: 0.20
+    observation: 0.20
+    area: 0.10
+    normal: 0.15
+    density: 0.10
+
+  selection:
+    keep_percent: 0.25
+    min_keep: 1000
+    max_keep: 8000
+
+  safety:
+    never_prune_active_map: true
+    protect_recent_kf: 3
+    protect_high_obs: 3
+    log_report: true
+    report_dir: "rap2dgs_lite_reports"
+
+# ============================================================
 # Loop Closure Configuration
 # ============================================================
 LoopClosure:

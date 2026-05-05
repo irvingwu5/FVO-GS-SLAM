@@ -81,6 +81,16 @@ class BackEnd(mp.Process):
         self.handoff_age_frames = 0
         Log(f"[Handoff] use_handoff={self.use_handoff}")
 
+        # ===== RAP2DGS Lite =====
+        rap_cfg = self.config.get("RAP2DGSLite", {})
+        self.rap2dgs_lite_enable = rap_cfg.get("enable", False)
+        self.rap2dgs_lite_use_in_handoff = rap_cfg.get("use_in_handoff", False)
+        self.rap2dgs_lite_fallback_to_original = rap_cfg.get("fallback_to_original", True)
+        self.rap2dgs_lite_cfg = rap_cfg
+        self.rap2dgs_lite_selector = None
+        Log(f"[RAP2DGS-Lite] enable={self.rap2dgs_lite_enable}, "
+            f"use_in_handoff={self.rap2dgs_lite_use_in_handoff}")
+
         # ===== Backend pose policy (EAGS 风格: Gaussian only) =====
         self.optimize_keyframe_pose = self.config.get("Backend", {}).get(
             "optimize_keyframe_pose", False
@@ -653,6 +663,116 @@ class BackEnd(mp.Process):
         result[selected] = True
         return result
 
+    def _rap2dgs_lite_handoff_select(self, cand_mask, support, opacity):
+        """RAP2DGS Lite handoff selection with automatic fallback to original.
+
+        Args:
+            cand_mask: (N,) bool candidate mask
+            support: (N,) long tensor, visibility support count
+            opacity: (N,) float tensor, sigmoid-activated opacity
+
+        Returns:
+            selected: (N,) bool mask, always a subset of cand_mask
+        """
+        import time
+
+        N = cand_mask.shape[0]
+        t0 = time.time()
+
+        # ---- Lazy init selector ----
+        if self.rap2dgs_lite_selector is None:
+            from utils.rap2dgs_lite.selector import RAP2DGSLiteSelector
+            self.rap2dgs_lite_selector = RAP2DGSLiteSelector(self.rap2dgs_lite_cfg)
+
+        # ---- Effective max_keep: capped by handoff_max_points ----
+        sel_cfg = self.rap2dgs_lite_cfg.get("selection", {})
+        rap_max_keep = int(sel_cfg.get("max_keep", 8000))
+        effective_max_keep = min(rap_max_keep, self.handoff_max_points)
+
+        current_kf_id = self.current_window[-1] if len(self.current_window) > 0 else None
+
+        fallback = False
+        fallback_reason = ""
+
+        try:
+            selected_mask, _scores, report = self.rap2dgs_lite_selector.select(
+                gaussians=self.gaussians,
+                candidate_mask=cand_mask,
+                support_count=support,
+                current_kf_id=current_kf_id,
+                max_keep=effective_max_keep,
+            )
+
+            # ---- Safety checks ----
+            if report.get("fallback_required", False):
+                fallback = True
+                fallback_reason = report.get("fallback_reason", "selector_fallback")
+            elif selected_mask.sum() == 0:
+                fallback = True
+                fallback_reason = "empty_selected_mask"
+            elif selected_mask.shape[0] != N:
+                fallback = True
+                fallback_reason = f"shape_mismatch:{selected_mask.shape[0]}!={N}"
+            elif selected_mask.dtype != torch.bool:
+                fallback = True
+                fallback_reason = f"dtype_mismatch:{selected_mask.dtype}"
+            elif (selected_mask & ~cand_mask).any():
+                fallback = True
+                fallback_reason = "selected_not_subset_of_candidate"
+            else:
+                pass  # all checks passed
+
+            elapsed_ms = (time.time() - t0) * 1000.0
+
+        except Exception as e:
+            fallback = True
+            fallback_reason = f"exception:{e}"
+            elapsed_ms = (time.time() - t0) * 1000.0
+            torch.cuda.empty_cache()
+
+        if fallback:
+            Log(
+                f"[RAP2DGS-Lite] fallback to original handoff: "
+                f"reason={fallback_reason} elapsed={elapsed_ms:.1f}ms"
+            )
+            score = support.float() + 0.2 * opacity.float()
+            return self._select_topk_mask(cand_mask, score, self.handoff_max_points)
+
+        n_cand = int(cand_mask.sum().item())
+        n_sel = int(selected_mask.sum().item())
+        Log(
+            f"[RAP2DGS-Lite] handoff selection: "
+            f"candidates={n_cand} selected={n_sel} "
+            f"elapsed={elapsed_ms:.1f}ms fallback=False"
+        )
+
+        # ---- Save report if configured ----
+        if self.rap2dgs_lite_cfg.get("safety", {}).get("log_report", False):
+            try:
+                from utils.rap2dgs_lite.report import save_report_json
+
+                report["num_total_gaussians"] = N
+                report["num_candidates"] = n_cand
+                report["num_selected"] = n_sel
+                report["elapsed_ms"] = elapsed_ms
+                report["fallback_required"] = False
+                report["fallback_reason"] = ""
+
+                save_dir = self.config["Results"]["save_dir"]
+                report_dir_name = (
+                    self.rap2dgs_lite_cfg.get("safety", {})
+                    .get("report_dir", "rap2dgs_lite_reports")
+                )
+                out_dir = os.path.join(save_dir, report_dir_name)
+                old_submap = self.current_submap_id
+                new_submap = self.current_submap_id + 1
+                label = f"handoff_submap_{old_submap}_to_{new_submap}"
+                save_report_json(report, out_dir, label=label)
+            except Exception as e:
+                Log(f"[RAP2DGS-Lite] failed to save report: {e}")
+
+        return selected_mask
+
     def build_boundary_handoff(self, new_seed_global_c2w):
         """
         在旧子图被清除前，基于 seed frame + 尾部关键帧共视关系选择边界 Handoff Gaussian。
@@ -698,8 +818,13 @@ class BackEnd(mp.Process):
                 & (opacity > self.handoff_opacity_min)
             )
 
-            score = support.float() + 0.2 * opacity.float()
-            selected = self._select_topk_mask(mask, score, self.handoff_max_points)
+            if self.rap2dgs_lite_enable and self.rap2dgs_lite_use_in_handoff:
+                selected = self._rap2dgs_lite_handoff_select(
+                    mask, support, opacity
+                )
+            else:
+                score = support.float() + 0.2 * opacity.float()
+                selected = self._select_topk_mask(mask, score, self.handoff_max_points)
 
             handoff_params = self.gaussians.capture_masked(selected)
 
