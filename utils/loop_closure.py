@@ -522,7 +522,8 @@ class LoopClosureProcess(mp.Process):
                     verified_loop_edges = []
                     if self.mode in ("verify_only", "keyframe_pgo"):
                         loop_cfg = self.config.get("LoopClosure", {})
-                        refine_cfg = loop_cfg.get("render_refine", {})
+                        # loop_edge_gates consumed inside refine_keyframe_loop_edge()
+                        _gate_cfg = loop_cfg.get("loop_edge_gates", {})
                         refine_log_path = os.path.join(
                             self.save_dir, "loop_verified_edges.jsonl"
                         )

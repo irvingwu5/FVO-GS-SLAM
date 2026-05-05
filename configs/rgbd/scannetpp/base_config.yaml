@@ -118,8 +118,6 @@ Backend:
   optimize_keyframe_exposure: false
   backend_pose_sanity_check: true
   backend_restore_pose_if_changed: true
-  backend_pose_check_eps_t: 1.0e-8
-  backend_pose_check_eps_r_deg: 1.0e-6
   pose_check_log_every: 99999
 
 # ============================================================
@@ -141,37 +139,25 @@ Submap:
   handoff_warmup_frames: 20
   handoff_warmup_keyframes: 3
   handoff_new_coverage_th: 0.85
-  handoff_depth_consistency_th: 0.08
 
 # ============================================================
 # RAP2DGS Lite Configuration (lightweight rule-based handoff scoring)
 # ============================================================
 RAP2DGSLite:
-  enable: false               # Master switch; baseline unchanged when false
-  mode: "rule"                # Scoring mode: "rule" only in v1
-  use_in_handoff: false       # Replace handoff scoring when true
-  fallback_to_original: true  # Fallback to support+opacity on error
-
-  candidate:
-    max_candidate_points: 20000          # Hard cap on candidates before scoring
-    prefilter_by_support_opacity: true   # Coarse prefilter when over max
-    prefilter_max_points: 20000          # Prefilter target
+  enable: false                    # 总开关，false 时模块完全不加载
+  use_in_handoff: false            # handoff 时使用 RAP2DGS Lite 替代原始支持度评分
 
   knn:
-    enable: true
-    k: 16
-    chunk_size: 4096
+    k: 16                          # KNN 邻居数，消融验证 16 最优，8-32
+    chunk_size: 4096               # chunked cdist 块大小，1024-8192
 
   features:
-    use_support: true
-    use_opacity: true
-    use_observation: true
-    use_area: true
-    use_axis_ratio: true
-    use_normal: true
-    use_density: true
-    use_color: false
-    use_sh_anisotropy: false
+    use_support: true              # 共视支持度
+    use_opacity: true              # 透明度
+    use_observation: true          # 观测次数 n_obs
+    use_area: true                 # surfel 面积
+    use_normal: true               # 法向一致性
+    use_density: true              # 局部密度
 
   score_weights:
     support: 0.25
@@ -182,16 +168,13 @@ RAP2DGSLite:
     density: 0.10
 
   selection:
-    keep_percent: 0.25
-    min_keep: 1000
-    max_keep: 8000
+    keep_percent: 0.25             # 保留比例，0.15-0.40
+    min_keep: 1000                 # 最少保留点数
+    max_keep: 8000                 # 最多保留点数，≤ handoff_max_points
 
   safety:
-    never_prune_active_map: true
-    protect_recent_kf: 3
-    protect_high_obs: 3
-    log_report: true
-    report_dir: "rap2dgs_lite_reports"
+    never_prune_active_map: true   # 硬约束：仅输出 mask，从不修改 GaussianModel
+    log_report: true               # 每次 handoff 保存 JSON 报告
 
 # ============================================================
 # Loop Closure Configuration
@@ -220,13 +203,12 @@ LoopClosure:
     depth_sample_count: 5000
     scale_search_steps: 10
 
-  # ===== Stage 5: Render refinement =====
-  render_refine:
-    enabled: false
-    max_delta_t_from_odom: 1.0
-    max_delta_r_deg_from_odom: 30.0
-    max_final_depth_rmse: 0.05
-    allow_depth_verified_edge_without_render_refine: true
+  # ===== Stage 5: Loop edge acceptance gates (odometry consistency + depth RMSE) =====
+  loop_edge_gates:
+    allow_depth_only: true          # 仅深度验证即可接受回环边
+    max_delta_t_from_odom: 1.0      # ScanNet++ 深度位姿与里程计的最大平移偏差 (m)，0.5-5.0
+    max_delta_r_deg_from_odom: 30.0 # 深度位姿与里程计的最大旋转偏差 (deg)，10-60
+    max_depth_rmse: 0.05            # 接受回环边的最大深度 RMSE (m)，0.02-0.15
 
   # ===== Stage 7: Keyframe PGO safety =====
   keyframe_pgo_odom_info_scale: 10.0
@@ -313,10 +295,6 @@ opt_params:
 model_params:
   sh_degree: 0
   source_path: ""
-  model_path: ""
-  resolution: -1
-  white_background: False
-  data_device: "cuda"
 
 # ============================================================
 # Pipeline Parameters

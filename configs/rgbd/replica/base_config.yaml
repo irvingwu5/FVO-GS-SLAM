@@ -2,26 +2,26 @@
 # Results Configuration
 # ============================================================
 Results:
-  save_results: True
-  save_dir: "replica_results"
-  save_trj: True
-  save_trj_kf_intv: 20 #20->40
-  use_gui: False
-  eval_rendering: False
-  use_wandb: False
+  save_results: True               # 是否保存结果到硬盘
+  save_dir: "replica_results"      # 结果根目录
+  save_trj: True                   # 是否保存轨迹文件 (.txt)
+  save_trj_kf_intv: 20             # 轨迹保存间隔（每 N 帧），Replica 帧数较多设 20
+  use_gui: False                   # 是否启用 OpenGL GUI 可视化
+  eval_rendering: False            # 是否评估渲染质量（PSNR/SSIM/LPIPS/Depth L1）
+  use_wandb: False                 # 是否启用 W&B 在线日志
 
 # ============================================================
 # Dataset Configuration
 # ============================================================
 Dataset:
-  type: 'replica'
-  sensor_type: 'depth'
-  pcd_downsample: 64 #其他阶段下采样因子，保留1/64%点云
-  pcd_downsample_init: 32 #初始阶段下采样因子
-  adaptive_pointsize: True #点大小乘中值深度得到场景中点的实际大小，限制最小为0.05
-  point_size: 0.05 # 影响scales的初始化
+  type: 'replica'                  # 数据集类型: tum / replica / scannetpp
+  sensor_type: 'depth'             # 传感器模式: depth（RGBD）/ monocular
+  pcd_downsample: 64               # 建图阶段点云下采样因子 (1/N)，Replica 1200×680 → 64
+  pcd_downsample_init: 32          # 首帧/seed 帧初始化时下采样因子，值越小点越多
+  adaptive_pointsize: True         # 是否根据中值深度自适应调整 point_size
+  point_size: 0.05                 # 基础点大小 (m)，Replica 场景尺度大设 0.05
   Calibration:
-    fx: 600.0
+    fx: 600.0                      # [Replica 默认内参] 仅当场景 yaml 未覆盖时使用
     fy: 600.0
     cx: 599.5
     cy: 339.5
@@ -40,141 +40,138 @@ Dataset:
 # ============================================================
 Training:
   # ===== Initialization Parameters =====
-  init_itr_num: 1050 # 首帧初始化时优化的迭代次数
-  init_gaussian_update: 100 #每隔多少次进行一次gs密化和修剪
-  init_gaussian_reset: 500 #当总迭代次数iter_count达到该值时，把gs不透明度重置为0.01
-  init_gaussian_th: 0.005 #该值设置必须小于0.01，由于reset opacity为0.01<0.02，则全员gs被剪枝，0.005->0.02
-  init_gaussian_extent: 30 #对densify的影响:值越大倾向于clone,值越小倾向于split,对prune的影响:值越大浮空伪影无法被剔除，值越小容易过度剔除，背景空洞
+  init_itr_num: 1050               # 首帧/seed 帧初始化迭代次数，500-2000
+  init_gaussian_update: 100        # 初始化阶段每 N 次迭代执行一次 densify+prune
+  init_gaussian_reset: 500         # 初始化阶段第 N 次迭代重置 opacity 为 0.01
+  init_gaussian_th: 0.005          # 初始化阶段 prune 的 opacity 下限，必须 < 0.01
+  init_gaussian_extent: 30         # 初始化阶段 densify extent 系数，越大越倾向 clone
 
   # ===== Tracking Parameters =====
-  tracking_itr_num: 100 #每帧跟踪优化的迭代次数
+  tracking_itr_num: 100            # 每帧 tracking 渲染精化迭代次数，60-200
 
   # ===== Mapping Parameters =====
-  mapping_itr_num: 150 #建图阶段每处理一个新关键帧时的优化迭代次数150->4dtam 5
-  gaussian_update_every: 150 #每隔多少次进行一次gs密化和修剪,
-  gaussian_update_offset: 50 #当总迭代次数为50、50+150、50+2*150、50+3*150...时进行gs密化和修剪
-  gaussian_th: 0.7 #控制高斯点的不透明度下限，小于该值的gs会被剔除
-  gaussian_extent: 1.0 ##gs的scaling>该值*camera_extent*0.1时被剔除
-  gaussian_reset: 2001 #当总迭代次数iter_count达到该值时，把gs不透明度重置为0.01
-  size_threshold: 20 #如果max_radii2d(好像全0)>投影gs尺寸阈值，则被剔除
+  mapping_itr_num: 150             # 每关键帧 mapping 迭代次数，Replica 收敛快设 150（TUM: 180）
+  gaussian_update_every: 150       # densify+prune 间隔（迭代次数）
+  gaussian_update_offset: 50       # 首次 densify+prune 偏移（iteration==offset 时触发）
+  gaussian_th: 0.7                 # prune 的 opacity 下限，低于此值被剔除，0.3-0.9
+  gaussian_extent: 1.0             # prune 的 scaling 上限系数，scaling > extent*0.1 被剔除
+  gaussian_reset: 2001             # 周期性 opacity reset 的迭代间隔，1000-5000
+  size_threshold: 20               # 2D 投影半径上限 (pixels)，超限触发 prune
 
   # ===== Keyframe Parameters =====
-  kf_interval: 4 #创建关键帧的间隔帧数
-  kf_translation: 0.04
-  kf_min_translation: 0.02
-  kf_overlap: 0.95
-  kf_cutoff: 0.3
+  kf_interval: 4                   # 最小关键帧间隔（帧数），Replica 帧率低设 4
+  kf_translation: 0.04             # 关键帧插入平移阈值 (m)，Replica 场景小设 0.04（TUM: 0.08）
+  kf_min_translation: 0.02         # 最小平移阈值 (m)，Replica: 0.02（TUM: 0.05）
+  kf_overlap: 0.95                 # 关键帧重叠率阈值，Replica 运动慢设 0.95（TUM: 0.90）
+  kf_cutoff: 0.3                   # 关键帧选择截止比例，0.2-0.5
 
   # ===== Window Parameters =====
-  window_size: 10 #关键帧滑动窗口
-  pose_window: 5 #只更新滑动窗口中位姿优化窗口内的相机位姿
+  window_size: 10                  # 滑动窗口中关键帧数量，Replica 设 10（TUM: 8）
+  pose_window: 5                   # 滑动窗口中参与位姿优化的关键帧数，Replica: 5（TUM: 3）
 
   # ===== Learning Rate =====
   lr:
-    cam_rot_delta: 0.003
-    cam_trans_delta: 0.001
+    cam_rot_delta: 0.003           # 位姿旋转 delta 学习率，0.001-0.01
+    cam_trans_delta: 0.001         # 位姿平移 delta 学习率，0.0005-0.005
 
   # ===== Other Training Parameters =====
-  edge_threshold: 4
-  rgb_boundary_threshold: 0.01
-  prune_mode: 'slam'
-  single_thread: False
-  spherical_harmonics: False
-  #近景幕布gs+雾片挡相机，限制gs尺寸
-  alpha: 0.9
-  low_freq_scale_multiplier: 2.0
-  min_init_gaussian_scale: 0.002
-  max_init_gaussian_scale: 0.06
+  edge_threshold: 4                # 深度边缘阈值，Replica 深度噪声低设 4（TUM: 1.1）
+  rgb_boundary_threshold: 0.01     # RGB 边界检测阈值
+  alpha: 0.9                       # 渲染透明度混合系数
+  prune_mode: 'slam'               # prune 模式: 'slam'（基于 covisibility）/ 'odometry'
+  single_thread: False             # True=前端后端在同一进程运行
+  spherical_harmonics: False       # True=启用高阶 SH（需 sh_degree>0）
+  low_freq_scale_multiplier: 2.0   # 低频区域初始 Gaussian scale 乘数，1.0-3.0
+  min_init_gaussian_scale: 0.002   # 初始 Gaussian scale 下限 (m)，0.001-0.005
+  max_init_gaussian_scale: 0.06    # 初始 Gaussian scale 上限 (m)，0.02-0.10
 
   # ===== RSKM (Random Sampling Keyframe Mapping) =====
-  use_rskm: false
-  rskm_current_frame_interval: 4
-  rskm_seed: 42
-  rskm_debug_log: false
+  use_rskm: True                   # 是否启用子图内随机关键帧重放
+  rskm_current_frame_interval: 4   # 每 N 次采样强制使用当前帧（避免遗忘），2-8
+  rskm_seed: 42                    # RSKM 随机种子
+  rskm_debug_log: false            # 是否输出 RSKM 调试统计
 
 # ============================================================
 # FFT Edge VO Configuration (dense DT alignment, Edge VO style)
 # ============================================================
 FFTEdgeVO:
-  use_fft_edge_vo: true
-  tracking_refine_iters: 120
-  tracking_fallback_iters: 100
-  num_levels: 3
-  level_scale: 0.5
-  max_iters_coarse: 25
-  max_iters_fine: 15
-  dt_max_dist: 50.0
-  dt_huber_delta: 5.0
-  dt_mean_fail_threshold: 15.0
-  require_visible_ratio: 0.3
-  min_dt_mean: 0.5
-  debug_log: false
+  use_fft_edge_vo: true            # 是否启用 FFT Edge VO 提供 tracking 初值
+
+  # Refinement control
+  tracking_refine_iters: 120       # Edge VO 成功后的渲染精化迭代数，60-200
+  tracking_fallback_iters: 100     # Edge VO 失败时的退化跟踪迭代数，60-150
+
+  # Pyramid
+  num_levels: 3                    # 金字塔层数，2-4
+  level_scale: 0.5                 # 金字塔逐层缩放因子，0.4-0.6
+
+  # Optimisation
+  max_iters_coarse: 25             # 粗层最大 LM 迭代次数，10-50
+  max_iters_fine: 15               # 精层最大 LM 迭代次数，5-30
+
+  # Distance transform
+  dt_max_dist: 50.0                # DT 最大截断距离 (pixels)，20-100
+  dt_huber_delta: 5.0              # DT 残差的 Huber delta (pixels)，2-15
+
+  # Quality
+  dt_mean_fail_threshold: 15.0     # dt_mean 超过此值视为跟踪失败，8-30
+  require_visible_ratio: 0.3       # 最少可见点比率，低于此值视为失败，0.2-0.5
+  min_dt_mean: 0.5                 # 最低 dt_mean 阈值（触发参考帧自动刷新），0.3-2.0
+
+  # Logging
+  debug_log: false                 # 是否输出 FFTEdgeVO 逐帧调试日志
 
 # ============================================================
 # Backend Mapping Configuration (EAGS-style: Gaussian only)
 # ============================================================
 Backend:
-  optimize_keyframe_pose: true
-  optimize_keyframe_exposure: false
-  backend_pose_sanity_check: false
-  backend_restore_pose_if_changed: true
-  backend_pose_check_eps_t: 1.0e-8
-  backend_pose_check_eps_r_deg: 1.0e-6
-  pose_check_log_every: 99999
+  optimize_keyframe_pose: true     # 后端是否优化关键帧位姿（EAGS 风格）
+  optimize_keyframe_exposure: false # 后端是否优化关键帧曝光参数
+  backend_pose_sanity_check: false # [Replica] 关闭 sanity check（Replica 深度噪声低，pose 更稳定）
+  backend_restore_pose_if_changed: true  # sanity check 失败时恢复原始位姿
+  pose_check_log_every: 99999      # 每 N 次 mapping 输出一次 pose check 汇总
 
 # ============================================================
 # Submap Configuration
 # ============================================================
 Submap:
-  # ===== Submap Cut Thresholds (motion-only, relative to submap start frame) =====
-  trans_thre: 1.5
-  rot_thre: 60
+  # ===== Submap Cut Thresholds (motion-only, relative to submap anchor) =====
+  trans_thre: 1.5                  # 切图平移阈值 (m)，Replica 房间小设 1.5（TUM: 2.0）
+  rot_thre: 60                     # 切图旋转阈值 (deg)，Replica 设 60（TUM: 80）
 
-  seed_init_iters: 1500
+  seed_init_iters: 1500            # 新子图 seed 帧初始化迭代数，500-2000
 
   # ===== Cross-Submap Covisibility Handoff =====
-  use_handoff: false
-  handoff_tail_kfs: 4
-  handoff_max_points: 80000
-  handoff_min_support: 2
-  handoff_opacity_min: 0.20
-  handoff_warmup_frames: 20
-  handoff_warmup_keyframes: 3
-  handoff_new_coverage_th: 0.85
-  handoff_depth_consistency_th: 0.08
+  use_handoff: true                # 是否启用跨子图共视 handoff
+  handoff_tail_kfs: 4              # 参与共视的旧子图尾部关键帧数，2-6
+  handoff_max_points: 8000         # handoff 最大 Gaussian 数量，3000-15000
+  handoff_min_support: 2           # 最少共视关键帧数（含 seed 帧），1-4
+  handoff_opacity_min: 0.20        # 最低 opacity 阈值（sigmoid 后），0.10-0.40
+  handoff_warmup_frames: 20        # handoff warmup 最大帧数，超出强制释放
+  handoff_warmup_keyframes: 3      # handoff warmup 最大关键帧数，超出强制释放
+  handoff_new_coverage_th: 0.85    # active coverage 超此值提前释放 handoff，0.70-0.95
 
 # ============================================================
 # RAP2DGS Lite Configuration (lightweight rule-based handoff scoring)
 # ============================================================
 RAP2DGSLite:
-  enable: false               # Master switch; baseline unchanged when false
-  mode: "rule"                # Scoring mode: "rule" only in v1
-  use_in_handoff: false       # Replace handoff scoring when true
-  fallback_to_original: true  # Fallback to support+opacity on error
-
-  candidate:
-    max_candidate_points: 20000          # Hard cap on candidates before scoring
-    prefilter_by_support_opacity: true   # Coarse prefilter when over max
-    prefilter_max_points: 20000          # Prefilter target
+  enable: true                     # 总开关，false 时模块完全不加载
+  use_in_handoff: true             # handoff 时使用 RAP2DGS Lite 替代原始支持度评分
 
   knn:
-    enable: true
-    k: 16
-    chunk_size: 4096
+    k: 16                          # KNN 邻居数，消融验证 16 最优，8-32
+    chunk_size: 4096               # chunked cdist 块大小，1024-8192
 
   features:
-    use_support: true
-    use_opacity: true
-    use_observation: true
-    use_area: true
-    use_axis_ratio: true
-    use_normal: true
-    use_density: true
-    use_color: false
-    use_sh_anisotropy: false
+    use_support: true              # 共视支持度（percentile 归一化）
+    use_opacity: true              # 透明度（min-max 归一化）
+    use_observation: true          # 观测次数 n_obs（log1p+percentile 归一化）
+    use_area: true                 # surfel 面积（有界中区评分）
+    use_normal: true               # 法向一致性（KNN 邻域内 |dot| 均值）
+    use_density: true              # 局部密度（KNN 平均距离的有界中区评分）
 
   score_weights:
-    support: 0.25
+    support: 0.25                  # 共视是最核心跨子图信号
     opacity: 0.20
     observation: 0.20
     area: 0.10
@@ -182,16 +179,13 @@ RAP2DGSLite:
     density: 0.10
 
   selection:
-    keep_percent: 0.25
-    min_keep: 1000
-    max_keep: 8000
+    keep_percent: 0.25             # 保留比例，消融验证 0.25 最优，0.15-0.40
+    min_keep: 1000                 # 最少保留点数
+    max_keep: 8000                 # 最多保留点数，≤ handoff_max_points
 
   safety:
-    never_prune_active_map: true
-    protect_recent_kf: 3
-    protect_high_obs: 3
-    log_report: true
-    report_dir: "rap2dgs_lite_reports"
+    never_prune_active_map: true   # 硬约束：仅输出 mask，从不修改 GaussianModel
+    log_report: false               # 每次 handoff 保存 JSON 报告
 
 # ============================================================
 # Loop Closure Configuration
@@ -199,123 +193,112 @@ RAP2DGSLite:
 LoopClosure:
 
   # ===== Stage 0: LoopClosure mode control =====
-  mode: verify_only  # choices: off, detect_only, verify_only, keyframe_pgo
+  mode: keyframe_pgo               # off / detect_only / verify_only / keyframe_pgo
 
   # ===== Stage 2: Keyframe retrieval =====
-  keyframe_retrieval_top_k: 10
-  keyframe_retrieval_min_score: 0.50
-  keyframe_retrieval_min_temporal_gap: 10
-  keyframe_retrieval_mutual_nearest: true
-  keyframe_retrieval_mutual_top_n: 20
+  keyframe_retrieval_top_k: 10     # CosPlace 检索返回 top-K 候选，5-20
+  keyframe_retrieval_min_score: 0.50  # CosPlace 相似度最低阈值，0.30-0.70
+  keyframe_retrieval_min_temporal_gap: 10  # 最小帧间隔（防止相邻帧自匹配）
+  keyframe_retrieval_mutual_nearest: true  # 是否要求互为最近邻
+  keyframe_retrieval_mutual_top_n: 20      # 互为最近邻检索的候选池大小
 
   # ===== Stage 4: Depth verification =====
   depth_verify:
     enabled: true
-    min_overlap: 0.20
-    max_depth_rmse: 0.06
-    min_inlier_ratio: 0.35
-    depth_inlier_threshold: 0.10
-    scale_search_min: 0.1
-    scale_search_max: 20.0
-    depth_sample_count: 5000
-    scale_search_steps: 10
+    min_overlap: 0.20              # 最小深度重叠率，0.10-0.30
+    max_depth_rmse: 0.08           # [Replica] 最大深度 RMSE (m)，Replica 深度干净设 0.08（TUM: 0.80）
+    min_inlier_ratio: 0.15         # [Replica] 最小内点比率，0.10-0.30（TUM: 0.05，Replica 深度可靠设更高）
+    depth_inlier_threshold: 0.10   # [Replica] 深度内点阈值 (m)，0.05-0.15（Replica 深度噪声低设 0.10）
+    depth_sample_count: 5000       # 深度采样点数，2000-10000
+    scale_search_steps: 20         # 对数空间尺度搜索步数，10-30
+    scale_search_min: 0.1          # 最小尺度因子
+    scale_search_max: 20.0         # 最大尺度因子
 
-  # ===== Stage 5: Render refinement =====
-  render_refine:
-    enabled: false
-    max_delta_t_from_odom: 1.0
-    max_delta_r_deg_from_odom: 30.0
-    max_final_depth_rmse: 0.05
-    allow_depth_verified_edge_without_render_refine: true
+  # ===== Stage 5: Loop edge acceptance gates (odometry consistency + depth RMSE) =====
+  loop_edge_gates:
+    allow_depth_only: true          # [Replica] 仅深度验证即可接受回环边
+    max_delta_t_from_odom: 3.0      # [Replica] 深度位姿与里程计的最大平移偏差 (m)，0.5-5.0
+    max_delta_r_deg_from_odom: 30.0 # [Replica] 深度位姿与里程计的最大旋转偏差 (deg)，10-60
+    max_depth_rmse: 0.08            # [Replica] 接受回环边的最大深度 RMSE (m)，0.03-0.15
 
   # ===== Stage 7: Keyframe PGO safety =====
-  keyframe_pgo_odom_info_scale: 10.0
-  keyframe_pgo_handoff_info_scale: 5.0
+  keyframe_pgo_odom_info_scale: 10.0     # PGO 里程计边信息矩阵缩放
+  keyframe_pgo_handoff_info_scale: 5.0   # PGO handoff 边信息矩阵缩放
   keyframe_pgo_safety:
-    max_correction_t: 1.00
-    max_correction_r_deg: 15.0
-    max_odom_residual_increase_ratio: 2.00
-    min_loop_residual_decrease_ratio: 0.30
-    max_single_loop_residual_after_t: 0.30
-    max_single_loop_residual_after_r_deg: 5.0
-    min_verified_loop_edges: 3
-    max_pgo_retries: 2
-  pgo_voxel_size: 2.0
-  pgo_edge_prune_threshold: 5.0
+    max_correction_t: 1.00               # PGO 最大平移修正 (m)，0.5-2.0
+    max_correction_r_deg: 15.0           # PGO 最大旋转修正 (deg)，5-30
+    max_odom_residual_increase_ratio: 2.00  # 里程计边残差膨胀比上限
+    min_loop_residual_decrease_ratio: 0.30  # 回环边残差下降比下限
+    max_single_loop_residual_after_t: 0.30  # 优化后单条回环边最大平移残差 (m)
+    max_single_loop_residual_after_r_deg: 5.0  # 优化后单条回环边最大旋转残差 (deg)
+    min_verified_loop_edges: 3           # 最少验证通过的回环边数
+    max_pgo_retries: 2                   # PGO 最大重试次数（鲁棒边剔除）
+  pgo_voxel_size: 2.0                    # PGO 关键帧下采样体素 (m)
+  pgo_edge_prune_threshold: 5.0          # 鲁棒边剔除残差阈值
 
   # ===== Stage 9: Map correction from keyframe PGO =====
   MapCorrection:
-    mode: submap_median_from_keyframes  # choices: none, submap_median_from_keyframes, owner_keyframe
-    apply_online: false
-
+    mode: submap_median_from_keyframes   # none / submap_median_from_keyframes / owner_keyframe
+    apply_online: false                  # 仅 final merge 时应用，不写 ckpt
 
   # ===== Basic Parameters =====
-  min_interval: 3
-  voxel_size: 0.05
+  min_interval: 3                  # 两次回环检测最小间隔（关键帧数）
+  voxel_size: 0.05                 # [Replica] 深度验证点云下采样体素 (m)，0.02-0.08（Replica 场景大设 0.05）
 
-
-
-  # ===== Reloc3R (future replacement for GSReg+ICP) =====
+  # ===== Reloc3R =====
   Reloc3R:
     enabled: true
-    mock_mode: false
+    mock_mode: false               # True=跳过推理（调试用）
     repo_path: third_party/reloc3r
     checkpoint: siyan824/reloc3r-224
     local_checkpoint: weights/reloc3r-224.pth
-    image_size: 224
-    use_amp: true
+    image_size: 224                # 输入图像尺寸
+    use_amp: true                  # 自动混合精度
     device: cuda
-    topk_pairs: 5
-    min_valid_pairs: 2
+    topk_pairs: 5                  # 返回 top-K 关键帧对，3-10
+    min_valid_pairs: 2             # 最少有效对数，1-5
     pair_selection: cosplace_cross_similarity
     scale_mode: init_guess_norm
-    depth_scale_check: false
-    max_delta_t: 2.0
-    max_delta_r_deg: 45.0
-    max_pair_rot_std_deg: 15.0
-    max_pair_trans_angle_std_deg: 25.0
-
-
+    max_delta_t: 2.0               # Reloc3R 粗位姿允许的最大平移 (m)
+    max_delta_r_deg: 45.0          # Reloc3R 粗位姿允许的最大旋转 (deg)
+    max_pair_rot_std_deg: 15.0     # 多对估计旋转标准差上限 (deg)
+    max_pair_trans_angle_std_deg: 25.0  # 多对估计平移角度标准差上限 (deg)
 
 # ============================================================
 # Gaussian Optimization Parameters
 # ============================================================
 opt_params:
   # ===== Iteration Parameters =====
-  iterations: 30000
-  densify_from_iter: 500 #当总迭代次iter_count数达到该值时，把gs不透明度重置为0.01
-  densify_until_iter: 15000
-  densification_interval: 100
-  opacity_reset_interval: 3000
+  iterations: 30000                # 最大总迭代次数（离线优化使用）
+  densify_from_iter: 500           # 从第 N 次迭代开始 densify
+  densify_until_iter: 15000        # 到第 N 次迭代停止 densify
+  densification_interval: 100      # densify 间隔
+  opacity_reset_interval: 3000     # opacity reset 间隔
 
   # ===== Learning Rates =====
-  position_lr_init: 0.00016
-  position_lr_final: 0.0000016
-  position_lr_delay_mult: 0.01
-  position_lr_max_steps: 30000
-  feature_lr: 0.0025
-  opacity_lr: 0.05
-  scaling_lr: 0.001
-  rotation_lr: 0.001
+  position_lr_init: 0.00016        # 位置初始学习率
+  position_lr_final: 0.0000016     # 位置最终学习率
+  position_lr_delay_mult: 0.01     # 位置学习率延迟乘数
+  position_lr_max_steps: 30000     # 位置学习率衰减总步数
+  feature_lr: 0.0025               # 球谐系数学习率
+  opacity_lr: 0.05                 # 不透明度学习率，0.01-0.10
+  scaling_lr: 0.001                # 缩放学习率
+  rotation_lr: 0.001               # 旋转学习率
 
   # ===== Densification Parameters =====
-  percent_dense: 0.01
-  densify_grad_threshold: 0.0002 #0.0002->0.0006
+  percent_dense: 0.01              # 稠密化比例（×scene_extent），0.005-0.02
+  densify_grad_threshold: 0.0002   # 位置梯度阈值，超此值触发 densify，0.0001-0.001
 
   # ===== Loss Parameters =====
-  lambda_sensor_normal: 0.001
-  lambda_dssim: 0.2
+  lambda_sensor_normal: 0.001      # FDN 法向损失权重，0.0005-0.005
+  lambda_dssim: 0.2                # SSIM 损失权重，0.1-0.3
 
 # ============================================================
 # Model Parameters
 # ============================================================
 model_params:
-  sh_degree: 0
-  source_path: ""
-  model_path: ""
-  resolution: -1
-  white_background: False
-  data_device: "cuda"
+  sh_degree: 0                     # 球谐函数阶数，0=仅 DC（RGB），1-3=高阶 SH
+  source_path: ""                  # 离线加载 PLY 路径（slam.py 初始化 GaussianModel 时需要）
 
 # ============================================================
 # Pipeline Parameters
@@ -323,19 +306,16 @@ model_params:
 pipeline_params:
   convert_SHs_python: False
   compute_cov3D_python: False
-  depth_ratio: 1.0
-  # psedo surface attributes
-  # surf depth is either median or expected by setting depth_ratio to 1 or 0
-  # for bounded scene, use median depth, i.e., depth_ratio = 1;
-  # for unbounded scene, use expected depth, i.e., depth_ration = 0, to reduce disk anliasing.
+  depth_ratio: 1.0                 # 1.0=median depth (bounded scene), 0=expected depth
+                                   # bounded scene 用 1，unbounded scene 用 0 减少混叠
 
 # ============================================================
 # Ablation Switches
 # ============================================================
 Ablation:
-  use_submap: True          # (2) 是否开启子图切图策略 (关闭时退化为全局单地图)
-  use_loop_closure: False     # (3)&(4) 是否开启回环检测与全局 PGO 修正
-  use_fdn: True              # (5) 是否开启有限差分法线监督及相关 Loss 衰减
-  use_fft_mask: True         # (6) 是否开启 FFT 高低频掩膜指导采样与初始尺度设定
-  use_error_mask: True       # (6) 是否开启渲染误差掩膜指导动态补点
-  use_color_refinement: True   # (8) 是否开启颜色优化（如果开启，则在每次优化迭代中同时优化颜色相关参数；如果关闭，则只优化几何相关参数，颜色参数保持不变）
+  use_submap: True                 # 子图切图策略 (关闭 → 全局单地图)
+  use_loop_closure: False          # [Replica] 回环检测默认关闭（Replica 场景小，自然包含回环）
+  use_fdn: True                    # FDN 有限差分法向监督
+  use_fft_mask: True               # FFT 高低频掩膜指导采样与初始 scale
+  use_error_mask: True             # 渲染误差掩膜指导动态补点
+  use_color_refinement: True       # final merge 后离线颜色精化

@@ -453,7 +453,7 @@ def refine_keyframe_loop_edge(
     if config is None:
         config = {}
 
-    refine_cfg = config.get("render_refine", {})
+    gate_cfg = config.get("loop_edge_gates", {})
     T_refined = depth_verified_pair.T_target_from_source.copy()  # T_target_from_source
 
     edge.verification_metrics = {
@@ -464,15 +464,15 @@ def refine_keyframe_loop_edge(
         "refinement_method": "depth_only",
     }
 
-    allow_depth_only = refine_cfg.get("allow_depth_verified_edge_without_render_refine", True)
+    allow_depth_only = gate_cfg.get("allow_depth_only", True)
     if not allow_depth_only:
-        edge.rejection_reason = "render_refine_disabled_and_depth_only_not_allowed"
+        edge.rejection_reason = "depth_only_not_allowed"
         return edge
 
-    # ---- Delta gate ----
+    # ---- Delta gate (odometry consistency) ----
     odom_T = np.linalg.inv(target_record.c2w_global) @ source_record.c2w_global
-    max_dt_odom = refine_cfg.get("max_delta_t_from_odom", 50.0)
-    max_dr_odom = refine_cfg.get("max_delta_r_deg_from_odom", 90.0)
+    max_dt_odom = gate_cfg.get("max_delta_t_from_odom", 50.0)
+    max_dr_odom = gate_cfg.get("max_delta_r_deg_from_odom", 90.0)
     dt_odom = float(np.linalg.norm((T_refined @ np.linalg.inv(odom_T))[:3, 3]))
     dr_odom = _rot_error_deg(T_refined, odom_T)
     edge.verification_metrics["delta_t_from_odom"] = dt_odom
@@ -482,9 +482,9 @@ def refine_keyframe_loop_edge(
         edge.rejection_reason = f"delta_from_odom_too_large dt={dt_odom:.3f}m dr={dr_odom:.1f}deg"
         return edge
 
-    max_depth_rmse = refine_cfg.get("max_final_depth_rmse", 0.80)
+    max_depth_rmse = gate_cfg.get("max_depth_rmse", 0.80)
     if depth_verified_pair.depth_rmse > max_depth_rmse:
-        edge.rejection_reason = f"final_depth_rmse_{depth_verified_pair.depth_rmse:.4f}_gt_{max_depth_rmse}"
+        edge.rejection_reason = f"depth_rmse_{depth_verified_pair.depth_rmse:.4f}_gt_{max_depth_rmse}"
         return edge
 
     edge.T_source_to_target = T_refined

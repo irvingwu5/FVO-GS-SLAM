@@ -20,5 +20,7 @@ result*
 CLAUDE.md
 .claude/
 # 新增
-docs/
+.docs/
 external_repos/
+.gitnexus
+.third_party/

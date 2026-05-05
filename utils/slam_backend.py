@@ -104,12 +104,6 @@ class BackEnd(mp.Process):
         self.backend_restore_pose_if_changed = self.config.get("Backend", {}).get(
             "backend_restore_pose_if_changed", True
         )
-        self.backend_pose_check_eps_t = float(self.config.get("Backend", {}).get(
-            "backend_pose_check_eps_t", 1.0e-8
-        ))
-        self.backend_pose_check_eps_r_deg = float(self.config.get("Backend", {}).get(
-            "backend_pose_check_eps_r_deg", 1.0e-6
-        ))
         self.pose_check_log_every = int(self.config.get("Backend", {}).get(
             "pose_check_log_every", 50
         ))

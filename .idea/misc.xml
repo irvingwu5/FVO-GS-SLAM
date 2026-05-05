@@ -3,5 +3,5 @@
   <component name="Black">
     <option name="sdkName" value="my2dgsslam (2)" />
   </component>
-  <component name="ProjectRootManager" version="2" project-jdk-name="my2dgsslam" project-jdk-type="Python SDK" />
+  <component name="ProjectRootManager" version="2" project-jdk-name="fvo-gs-slam" project-jdk-type="Python SDK" />
 </project>
