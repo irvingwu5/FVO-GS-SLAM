@@ -76,14 +76,15 @@ def get_loss_tracking_rgbd(
     return alpha * l1_rgb + (1 - alpha) * l1_depth.mean()
 
 
-def get_loss_mapping(config, image, depth, viewpoint, initialization=False, apply_exposure=True):
+def get_loss_mapping(config, image, depth, viewpoint, initialization=False,
+                    apply_exposure=True, rend_dist=None):
     if initialization or not apply_exposure:
         image_ab = image
     else:
         image_ab = (torch.exp(viewpoint.exposure_a)) * image + viewpoint.exposure_b
     if config["Training"]["monocular"]:
         return get_loss_mapping_rgb(config, image_ab, viewpoint)
-    return get_loss_mapping_rgbd(config, image_ab, depth, viewpoint)
+    return get_loss_mapping_rgbd(config, image_ab, depth, viewpoint, rend_dist=rend_dist)
 
 
 def get_loss_mapping_rgb(config, image, viewpoint):
@@ -98,7 +99,8 @@ def get_loss_mapping_rgb(config, image, viewpoint):
     return l1_rgb.mean()
 
 
-def get_loss_mapping_rgbd(config, image, depth, viewpoint, initialization=False):
+def get_loss_mapping_rgbd(config, image, depth, viewpoint, initialization=False,
+                          rend_dist=None):
     alpha = config["Training"]["alpha"] if "alpha" in config["Training"] else 0.95
     rgb_boundary_threshold = config["Training"]["rgb_boundary_threshold"]
     gt_image = viewpoint.original_image.cuda()
@@ -112,7 +114,18 @@ def get_loss_mapping_rgbd(config, image, depth, viewpoint, initialization=False)
     l1_rgb = torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
     l1_depth = torch.abs(depth * depth_pixel_mask - gt_depth * depth_pixel_mask)
 
-    return alpha * l1_rgb.mean() + (1 - alpha) * l1_depth.mean()
+    loss = alpha * l1_rgb.mean() + (1 - alpha) * l1_depth.mean()
+
+    # Depth distortion loss (surface compaction): active when lambda_dist > 0
+    # When use_sa=True: rend_dist = SA depth variance (thinner surface = lower variance)
+    # When use_sa=False: rend_dist = standard 3DGS distortion (m-based)
+    if rend_dist is not None:
+        lambda_dist = config["opt_params"].get("lambda_dist", 0.0)
+        if lambda_dist > 0:
+            dist_loss = lambda_dist * rend_dist[rgb_pixel_mask].mean()
+            loss += dist_loss
+
+    return loss
 
 
 def get_median_depth(depth, opacity=None, mask=None, return_std=False):

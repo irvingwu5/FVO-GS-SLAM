@@ -403,10 +403,12 @@ class BackEnd(mp.Process):
                     render_pkg["opacity"],
                     render_pkg["n_touched"],
                 )
+                rend_dist = render_pkg["rend_dist"]
 
                 loss_view = get_loss_mapping(
                     self.config, image, depth, viewpoint,
                     apply_exposure=optimize_exposure,
+                    rend_dist=rend_dist,
                 )
 
                 if self.use_fdn and viewpoint.normal is not None:

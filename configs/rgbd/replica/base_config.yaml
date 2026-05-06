@@ -292,6 +292,7 @@ opt_params:
   # ===== Loss Parameters =====
   lambda_sensor_normal: 0.001      # FDN 法向损失权重，0.0005-0.005
   lambda_dssim: 0.2                # SSIM 损失权重，0.1-0.3
+  lambda_dist: 0.0                 # 深度失真损失权重，0=关闭，0.01-0.1 用于压实表面消除浮空物。use_sa=true时语义为SA depth variance
 
 # ============================================================
 # Model Parameters
@@ -306,15 +307,18 @@ model_params:
 pipeline_params:
   convert_SHs_python: False
   compute_cov3D_python: False
-  depth_ratio: 1.0                 # 1.0=median depth (bounded scene), 0=expected depth
-                                   # bounded scene 用 1，unbounded scene 用 0 减少混叠
+  depth_ratio: 0.0                 # 1.0=median depth (bounded scene), 0=expected depth
+  use_sa: true                    # SA surfel-aware depth相关参数，改变的是"渲染器算出什么深度"
+  use_sa_depth: true              # SA surfel-aware depth相关参数，Python 渲染层（深度选择策略）use_sa_depth 改变的是"SLAM loss 用哪个深度"
+  depth_eps: 1.0e-6               # SA surfel-aware depth相关参数,计算期望深度时的安全除数
+  debug_sa_depth: false
 
 # ============================================================
 # Ablation Switches
 # ============================================================
 Ablation:
   use_submap: True                 # 子图切图策略 (关闭 → 全局单地图)
-  use_loop_closure: False          # [Replica] 回环检测默认关闭（Replica 场景小，自然包含回环）
+  use_loop_closure: true          # [Replica] 回环检测默认关闭（Replica 场景小，自然包含回环）
   use_fdn: True                    # FDN 有限差分法向监督
   use_fft_mask: True               # FFT 高低频掩膜指导采样与初始 scale
   use_error_mask: True             # 渲染误差掩膜指导动态补点

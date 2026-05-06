@@ -141,6 +141,8 @@ class SLAM:
         self.dataset = load_dataset(
             model_params, model_params.source_path, config=config
         )
+        if config.get("max_frames", 0) > 0:
+            self.dataset.num_imgs = min(config["max_frames"], self.dataset.num_imgs)
         self.gaussians.training_setup(opt_params)
 
         # ---- Background ----
@@ -617,6 +619,8 @@ if __name__ == "__main__":
     parser = ArgumentParser(description="Training script parameters")
     parser.add_argument("--config", type=str)
     parser.add_argument("--eval", action="store_true")
+    parser.add_argument("--max_frames", type=int, default=0,
+                        help="Limit dataset to N frames for smoke testing (0=unlimited)")
 
     args = parser.parse_args(sys.argv[1:])
 
@@ -639,6 +643,10 @@ if __name__ == "__main__":
         config["Results"]["eval_rendering"] = True
         Log("\tuse_wandb=False")
         config["Results"]["use_wandb"] = False
+
+    if args.max_frames > 0:
+        config["max_frames"] = args.max_frames
+        Log(f"Limiting dataset to {args.max_frames} frames (smoke test)")
 
     if config["Results"]["save_results"]:
         mkdir_p(config["Results"]["save_dir"])

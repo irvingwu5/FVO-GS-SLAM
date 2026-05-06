@@ -178,11 +178,13 @@ renderCUDA(
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
 	const float* __restrict__ dL_depths,
+		const float* __restrict__ allmap,
 	float * __restrict__ dL_dtransMat,
 	float3* __restrict__ dL_dmean2D,
 	float* __restrict__ dL_dnormal3D,
 	float* __restrict__ dL_dopacity,
-	float* __restrict__ dL_dcolors)
+	float* __restrict__ dL_dcolors,
+	const bool use_sa)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -243,6 +245,8 @@ renderCUDA(
 	const int median_contributor = inside ? n_contrib[pix_id + H * W] : 0.f;
 	float dL_dmedian_depth = 0.f;
 	float dL_dmax_dweight = 0.f;
+	float mm = 0.f;
+	float mstd = 0.f;
 
 	if (inside) {
 		dL_ddepth = dL_depths[DEPTH_OFFSET * H * W + pix_id];
@@ -254,6 +258,8 @@ renderCUDA(
 
 		dL_dmedian_depth = dL_depths[MIDDEPTH_OFFSET * H * W + pix_id];
 		// dL_dmax_dweight = dL_depths[MEDIAN_WEIGHT_OFFSET * H * W + pix_id];
+		mm = allmap[MIDDEPTH_OFFSET * H * W + pix_id];
+		mstd = allmap[DISTORTION_OFFSET * H * W + pix_id];
 	}
 
 	// for compute gradient with respect to depth and normal
@@ -346,6 +352,12 @@ renderCUDA(
 			// compute intersection and depth
 			float rho = min(rho3d, rho2d);
 			float c_d = (rho3d <= rho2d) ? (s.x * Tw.x + s.y * Tw.y) + Tw.z : Tw.z; 
+			// SA confidence-adjusted depth
+			float conf = 1.f;
+			if (use_sa) {
+				conf = T < 0.5f ? exp(-(c_d - mm) * (c_d - mm) / (4.f * max(mstd / max(1.f - T_final, 1e-7f), 1e-7f))) : 1.f;
+				c_d = c_d * conf + mm * (1.f - conf);
+			}
 			// if (c_d < near_n) continue;
 			skip |= (c_d < near_n);
 			float4 nor_o = collected_normal_opacity[j];
@@ -475,7 +487,7 @@ renderCUDA(
 			// Helpful reusable temporary variables
 			const float dL_dG = nor_o.w * dL_dalpha;
 #if RENDER_AXUTILITY
-			dL_dz += alpha * T * dL_ddepth; 
+			dL_dz += conf * alpha * T * dL_ddepth; 
 #endif
 
 			if (rho3d <= rho2d) {
@@ -927,13 +939,15 @@ void BACKWARD::render(
 	const float* depths,
 	const float* final_Ts,
 	const uint32_t* n_contrib,
+		const float* allmap,
 	const float* dL_dpixels,
 	const float* dL_depths,
 	float * dL_dtransMat,
 	float3* dL_dmean2D,
 	float* dL_dnormal3D,
 	float* dL_dopacity,
-	float* dL_dcolors)
+	float* dL_dcolors,
+	bool use_sa)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
 		ranges,
@@ -950,10 +964,12 @@ void BACKWARD::render(
 		n_contrib,
 		dL_dpixels,
 		dL_depths,
+		allmap,
 		dL_dtransMat,
 		dL_dmean2D,
 		dL_dnormal3D,
 		dL_dopacity,
-		dL_dcolors
+		dL_dcolors,
+		use_sa
 		);
 }

@@ -85,7 +85,8 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.sh_degree,
             raster_settings.campos,
             raster_settings.prefiltered,
-            raster_settings.debug
+            raster_settings.debug,
+            raster_settings.use_sa
         )
 
         # Invoke C++/CUDA rasterizer
@@ -103,7 +104,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings
         ctx.num_rendered = num_rendered
-        ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer)
+        ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer, depth)
         return color, radii, depth, n_touched
 
     @staticmethod
@@ -112,7 +113,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         # Restore necessary values from context
         num_rendered = ctx.num_rendered
         raster_settings = ctx.raster_settings
-        colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer = ctx.saved_tensors
+        colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer, out_allmap = ctx.saved_tensors
 
         # Restructure args as C++ method expects them
         args = (raster_settings.bg,
@@ -139,7 +140,9 @@ class _RasterizeGaussians(torch.autograd.Function):
                 num_rendered,
                 binningBuffer,
                 imgBuffer,
-                raster_settings.debug)
+                out_allmap,
+                raster_settings.debug,
+                raster_settings.use_sa)
 
         # Compute gradients for relevant tensors by invoking backward method
         if raster_settings.debug:
@@ -179,7 +182,7 @@ class _RasterizeGaussians(torch.autograd.Function):
 
 class GaussianRasterizationSettings(NamedTuple):
     image_height: int
-    image_width: int 
+    image_width: int
     tanfovx : float
     tanfovy : float
     bg : torch.Tensor
@@ -190,7 +193,8 @@ class GaussianRasterizationSettings(NamedTuple):
     campos : torch.Tensor
     prefiltered : bool
     debug : bool
-    
+    use_sa : bool
+
     cx: float
     cy: float
     projmatrix_raw : torch.Tensor

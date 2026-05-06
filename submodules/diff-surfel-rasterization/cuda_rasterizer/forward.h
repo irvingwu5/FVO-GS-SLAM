@@ -67,7 +67,7 @@ namespace FORWARD
 		const float* bg_color,
 		float* out_color,
 		float* out_others,
-		int* n_touched);
+		int* n_touched, bool use_sa);
 }
 
 

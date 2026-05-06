@@ -273,7 +273,8 @@ renderCUDA(
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color,
 	float* __restrict__ out_others,
-	int * __restrict__ n_touched)
+	int * __restrict__ n_touched,
+	const bool use_sa)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -316,6 +317,7 @@ renderCUDA(
 	float M1 = {0};
 	float M2 = {0};
 	float distortion = {0};
+		float D2 = {0};
 	float median_depth = {0};
 	// float median_weight = {0};
 	float median_contributor = {-1};
@@ -391,24 +393,33 @@ renderCUDA(
 			}
 
 			float w = alpha * T;
-#if RENDER_AXUTILITY
-			// Render depth distortion map
-			// Efficient implementation of distortion loss, see 2DGS' paper appendix.
+	#if RENDER_AXUTILITY
+		if (T > 0.5) {
+			median_depth = depth;
+			median_contributor = contributor;
+		}
+		if (use_sa) {
+			if (D > 0) {
+				float exp_depth = median_depth;
+				float exp_std = (D2 - 2 * D * exp_depth) / (1 - T) + exp_depth * exp_depth;
+				exp_std = max(exp_std, 1e-7f);
+				float error = (exp_depth - depth) * (exp_depth - depth);
+				float conf = exp(-error / (4.0f * exp_std));
+				depth = conf * depth + (1.0f - conf) * exp_depth;
+			}
+			D  += depth * w;
+			D2 += depth * depth * w;
+		} else {
 			float A = 1-T;
 			float m = far_n / (far_n - near_n) * (1 - near_n / depth);
 			distortion += (m * m * A + M2 - 2 * m * M1) * w;
 			D  += depth * w;
 			M1 += m * w;
 			M2 += m * m * w;
-
-			if (T > 0.5) {
-				median_depth = depth;
-				// median_weight = w;
-				median_contributor = contributor;
-			}
-			// Render normal map
-			for (int ch=0; ch<3; ch++) N[ch] += normal[ch] * w;
-#endif
+		}
+		// Render normal map
+		for (int ch=0; ch<3; ch++) N[ch] += normal[ch] * w;
+	#endif
 
 			// Eq. (3) from 3D Gaussian splatting paper.
 			for (int ch = 0; ch < CHANNELS; ch++)
@@ -443,7 +454,7 @@ renderCUDA(
 		out_others[pix_id + ALPHA_OFFSET * H * W] = 1 - T;
 		for (int ch=0; ch<3; ch++) out_others[pix_id + (NORMAL_OFFSET+ch) * H * W] = N[ch];
 		out_others[pix_id + MIDDEPTH_OFFSET * H * W] = median_depth;
-		out_others[pix_id + DISTORTION_OFFSET * H * W] = distortion;
+		out_others[pix_id + DISTORTION_OFFSET * H * W] = use_sa ? (D2 - 2 * median_depth * D + (1-T) * median_depth * median_depth) : distortion;
 		// out_others[pix_id + MEDIAN_WEIGHT_OFFSET * H * W] = median_weight;
 #endif
 	}
@@ -465,7 +476,8 @@ void FORWARD::render(
 	const float* bg_color,
 	float* out_color,
 	float* out_others,
-	int* n_touched)
+	int* n_touched,
+	bool use_sa)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
@@ -482,7 +494,8 @@ void FORWARD::render(
 		bg_color,
 		out_color,
 		out_others,
-		n_touched);
+		n_touched,
+		use_sa);
 }
 
 void FORWARD::preprocess(int P, int D, int M,

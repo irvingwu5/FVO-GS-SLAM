@@ -278,6 +278,7 @@ opt_params:
   # ===== Loss Parameters =====
   lambda_sensor_normal: 0.001      # FDN 法向损失权重，0.0005-0.005
   lambda_dssim: 0.2                # SSIM 损失权重，0.1-0.3
+  lambda_dist: 0.0                 # 深度失真损失权重，0=关闭，0.01-0.1 用于压实表面消除浮空物。use_sa=true时语义为SA depth variance
 
 # ============================================================
 # Model Parameters
@@ -292,9 +293,21 @@ model_params:
 pipeline_params:
   convert_SHs_python: False
   compute_cov3D_python: False
-  depth_ratio: 1.0                 # 1.0=median depth (bounded scene), 0=expected depth
-                                   # bounded scene 用 1，unbounded scene 用 0 减少混叠
-
+  depth_ratio: 0.0              # 1.0=median depth (bounded scene), 0=expected depth # bounded scene 用 1，unbounded scene 用 0 减少混叠
+  use_sa: true                  # SA surfel-aware depth相关参数，改变的是"渲染器算出什么深度"
+  use_sa_depth: true            # SA surfel-aware depth相关参数，Python 渲染层（深度选择策略）use_sa_depth 改变的是"SLAM loss 用哪个深度"
+  depth_eps: 1.0e-6             # SA surfel-aware depth相关参数,计算期望深度时的安全除数
+  debug_sa_depth: false
+#  ┌────────┬──────────────┬───────────────────────────────────────────────────────────────────────────────┐
+#  │ use_sa │ use_sa_depth │                                     效果                                       │
+#  ├────────┼──────────────┼───────────────────────────────────────────────────────────────────────────────┤
+#  │ false  │ false        │ CUDA 算标准深度 → loss 用 median depth（A0 baseline）                            │
+#  ├────────┼──────────────┼───────────────────────────────────────────────────────────────────────────────┤
+#  │ true   │ false        │ CUDA 算 SA 深度 → 但 loss 仍用 median depth（A1：验证 CUDA 侧的间接影响）           │
+#  ├────────┼──────────────┼───────────────────────────────────────────────────────────────────────────────┤
+#  │ true   │ true         │ CUDA 算 SA 深度 → loss 直接用 SA expected depth（A2/A3/A4：完整 SA pipeline）     │
+#  └────────┴──────────────┴───────────────────────────────────────────────────────────────────────────────┘
+#==============================
 # ============================================================
 # Ablation Switches
 # ============================================================

@@ -22,7 +22,10 @@ from diff_surfel_rasterization import (
     GaussianRasterizer,
 )
 
-from gaussian_splatting.scene.gaussian_model import GaussianModel
+try:
+    from gaussian_splatting.scene.gaussian_model import GaussianModel
+except ImportError:
+    GaussianModel = None  # type hint only, not needed at runtime
 from gaussian_splatting.utils.sh_utils import eval_sh
 from utils.point_utils import depth_to_normal
 
@@ -78,6 +81,7 @@ def render(
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
         debug=False,
+        use_sa=getattr(pipe, "use_sa", False),
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
@@ -174,23 +178,35 @@ def render(
             @ (viewpoint_camera.world_view_transform[:3, :3].T)
     ).permute(2, 0, 1)
 
-    # get median depth map中值深度（render_depth_median）对比：期望深度对离群贡献更敏感（适合无界/稀疏场景以减少光盘锯齿），中值深度更鲁棒（适合有界场景）。
+    # get median depth map
     render_depth_median = allmap[5:6]
     render_depth_median = torch.nan_to_num(render_depth_median, 0, 0)
-    #期望深度图是每个像素沿视线的加权平均深度。简单来说，它表示“从相机看过去，所有被该像素贡献的高斯元的平均深度”。
-    # get expected depth map：D_expected = sum_i (w_i * d_i) / sum_i w_i，其中 d_i 是第 i 个高斯元的深度，w_i 是该高斯元对像素的权重（累积到 render_alpha）
-    render_depth_expected = allmap[0:1] #每个像素沿视线的加权平均深度，深度的累加量
-    render_depth_expected = render_depth_expected / render_alpha
+
+    # get expected depth map: D_expected = sum_i (w_i * d_i) / sum_i w_i
+    depth_eps = getattr(pipe, "depth_eps", 1.0e-6)
+    render_depth_expected = allmap[0:1]
+    render_depth_expected = render_depth_expected / torch.clamp(render_alpha, min=depth_eps)
     render_depth_expected = torch.nan_to_num(render_depth_expected, 0, 0)
 
     # get depth distortion map
     render_dist = allmap[6:7]
-    # psedo surface attributes
-    # surf depth is either median or expected by setting depth_ratio to 1 or 0
-    # for bounded scene, use median depth, i.e., depth_ratio = 1;
-    # for unbounded scene, use expected depth, i.e., depth_ration = 0, to reduce disk anliasing.
-    surf_depth = render_depth_expected * (1 - pipe.depth_ratio) + (pipe.depth_ratio) * render_depth_median
 
+    # surf depth selection:
+    # use_sa_depth=True: use SA expected depth directly (compatible with use_sa=True forward)
+    # use_sa_depth=False: mixed median/expected depth by depth_ratio (original behavior)
+    if getattr(pipe, "use_sa_depth", False):
+        surf_depth = render_depth_expected
+    else:
+        surf_depth = render_depth_expected * (1 - pipe.depth_ratio) + (pipe.depth_ratio) * render_depth_median
+    #  ┌────────┬──────────────┬───────────────────────────────────────────────────────────────────────────────┐
+    #  │ use_sa │ use_sa_depth │                                     效果                                       │
+    #  ├────────┼──────────────┼───────────────────────────────────────────────────────────────────────────────┤
+    #  │ false  │ false        │ CUDA 算标准深度 → loss 用 median depth（A0 baseline）                            │
+    #  ├────────┼──────────────┼───────────────────────────────────────────────────────────────────────────────┤
+    #  │ true   │ false        │ CUDA 算 SA 深度 → 但 loss 仍用 median depth（A1：验证 CUDA 侧的间接影响）           │
+    #  ├────────┼──────────────┼───────────────────────────────────────────────────────────────────────────────┤
+    #  │ true   │ true         │ CUDA 算 SA 深度 → loss 直接用 SA expected depth（A2/A3/A4：完整 SA pipeline）     │
+    #  └────────┴──────────────┴───────────────────────────────────────────────────────────────────────────────┘
     if surf: #渲染深度图计算出来的法线图，宏观几何，后续让每个surfels都朝向对应的宏观法线方向，
         surf_normal = depth_to_normal(viewpoint_camera, surf_depth) #已经转换到了世界坐标系下，assume the depth points form the 'surface' and generate psudo surface normal for regularizations.
         surf_normal = surf_normal.permute(2, 0, 1)
@@ -200,7 +216,6 @@ def render(
 
     rets.update(
         {
-            #"rend_alpha": render_alpha,
             "rend_normal": render_normal,
             "rend_dist": render_dist,
             "depth": surf_depth,
@@ -208,6 +223,12 @@ def render(
             "opacity": render_alpha,
         }
     )
+
+    # Optional debug fields for SA depth inspection
+    if getattr(pipe, "debug_sa_depth", False):
+        rets["depth_expected"] = render_depth_expected
+        rets["depth_median"] = render_depth_median
+        rets["depth_alpha"] = render_alpha
 
     return rets
 '''
@@ -221,8 +242,8 @@ def render(
     rend_dist = render_pkg["rend_dist"]
     dist_loss = lambda_dist * (rend_dist).mean()
     集中分布： 惩罚那些权重高但在深度上分布很散的情况。它强制高斯图元在沿射线的深度上尽可能集中
-    消除伪影： 减少“浮空物”（floaters）和背景噪声。
-    压实表面： 3DGS 容易用一团松散的“云”来模拟实心物体，这个损失强制这团“云”坍缩成一个薄且紧密的表面 。
+    消除伪影： 减少"浮空物"（floaters）和背景噪声。
+    压实表面： 3DGS 容易用一团松散的"云"来模拟实心物体，这个损失强制这团"云"坍缩成一个薄且紧密的表面 。
     -----------------------------------------------------------------------------------------------------------
     3.Normal Consistency loss:
     lambda_normal = opt.lambda_normal if iteration > 7000 else 0.0、lambda_normal = 0.05
@@ -237,6 +258,6 @@ render_normal
     含义：来自 rasterizer 的输出（allmap[2:5]），表示每个像素由高斯元累积得到的法线分量（最初在视图/相机坐标系下）。这些法线是按贡献加权累积的，可能未归一化。
     转换：用相机的世界视图旋转矩阵将视图空间法线变换到世界坐标系（通过矩阵乘法和维度重排）。
 surf_normal  
-    含义：由深度图推导得到的“伪表面法线”，表示宏观几何方向（用于正则化）。深度图 surf_depth 是期望深度（期望深度图是每个像素沿视线的加权平均深度。简单来说，它表示“从相机看过去，所有被该像素贡献的高斯元的平均深度”）与中值深度按 pipe.depth_ratio 混合得到的。
+    含义：由深度图推导得到的"伪表面法线"，表示宏观几何方向（用于正则化）。深度图 surf_depth 是期望深度（期望深度图是每个像素沿视线的加权平均深度。简单来说，它表示"从相机看过去，所有被该像素贡献的高斯元的平均深度"）与中值深度按 pipe.depth_ratio 混合得到的。
     计算：调用 depth_to_normal(viewpoint_camera, surf_depth)（返回世界坐标系下的法线，通常通过深度的空间梯度或将临近像素反投影到 3D 再做叉乘得到），然后重排通道并乘以 render_alpha.detach()（按累积 alpha 加权，用于与 rasterizer 的法线匹配）
 '''
