@@ -2,10 +2,12 @@
 
 > **FVO-GS-SLAM: Frequency-Aware 2D Gaussian SLAM with Submap Covisibility Handoff**
 >
-> 基于 RGBD + 2D Gaussian Splatting 的静态室内 SLAM 系统，目标是在稳定轨迹精度的前提下提升渲染质量。三个并行进程 + 一个主进程后处理阶段，围绕两大核心问题展开：
+> 基于 RGB-D + 2D Gaussian Splatting 的静态室内 SLAM 系统，目标是在稳定轨迹精度的前提下提升渲染质量。三个并行进程 + 一个主进程后处理阶段，围绕在线 2DGS SLAM 中 tracking、mapping 与地图管理之间的耦合问题展开：
 >
-> - **问题一：在线 Tracking 精度易受退化条件影响** — 弱纹理/模糊下 photometric 约束失效 → 频域感知边缘VO与渲染精化解决
-> - **问题二：Gaussian 膨胀与硬切图导致渲染质量下降** — 显存不可控/切图渲染断裂/新子图初始化不稳定 → 共视引导的子图建图（Handoff + RSKM + 回环闭合）
+> - **问题一：渲染参与式 Tracking 在退化条件下易失稳** — 弱纹理、运动模糊或 Gaussian 地图尚未充分优化时，photometric refinement 的渲染约束变弱 → 频域感知 Visual Odometry 提供相对独立的几何位姿初值，再由 2DGS 可微渲染精化。
+> - **问题二：Gaussian 地图规模控制与硬切图破坏渲染支撑** — 为控制显存占用和优化开销，Gaussian based SLAM 需要限制在线维护的 Gaussian 地图规模；但硬切图会移除仍与当前视角共视的稳定 Gaussian，使新子图缺少可用于 tracking 和 rendering 的渲染支撑 → 共视引导的子图建图缓解切图期间的 tracking 断裂和渲染退化。
+>
+> **论文主线：** 2D Gaussian Splatting 为 RGB-D SLAM 提供了显式、可微且具备较高渲染质量的场景表示，使相机位姿估计与场景表示优化能够通过渲染误差建立联系。然而，在以 Gaussian 地图渲染结果参与 tracking refinement 的在线系统中，位姿估计、地图优化和地图管理之间仍存在明显耦合。一方面，当场景存在弱纹理、运动模糊，或当前 Gaussian 地图尚未充分优化时，基于渲染误差的 photometric refinement 容易失去稳定约束，导致位姿估计漂移；另一方面，为控制显存占用和优化开销，Gaussian based SLAM 通常需要限制在线维护的 Gaussian 地图规模，但如果在子图切换时直接移除旧子图中仍与当前视角共视的稳定 Gaussian，新子图在初始化阶段将缺少可用于 tracking 和 rendering 的渲染支撑，从而破坏 tracking 连续性，并进一步放大位姿误差与地图退化之间的耦合。为此，本文提出 FVO-GS-SLAM：前端通过频域感知 Visual Odometry 提供相对独立的几何位姿初值，再利用 2DGS 可微渲染进行位姿精化；后端通过共视 Handoff、子图内 RSKM、轻量 Gaussian 评分和关键帧级回环闭合，在显存可控的前提下缓解子图切换造成的渲染支撑断裂，并提升 tracking 连续性、局部渲染质量和全局一致性。
 
 ```text
 RGBD 序列 → FrontEnd (主进程) → BackEnd (独立进程) → LoopClosureProcess (独立进程) → 主进程融合评估
@@ -47,7 +49,7 @@ RGBD 序列 → FrontEnd (主进程) → BackEnd (独立进程) → LoopClosureP
 | 文件 | 职责 |
 |---|---|
 | `utils/slam_frontend.py` (子图部分) | `compute_submap_motion()` 计算当前帧相对于子图锚点的平移/旋转；`should_start_new_submap()` 阈值判断；`perform_submap_cut()` 触发切图 |
-| `utils/slam_backend.py` (Handoff 部分) | 切图时根据 seed 帧 + 尾部关键帧共视关系选择旧子图边界 Gaussian → 导出为 frozen GaussianModel（无 optimizer）→ 发送给前端用作短期 tracking 支撑 |
+| `utils/slam_backend.py` (Handoff 部分) | 切图时根据 seed 帧 + 尾部关键帧共视关系选择旧子图边界 Gaussian → 导出为 frozen GaussianModel（无 optimizer）→ 发送给前端用作短期 tracking 和 rendering 渲染支撑 |
 | `utils/rap2dgs_lite/scorer.py` | RAP2DGS Lite 评分器：在 candidate_mask 内通过单次共享 KNN 计算 6 维几何特征（support/opacity/observation/area/normal consistency/local density），加权融合 |
 | `utils/rap2dgs_lite/selector.py` | Top-K 选择 + fallback 逻辑 |
 | `utils/rap2dgs_lite/feature_utils.py` | 归一化 / sanitize / chunked KNN / normal consistency 工具函数 |
@@ -253,7 +255,7 @@ configs/rgbd/
                   ▼
       ┌────────────────────────────────────┐
       │  LoopClosureProcess (独立进程)      │
-      │  （共视引导子图建图 — 全局一致性）   │
+      │  （共视引导子图建图 — 渲染支撑与全局一致性）   │
       │                                    │
       │  CosPlace 视觉位置识别              │
       │  关键帧级跨子图检索                  │

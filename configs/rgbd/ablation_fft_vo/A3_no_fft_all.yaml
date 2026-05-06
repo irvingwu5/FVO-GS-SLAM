@@ -1,0 +1,12 @@
+inherit_from: "configs/rgbd/tum/fr3_office.yaml"
+
+Results:
+  eval_rendering: true
+
+# A3: All FFT off — no VO prior + no FFT mask seeding
+FFTEdgeVO:
+  use_fft_edge_vo: false
+
+Ablation:
+  use_loop_closure: false
+  use_fft_mask: false

@@ -1,0 +1,12 @@
+inherit_from: "configs/rgbd/tum/fr3_office.yaml"
+
+Results:
+  eval_rendering: true
+
+# A1: No FFT Edge VO — tracking falls back to previous-frame pose + render refinement
+FFTEdgeVO:
+  use_fft_edge_vo: false
+
+Ablation:
+  use_loop_closure: false
+  use_fft_mask: true

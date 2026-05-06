@@ -1,0 +1,9 @@
+inherit_from: "configs/rgbd/tum/fr3_office.yaml"
+
+pipeline_params:
+  use_sa: false
+  use_sa_depth: false
+  depth_ratio: 1.0
+
+opt_params:
+  lambda_dist: 0.0

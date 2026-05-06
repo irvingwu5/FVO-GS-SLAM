@@ -128,14 +128,15 @@ Submap:
   seed_init_iters: 1500            # 新子图 seed 帧初始化迭代数，500-2000
 
   # ===== Cross-Submap Covisibility Handoff =====
+  # 退出条件:1. (唯一) keyframes >= 3 AND coverage >= 0.85  → 正常退出 2. (兜底) age >= 200→ 强制退出 + WARN 日志
+  # 结果: Handoff 会一直保护到新子图真正自给自足
   use_handoff: true                # 是否启用跨子图共视 handoff
   handoff_tail_kfs: 4              # 参与共视的旧子图尾部关键帧数，2-6
   handoff_max_points: 8000         # handoff 最大 Gaussian 数量，3000-15000
   handoff_min_support: 2           # 最少共视关键帧数（含 seed 帧），1-4
   handoff_opacity_min: 0.20        # 最低 opacity 阈值（sigmoid 后），0.10-0.40
-  handoff_warmup_frames: 20        # handoff warmup 最大帧数，超出强制释放
-  handoff_warmup_keyframes: 3      # handoff warmup 最大关键帧数，超出强制释放
-  handoff_new_coverage_th: 0.85    # active coverage 超此值提前释放 handoff，0.70-0.95
+  handoff_warmup_keyframes: 3      # handoff 最少关键帧数，需与 coverage_th 同时满足才释放（AND 关系）
+  handoff_new_coverage_th: 0.85    # 新子图自身覆盖率 ≥85% 且关键帧达标后释放。200 帧安全兜底
 
 # ============================================================
 # RAP2DGS Lite Configuration (lightweight rule-based handoff scoring)
@@ -313,7 +314,7 @@ pipeline_params:
 # ============================================================
 Ablation:
   use_submap: True                 # 子图切图策略 (关闭 → 全局单地图)
-  use_loop_closure: True           # 回环检测 + PGO 修正
+  use_loop_closure: False           # 回环检测 + PGO 修正
   use_fdn: True                    # FDN 有限差分法向监督
   use_fft_mask: True               # FFT 高低频掩膜指导采样与初始 scale
   use_error_mask: True             # 渲染误差掩膜指导动态补点

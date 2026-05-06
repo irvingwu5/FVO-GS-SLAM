@@ -25,6 +25,7 @@ The current system includes:
 - Keyframe selection and sliding window management
 - Asynchronous back end Gaussian-only mapping (RGB + depth + normal)
 - 2D Gaussian map representation with differentiable surfel rendering
+- Surface-aware (SA) depth rendering: confidence-weighted expected depth reduces depth aliasing at occlusion boundaries
 - Finite difference normal (FDN) supervision
 - Gaussian densification, opacity reset, and pruning
 - Visibility maintenance with `occ_aware_visibility`
@@ -93,7 +94,31 @@ Mapping includes:
 - Error mask guided dynamic point insertion (holes + depth penetration)
 - Periodic densify, opacity reset, and prune
 
-### 5. Submap based SLAM
+### 5. Surface-Aware Depth Rendering
+
+Porting GauS-SLAM's confidence-weighted expected depth into the differentiable surfel rasterizer. When `use_sa=true`, the CUDA forward kernel adjusts each splat's depth before alpha accumulation: if a splat's depth deviates from the current surface estimate (median depth), its depth is pulled toward the surface via a confidence factor $conf = \exp(-error^2 / 4\sigma^2)$. This reduces depth aliasing at occlusion boundaries where background splats would otherwise bias the alpha-composited expected depth.
+
+Key design decisions:
+- **Preserve pose gradient**: SA backward correctly propagates gradients through the confidence-adjusted depth path while keeping `dL_dtau` (SE(3) pose Jacobian) intact.
+- **Dual-switch control**: `use_sa` (CUDA forward/backward) and `use_sa_depth` (Python depth selection for loss) are independently configurable for ablation.
+- **Zero overhead**: Confidence computation (4 FMA + 1 exp per splat) runs inside the existing CUDA kernel; measured FPS difference < 5%.
+- **Default off**: `use_sa: false, use_sa_depth: false` preserves exact baseline behavior.
+
+On TUM fr3_office, SA expected depth (A2: `use_sa=true, use_sa_depth=true, depth_ratio=0.0`) improves Mid PGO ATE by 27.4% (0.01441 vs 0.01984 m) with no rendering quality degradation.
+
+```yaml
+pipeline_params:
+  use_sa: false           # CUDA SA depth adjustment
+  use_sa_depth: false     # use SA expected depth in loss
+  depth_eps: 1.0e-6       # safe division epsilon
+  debug_sa_depth: false   # output debug fields
+opt_params:
+  lambda_dist: 0.0        # distortion loss weight (0=off)
+```
+
+For detailed theory and ablation results, see `docs/experiments/surface_aware_depth_rendering_technical_report.md`.
+
+### 6. Submap based SLAM
 
 Motion-based submap cutting: a new submap starts when current camera motion relative to the submap anchor exceeds the configured translation or rotation threshold. Each submap is an independent memory and optimization partition.
 
@@ -109,7 +134,7 @@ On submap cut, the back end prunes ALL Gaussian points and resets optimizer stat
 
 When `use_handoff: true`, the system preserves a small set of boundary Gaussians from the old submap as short-term frozen tracking support (see [Handoff Mechanism](#7-cross-submap-covisibility-handoff)).
 
-### 6. Loop closure and PGO
+### 7. Loop closure and PGO
 
 The loop closure process runs as an independent process:
 
@@ -128,7 +153,7 @@ The loop closure process runs as an independent process:
 - `verify_only`: retrieval + Reloc3R + depth verify, NO correct_tsfm write
 - `keyframe_pgo`: full pipeline including PGO trial (write only when safety passes)
 
-### 7. Streaming global fusion
+### 8. Streaming global fusion
 
 After front end finishes, the main process:
 1. Stops the back end (saves final submap)
@@ -139,7 +164,7 @@ After front end finishes, the main process:
 6. Evaluates ATE and rendering quality
 7. Optionally saves final PLY
 
-### 8. Cross-Submap Covisibility Handoff
+### 9. Cross-Submap Covisibility Handoff
 
 To mitigate tracking degradation after submap cuts (caused by sudden loss of all old Gaussians), the system supports boundary handoff:
 
@@ -162,7 +187,7 @@ handoff_warmup_keyframes: 3 # max keyframes before forced drop
 handoff_new_coverage_th: 0.85  # active coverage threshold for early drop
 ```
 
-### 9. RAP2DGS Lite: Rule-Based Handoff Scoring
+### 10. RAP2DGS Lite: Rule-Based Handoff Scoring
 
 To improve the quality of boundary Gaussian selection, the system includes RAP2DGS Lite (`utils/rap2dgs_lite/`), a lightweight rule-based scoring module that replaces the simple `support + 0.2 × opacity` heuristic in handoff selection:
 
@@ -246,6 +271,8 @@ FrontEnd (main process)
     ├── Render-based pose refinement
     │     Adam on cam_rot_delta / cam_trans_delta
     │     RGB L1 + DSSIM + depth L1 tracking loss
+    │     SA depth (use_sa=true): confidence-weighted expected depth,
+    │       outlier splat depths pulled toward median surface
     ├── Keyframe decision + sliding window
     ├── Motion monitoring → submap cut trigger
     └── Auto-refresh FFTEdgeVO reference
@@ -463,9 +490,9 @@ Important configuration groups:
 | `Submap` | motion thresholds (TUM: 2.0m/80°), seed init, handoff |
 | `RAP2DGSLite` | rule-based handoff scoring: KNN k, features, weights, selection budget |
 | `LoopClosure` | mode control, keyframe retrieval, depth verify, keyframe PGO safety, Reloc3R |
-| `opt_params` | Gaussian optimizer and densification params |
+| `opt_params` | Gaussian optimizer, densification, lambda_dist, lambda_sensor_normal |
 | `model_params` | SH degree, data device |
-| `pipeline_params` | renderer settings |
+| `pipeline_params` | renderer settings, use_sa, use_sa_depth, depth_ratio, depth_eps |
 | `Ablation` | submap, loop closure, FDN, FFT mask, error mask, color refinement |
 
 Three base configs must be kept in sync for generic parameters:

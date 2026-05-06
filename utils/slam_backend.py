@@ -71,7 +71,6 @@ class BackEnd(mp.Process):
         self.handoff_max_points = submap_cfg.get("handoff_max_points", 80000)
         self.handoff_min_support = submap_cfg.get("handoff_min_support", 2)
         self.handoff_opacity_min = submap_cfg.get("handoff_opacity_min", 0.20)
-        self.handoff_warmup_frames = submap_cfg.get("handoff_warmup_frames", 20)
         self.handoff_warmup_keyframes = submap_cfg.get("handoff_warmup_keyframes", 3)
         self.handoff_new_coverage_th = submap_cfg.get("handoff_new_coverage_th", 0.85)
         self.handoff_depth_consistency_th = submap_cfg.get("handoff_depth_consistency_th", 0.08)
@@ -857,7 +856,7 @@ class BackEnd(mp.Process):
             tag = "sync_backend"
         # Handoff: 传递 frozen GaussianModel（multiprocessing queue 自动序列化，无需手动 clone）
         if self.use_handoff and self.handoff_gaussians is not None and self.handoff_active:
-            handoff_data = (self.handoff_gaussians, self.handoff_age_frames, self.handoff_warmup_frames)
+            handoff_data = (self.handoff_gaussians,)
         else:
             handoff_data = None
         # 过滤 shape 不一致的 occ_aware_visibility 条目（densify 后可能残留旧 shape）
@@ -987,9 +986,11 @@ class BackEnd(mp.Process):
                     self.current_window = current_window
                     if self.handoff_active:
                         self.handoff_age_frames += 1
-                        if len(self.current_window) >= self.handoff_warmup_keyframes:
-                            Log(f"[Handoff] keyframe count {len(self.current_window)} >= {self.handoff_warmup_keyframes}, "
-                                f"deactivating handoff (backend)")
+                        # Handoff 退出由 Frontend 统一决策:
+                        #   (关键帧数达标 AND 覆盖率达标), 200 帧安全兜底
+                        # Backend 仅做显存安全清理（远晚于 Frontend 正常退出时间）。
+                        if self.handoff_age_frames >= 300:
+                            Log(f"[Handoff] backend safety cleanup after {self.handoff_age_frames} kf")
                             self.handoff_active = False
                             self.handoff_gaussians = None
                             torch.cuda.empty_cache()
