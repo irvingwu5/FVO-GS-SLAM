@@ -64,31 +64,26 @@ class BackEnd(mp.Process):
         # ===== 子图切割参数 =====
         self.seed_init_iters = self.config.get("Submap", {}).get("seed_init_iters", 500)
 
-        # ===== Cross-Submap Covisibility Handoff =====
+        # ===== Gaussian Inheritance (替代 Handoff) =====
         submap_cfg = self.config.get("Submap", {})
-        self.use_handoff = submap_cfg.get("use_handoff", False)
-        self.handoff_tail_kfs = submap_cfg.get("handoff_tail_kfs", 4)
-        self.handoff_max_points = submap_cfg.get("handoff_max_points", 80000)
-        self.handoff_min_support = submap_cfg.get("handoff_min_support", 2)
-        self.handoff_opacity_min = submap_cfg.get("handoff_opacity_min", 0.20)
-        self.handoff_warmup_keyframes = submap_cfg.get("handoff_warmup_keyframes", 3)
-        self.handoff_new_coverage_th = submap_cfg.get("handoff_new_coverage_th", 0.85)
-        self.handoff_depth_consistency_th = submap_cfg.get("handoff_depth_consistency_th", 0.08)
-        # Handoff runtime state (Stage 4+)
-        self.handoff_gaussians = None
-        self.handoff_active = False
-        self.handoff_age_frames = 0
-        Log(f"[Handoff] use_handoff={self.use_handoff}")
+        self.use_inheritance = submap_cfg.get("use_inheritance", True)
+        self.inherit_keep_percent = submap_cfg.get("inherit_keep_percent", 0.45)
+        self.inherit_min_keep = submap_cfg.get("inherit_min_keep", 3000)
+        self.inherit_tail_kfs = submap_cfg.get("inherit_tail_kfs", 4)
+        self.inherit_min_support = submap_cfg.get("inherit_min_support", 2)
+        self.inherit_opacity_min = submap_cfg.get("inherit_opacity_min", 0.20)
+        self.inherit_max_points = submap_cfg.get("inherit_max_points", 30000)
+        Log(f"[Inheritance] enable={self.use_inheritance}, "
+            f"keep_percent={self.inherit_keep_percent}")
 
-        # ===== RAP2DGS Lite =====
+        # ===== RAP2DGS Lite (用于 Inheritance 高斯评分) =====
         rap_cfg = self.config.get("RAP2DGSLite", {})
         self.rap2dgs_lite_enable = rap_cfg.get("enable", False)
-        self.rap2dgs_lite_use_in_handoff = rap_cfg.get("use_in_handoff", False)
-        self.rap2dgs_lite_fallback_to_original = rap_cfg.get("fallback_to_original", True)
+        self.rap2dgs_lite_use_in_inheritance = rap_cfg.get("use_in_inheritance", False)
         self.rap2dgs_lite_cfg = rap_cfg
         self.rap2dgs_lite_selector = None
         Log(f"[RAP2DGS-Lite] enable={self.rap2dgs_lite_enable}, "
-            f"use_in_handoff={self.rap2dgs_lite_use_in_handoff}")
+            f"use_in_inheritance={self.rap2dgs_lite_use_in_inheritance}")
 
         # ===== Backend pose policy (EAGS 风格: Gaussian only) =====
         self.optimize_keyframe_pose = self.config.get("Backend", {}).get(
@@ -658,14 +653,14 @@ class BackEnd(mp.Process):
         result[selected] = True
         return result
 
-    def _rap2dgs_lite_handoff_select(self, cand_mask, support, opacity):
-        """RAP2DGS Lite handoff selection with automatic fallback to original.
+    def _rap2dgs_lite_inheritance_select(self, cand_mask, support, opacity, max_keep):
+        """RAP2DGS Lite inheritance selection with automatic fallback.
 
         Args:
             cand_mask: (N,) bool candidate mask
             support: (N,) long tensor, visibility support count
             opacity: (N,) float tensor, sigmoid-activated opacity
-
+            max_keep: max points to keep
         Returns:
             selected: (N,) bool mask, always a subset of cand_mask
         """
@@ -674,15 +669,13 @@ class BackEnd(mp.Process):
         N = cand_mask.shape[0]
         t0 = time.time()
 
-        # ---- Lazy init selector ----
         if self.rap2dgs_lite_selector is None:
             from utils.rap2dgs_lite.selector import RAP2DGSLiteSelector
             self.rap2dgs_lite_selector = RAP2DGSLiteSelector(self.rap2dgs_lite_cfg)
 
-        # ---- Effective max_keep: capped by handoff_max_points ----
         sel_cfg = self.rap2dgs_lite_cfg.get("selection", {})
         rap_max_keep = int(sel_cfg.get("max_keep", 8000))
-        effective_max_keep = min(rap_max_keep, self.handoff_max_points)
+        effective_max_keep = min(rap_max_keep, max_keep)
 
         current_kf_id = self.current_window[-1] if len(self.current_window) > 0 else None
 
@@ -726,20 +719,14 @@ class BackEnd(mp.Process):
             torch.cuda.empty_cache()
 
         if fallback:
-            Log(
-                f"[RAP2DGS-Lite] fallback to original handoff: "
-                f"reason={fallback_reason} elapsed={elapsed_ms:.1f}ms"
-            )
+            Log(f"[RAP2DGS-Lite] fallback: reason={fallback_reason} elapsed={elapsed_ms:.1f}ms")
             score = support.float() + 0.2 * opacity.float()
-            return self._select_topk_mask(cand_mask, score, self.handoff_max_points)
+            return self._select_topk_mask(cand_mask, score, max_keep)
 
         n_cand = int(cand_mask.sum().item())
         n_sel = int(selected_mask.sum().item())
-        Log(
-            f"[RAP2DGS-Lite] handoff selection: "
-            f"candidates={n_cand} selected={n_sel} "
-            f"elapsed={elapsed_ms:.1f}ms fallback=False"
-        )
+        Log(f"[RAP2DGS-Lite] inheritance selection: "
+            f"candidates={n_cand} selected={n_sel} elapsed={elapsed_ms:.1f}ms fallback=False")
 
         # ---- Save report if configured ----
         if self.rap2dgs_lite_cfg.get("safety", {}).get("log_report", False):
@@ -761,38 +748,37 @@ class BackEnd(mp.Process):
                 out_dir = os.path.join(save_dir, report_dir_name)
                 old_submap = self.current_submap_id
                 new_submap = self.current_submap_id + 1
-                label = f"handoff_submap_{old_submap}_to_{new_submap}"
+                label = f"inheritance_submap_{old_submap}_to_{new_submap}"
                 save_report_json(report, out_dir, label=label)
             except Exception as e:
                 Log(f"[RAP2DGS-Lite] failed to save report: {e}")
 
         return selected_mask
 
-    def build_boundary_handoff(self, new_seed_global_c2w):
+    def build_inheritance_mask(self, new_seed_global_c2w):
         """
-        在旧子图被清除前，基于 seed frame + 尾部关键帧共视关系选择边界 Handoff Gaussian。
-        返回 (handoff_params_dict | None, valid_tail_ids | list)。
+        子图切换时评分旧高斯，返回 keep_mask 用于保留 top-K% 继承到新子图。
+        与 Handoff 关键区别: 返回 mask 而非导出参数，保留的高斯仍为 active（可优化）。
         """
-        if not self.use_handoff:
-            return None, []
+        if not self.use_inheritance:
+            return torch.ones(self.gaussians._xyz.shape[0], dtype=torch.bool, device="cuda")
 
-        if self.gaussians.get_xyz.shape[0] == 0:
-            return None, []
+        N = self.gaussians._xyz.shape[0]
+        if N == 0:
+            return torch.zeros(0, dtype=torch.bool, device="cuda")
 
         seed_vp = self._make_handoff_seed_viewpoint(new_seed_global_c2w)
         if seed_vp is None:
-            return None, []
+            return torch.ones(N, dtype=torch.bool, device="cuda")
 
         with torch.no_grad():
             render_pkg = render(
                 seed_vp, self.gaussians, self.pipeline_params, self.background, surf=False
             )
             seed_visible = render_pkg["visibility_filter"]  # (N,) bool
-            N = seed_visible.shape[0]
-
             support = seed_visible.long().clone()
 
-            tail_ids = list(self.current_window)[-self.handoff_tail_kfs:]
+            tail_ids = list(self.current_window)[-self.inherit_tail_kfs:]
             valid_tail_ids = []
             for kf_id in tail_ids:
                 if kf_id not in self.viewpoints:
@@ -807,30 +793,43 @@ class BackEnd(mp.Process):
                     valid_tail_ids.append(kf_id)
 
             opacity = self.gaussians.get_opacity.squeeze()
-            mask = (
+            cand_mask = (
                 seed_visible
-                & (support >= self.handoff_min_support)
-                & (opacity > self.handoff_opacity_min)
+                & (support >= self.inherit_min_support)
+                & (opacity > self.inherit_opacity_min)
             )
 
-            if self.rap2dgs_lite_enable and self.rap2dgs_lite_use_in_handoff:
-                selected = self._rap2dgs_lite_handoff_select(
-                    mask, support, opacity
+            # 从 candidate_mask 内按 keep_percent 选 top-K
+            # inherit_min_keep 保证最少保留数，防止最后一个子图继承过少
+            n_candidates = int(cand_mask.sum().item())
+            n_keep = max(1, int(N * self.inherit_keep_percent))
+            n_keep = max(n_keep, self.inherit_min_keep)
+            n_keep = min(n_keep, n_candidates, self.inherit_max_points)
+
+            if self.rap2dgs_lite_enable and self.rap2dgs_lite_use_in_inheritance:
+                selected = self._rap2dgs_lite_inheritance_select(
+                    cand_mask, support, opacity, n_keep
                 )
+                # RAP2DGS 内部 keep_percent 可能截断选择 → 用简单评分补足
+                n_selected = int(selected.sum().item())
+                if n_selected < n_keep:
+                    remaining = cand_mask & ~selected
+                    n_need = n_keep - n_selected
+                    if remaining.any():
+                        score = support.float() + 0.2 * opacity.float()
+                        extra = self._select_topk_mask(remaining, score, n_need)
+                        selected = selected | extra
             else:
                 score = support.float() + 0.2 * opacity.float()
-                selected = self._select_topk_mask(mask, score, self.handoff_max_points)
+                selected = self._select_topk_mask(cand_mask, score, n_keep)
 
-            handoff_params = self.gaussians.capture_masked(selected)
+        n_kept = int(selected.sum().item())
+        Log(f"[Inheritance] old_gaussians={N} seed_visible={int(seed_visible.sum().item())} "
+            f"tail_kfs={tail_ids} valid_tail={valid_tail_ids}")
+        Log(f"[Inheritance] candidates={n_candidates} kept={n_kept} "
+            f"keep_ratio={n_kept / max(1, N):.4f}")
 
-        Log(f"[Handoff] old_gaussians={N}")
-        Log(f"[Handoff] seed_visible={int(seed_visible.sum().item())}")
-        Log(f"[Handoff] tail_kfs={tail_ids}  valid_tail={valid_tail_ids}")
-        Log(f"[Handoff] support>={self.handoff_min_support} count={int((support >= self.handoff_min_support).sum().item())}")
-        Log(f"[Handoff] selected_points={int(selected.sum().item())} "
-            f"selected_ratio={selected.float().mean().item():.4f}")
-
-        return handoff_params, valid_tail_ids
+        return selected
 
     # ========================================================================
     # 8. Color Refinement (offline)
@@ -854,19 +853,13 @@ class BackEnd(mp.Process):
                 keyframes.append((latest_kf_idx, kf.T.clone()))
         if tag is None:
             tag = "sync_backend"
-        # Handoff: 传递 frozen GaussianModel（multiprocessing queue 自动序列化，无需手动 clone）
-        if self.use_handoff and self.handoff_gaussians is not None and self.handoff_active:
-            handoff_data = (self.handoff_gaussians,)
-        else:
-            handoff_data = None
-        # 过滤 shape 不一致的 occ_aware_visibility 条目（densify 后可能残留旧 shape）
         n_curr = self.gaussians._xyz.shape[0]
         if n_curr > 0:
             safe_occ = {k: v for k, v in self.occ_aware_visibility.items()
                         if isinstance(v, torch.Tensor) and v.shape[0] == n_curr}
         else:
             safe_occ = {}
-        msg = [tag, clone_obj(self.gaussians), safe_occ, keyframes, handoff_data]
+        msg = [tag, clone_obj(self.gaussians), safe_occ, keyframes]
         self.frontend_queue.put(msg)
 
     # ========================================================================
@@ -964,9 +957,14 @@ class BackEnd(mp.Process):
 
                     self.viewpoints[cur_frame_idx] = viewpoint
                     self.current_window = [cur_frame_idx]
+                    has_inherited = len(self.gaussians._xyz) > 0
                     self.add_next_kf(
-                        cur_frame_idx, viewpoint, depth_map=depth_map, init=True
+                        cur_frame_idx, viewpoint, depth_map=depth_map, init=not has_inherited
                     )
+                    if has_inherited:
+                        n_inherited = len(self.gaussians._xyz)
+                        Log(f"[Inheritance] seed frame: {n_inherited} Gaussians present, "
+                            f"skipping full seeding (init=False)")
 
                     if len(self.gaussians._xyz) == 0 and self.current_submap_id > 0:
                         init_iters = self.seed_init_iters
@@ -984,16 +982,6 @@ class BackEnd(mp.Process):
 
                     self.viewpoints[cur_frame_idx] = viewpoint
                     self.current_window = current_window
-                    if self.handoff_active:
-                        self.handoff_age_frames += 1
-                        # Handoff 退出由 Frontend 统一决策:
-                        #   (关键帧数达标 AND 覆盖率达标), 200 帧安全兜底
-                        # Backend 仅做显存安全清理（远晚于 Frontend 正常退出时间）。
-                        if self.handoff_age_frames >= 300:
-                            Log(f"[Handoff] backend safety cleanup after {self.handoff_age_frames} kf")
-                            self.handoff_active = False
-                            self.handoff_gaussians = None
-                            torch.cuda.empty_cache()
                     self.add_next_kf(cur_frame_idx, viewpoint, depth_map=depth_map)
 
                     opt_params = []
@@ -1111,39 +1099,34 @@ class BackEnd(mp.Process):
                         self.loop_queue.put(["submap_saved", completed_submap_id, ckpt_path, kf_image_paths, kf_depth_paths])
                         Log(f"✓ Submap {completed_submap_id} sent to loop closure")
 
-                    if self.use_handoff:
-                        handoff_params, valid_tail_ids = self.build_boundary_handoff(
-                            new_seed_global_c2w
-                        )
-                        if handoff_params is not None:
-                            n_handoff = handoff_params["_xyz"].shape[0]
-                            Log(f"[Handoff] selected {n_handoff} boundary Gaussians for submap {completed_submap_id}→{self.current_submap_id}")
-                            sh_degree = self.gaussians.active_sh_degree if hasattr(self.gaussians, "active_sh_degree") else 0
-                            self.handoff_gaussians = GaussianModel.create_frozen_from_params(
-                                handoff_params, sh_degree=sh_degree
-                            )
-                            self.handoff_active = True
-                            self.handoff_age_frames = 0
-                            Log(f"[Handoff] frozen handoff created, points={n_handoff} device=cuda")
-                            Log("[Handoff] insertion uses active-only coverage (self.gaussians); "
-                                "handoff is separate frozen model")
-                        else:
-                            Log("[Handoff] no boundary Gaussians selected (empty mask)")
+                    # ---- Gaussian Inheritance: 保留 top-K% 旧高斯作为新子图 active 初始 ----
+                    N_before = self.gaussians._xyz.shape[0]
+                    if self.use_inheritance and N_before > 0:
+                        keep_mask = self.build_inheritance_mask(new_seed_global_c2w)
+                        prune_mask = ~keep_mask
+                        self.gaussians.prune_points(prune_mask)
+                        n_kept = self.gaussians._xyz.shape[0]
+                        n_pruned = N_before - n_kept
+                        Log(f"[Inheritance] kept {n_kept}/{N_before} Gaussians "
+                            f"({n_kept / max(1, N_before) * 100:.1f}%), pruned {n_pruned}")
                     else:
-                        Log("[Handoff] disabled, using original hard reset behavior")
-
-                    self.gaussians.prune_points(self.gaussians.unique_kfIDs >= 0)
-                    Log("✓ Pruned ALL Gaussian points for true independent submap")
+                        self.gaussians.prune_points(self.gaussians.unique_kfIDs >= 0)
+                        Log("✓ Pruned ALL Gaussian points for true independent submap")
 
                     self.viewpoints.clear()
                     self.current_window = []
                     self.occ_aware_visibility = {}
                     self.keyframe_optimizers = None
 
+                    # 给继承高斯加微小噪声，打破旧子图系统偏差
+                    if self.use_inheritance and self.gaussians._xyz.shape[0] > 0:
+                        noise = torch.randn_like(self.gaussians._xyz) * 0.001
+                        self.gaussians._xyz.data += noise
+
                     self.gaussians.training_setup(self.opt_params)
 
                     torch.cuda.empty_cache()
-                    Log("✓ Backend state fully reset. Waiting for seed frame init...")
+                    Log("✓ Backend state reset. Waiting for seed frame init...")
 
         while not self.backend_queue.empty():
             try:

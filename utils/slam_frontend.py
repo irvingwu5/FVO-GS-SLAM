@@ -5,7 +5,7 @@ import torch
 import torch.multiprocessing as mp
 import os
 from gaussian_splatting.gaussian_renderer import render
-from gaussian_splatting.scene.gaussian_model import GaussianModel
+
 from gaussian_splatting.utils.graphics_utils import getProjectionMatrix2
 from gui import gui_utils
 from utils.camera_utils import Camera
@@ -57,20 +57,12 @@ class FrontEnd(mp.Process):
         self.submap_trans_thre = self.config["Submap"]["trans_thre"]
         self.submap_rot_thre = self.config["Submap"]["rot_thre"]
         self.frame_to_submap = {}  # <--- 记录每帧属于哪个子图
-        # ========== LoopSplat-style submap handoff ==========
         # 新子图 seed 帧不再重置到单位阵，而是继承旧子图 tracking 后的全局估计位姿。
         self.last_submap_seed_global_c2w = None
         # ================================================
         self.submap_motion_anchor_global_c2w = None #运动监控锚点（global C2W）
         self.submap_start_frame_idx = 0
-        # ===== Cross-Submap Covisibility Handoff =====
-        self.handoff_gaussians = None  # frozen GaussianModel from old submap boundary
-        self.handoff_age_frames = 0
-        _sub_cfg = self.config.get("Submap", {})
-        self.handoff_warmup_keyframes = _sub_cfg.get("handoff_warmup_keyframes", 3)
-        self.handoff_safety_age = 200  # 安全兜底: 超过此帧数未达标则强制退出
-        self._handoff_dropped = False  # 防止 backend sync 重新激活已释放的 handoff
-        self._handoff_eval = {}  # per-submap eval stats
+        # ===== Gaussian Inheritance (Backend 处理，Frontend 无状态) =====
         self.fft_filter = None  # 频域滤波器实例
         # 消融实验开关
         self.use_submap = self.config.get("Ablation", {}).get("use_submap", True)
@@ -251,50 +243,7 @@ class FrontEnd(mp.Process):
         return error_mask
 
     def _get_render_model(self):
-        if self.handoff_gaussians is not None:
-            return GaussianModel.create_merged_for_render(self.gaussians, self.handoff_gaussians)
         return self.gaussians
-
-    def _maybe_drop_handoff(self, cur_frame_idx):
-        """唯一退出条件: 关键帧数达标 AND 覆盖率达标。200 帧安全兜底防止死循环。"""
-        if self.handoff_gaussians is None:
-            return False, ""
-
-        cov_th = self.config.get("Submap", {}).get("handoff_new_coverage_th", 0.85)
-
-        # 安全兜底: 超过 safety_age 帧仍未达标，强制退出
-        if self.handoff_age_frames >= self.handoff_safety_age:
-            Log(f"[Handoff] SAFETY: age={self.handoff_age_frames} >= {self.handoff_safety_age}, "
-                f"forcing drop (coverage never reached {cov_th})", tag="WARN")
-            return True, "safety_age"
-
-        # 正常退出: 关键帧数达标 AND 覆盖率达标（每 10 帧检查一次）
-        kf_ready = len(self.current_window) >= self.handoff_warmup_keyframes
-        if kf_ready and cur_frame_idx % 10 == 0 and self.gaussians is not None and len(self.gaussians._xyz) > 0:
-            with torch.no_grad():
-                viewpoint = self.cameras.get(cur_frame_idx)
-                if viewpoint is None:
-                    return False, ""
-                render_pkg = render(
-                    viewpoint, self.gaussians, self.pipeline_params, self.background, surf=False
-                )
-                opacity = render_pkg["opacity"]
-                coverage = (opacity > 0.95).float().mean().item()
-                if coverage >= cov_th:
-                    Log(f"[Handoff] keyframes={len(self.current_window)}>={self.handoff_warmup_keyframes} "
-                        f"AND coverage={coverage:.3f}>={cov_th}, dropping")
-                    return True, "keyframes+coverage"
-
-        return False, ""
-
-    def _drop_handoff(self, reason):
-        n_handoff = self.handoff_gaussians._xyz.shape[0] if self.handoff_gaussians is not None else 0
-        n_active = self.gaussians._xyz.shape[0] if self.gaussians is not None else 0
-        Log(f"[Handoff] dropped: reason={reason} age_frames={self.handoff_age_frames} "
-            f"handoff_points={n_handoff} active_points={n_active}")
-        self.handoff_gaussians = None
-        self.handoff_age_frames = 0
-        self._handoff_dropped = True  # 阻止 backend sync 重新激活
 
     # ========================================================================
     # 5. Tracking (FFT Edge VO + render refinement)
@@ -646,7 +595,6 @@ class FrontEnd(mp.Process):
 
         # Reset FFT Edge VO so new submap gets its own reference
         self.fft_edge_vo_initialized = False
-        self._handoff_dropped = False  # 新子图允许接收 handoff
 
         # 4) 清空当前子图窗口，但不要改 viewpoint.T。
         self.current_window = []
@@ -703,19 +651,6 @@ class FrontEnd(mp.Process):
 
         for kf_id, kf_T in keyframes:
             self.cameras[kf_id].T = kf_T
-
-        # Handoff: 接收 frozen GaussianModel（Stage 5）
-        if len(data) > 4 and data[4] is not None:
-            if self._handoff_dropped:
-                pass  # 本子图 handoff 已退出，忽略 backend 后续推送
-            else:
-                (handoff_clone,) = data[4]
-                if self.handoff_gaussians is None:
-                    self.handoff_age_frames = 0  # 首次收到 Handoff 时重置 age
-                self.handoff_gaussians = handoff_clone
-        elif len(data) <= 4 or data[4] is None:
-            self.handoff_gaussians = None
-            self.handoff_age_frames = 0
 
     # ========================================================================
     # 12. Coordinate Utility
@@ -805,24 +740,7 @@ class FrontEnd(mp.Process):
                 )
 
                 # Tracking
-                if self.handoff_gaussians is not None:
-                    self.handoff_age_frames += 1
                 render_pkg = self.tracking(cur_frame_idx, viewpoint)
-
-                if self.handoff_gaussians is not None:
-                    if self.handoff_age_frames <= 20 and self.handoff_age_frames % 5 == 0:
-                        with torch.no_grad():
-                            active_pkg = render(viewpoint, self.gaussians,
-                                                self.pipeline_params, self.background, surf=False)
-                            active_cov = (active_pkg["opacity"] > 0.95).float().mean().item()
-                        hf_pts = self.handoff_gaussians._xyz.shape[0]
-                        Log(f"[HandoffEval] submap={self.current_submap_id} frame={cur_frame_idx} "
-                            f"age={self.handoff_age_frames} active_cov={active_cov:.3f} "
-                            f"handoff_pts={hf_pts}")
-
-                    dropped, reason = self._maybe_drop_handoff(cur_frame_idx)
-                    if dropped:
-                        self._drop_handoff(reason)
 
                 current_c2w = torch.linalg.inv(viewpoint.T)
 
@@ -867,12 +785,6 @@ class FrontEnd(mp.Process):
                 last_keyframe_idx = self.current_window[0]
                 check_time = (cur_frame_idx - last_keyframe_idx) >= self.kf_interval
                 curr_visibility = (render_pkg["n_touched"] > 0).long()
-                # tracking render 使用 merged (active+handoff)，但 occ_aware_visibility 只有 active
-                # 切片到 active-only 部分避免 shape mismatch
-                if self.handoff_gaussians is not None and self.gaussians is not None:
-                    n_active = self.gaussians._xyz.shape[0]
-                    if n_active > 0 and n_active < curr_visibility.shape[0]:
-                        curr_visibility = curr_visibility[:n_active]
 
                 if last_keyframe_idx not in self.occ_aware_visibility:
                     Log(f"[Warning] Keyframe {last_keyframe_idx} visibility missing, skipping point_ratio check.")

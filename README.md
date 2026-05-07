@@ -33,14 +33,14 @@ The current system includes:
 - Independent submap initialization from seed frames
 - Submap checkpoint saving (Gaussian params, keyframe poses, seed global C2W, relative/correct tsfm)
 - RSKM (Random Sampling Keyframe Mapping): random keyframe replay within active submap
-- Cross-submap covisibility handoff: frozen boundary Gaussians smooth submap transitions
-- RAP2DGS Lite: lightweight rule-based scoring for handoff selection (KNN + 6 geometric features)
-- Active-only coverage for correct hole detection after submap cut
+- Gaussian Inheritance: RAP2DGS-scored top-45% old Gaussians inherited as active initial state
+- RAP2DGS Lite: lightweight rule-based scoring for inheritance selection (KNN + 6 geometric features)
+- Error-mask hole seeding for new submap areas not covered by inherited Gaussians
 - CosPlace visual descriptor extraction from saved keyframe images
 - Keyframe-level loop candidate retrieval (cross-submap pair selection)
 - Reloc3R (DUSt3R variant) keyframe pair coarse relative pose estimation
 - RGB-D depth geometric verification with log-spaced scale search
-- Keyframe-level pose graph construction (temporal/handoff/loop edges)
+- Keyframe-level pose graph construction (temporal/inheritance/loop edges)
 - Keyframe PGO trial + safety evaluation (Open3D LM, correction/residual gates)
 - Per-keyframe trajectory correction + submap-median Gaussian correction
 - Streaming submap loading and global Gaussian concatenation
@@ -130,9 +130,7 @@ Submap checkpoint fields:
 - `relative_pose` — previous submap seed → current submap seed
 - `correct_tsfm` — loop closure / PGO correction (default identity)
 
-On submap cut, the back end prunes ALL Gaussian points and resets optimizer state for the next independent submap.
-
-When `use_handoff: true`, the system preserves a small set of boundary Gaussians from the old submap as short-term frozen tracking support (see [Handoff Mechanism](#7-cross-submap-covisibility-handoff)).
+On submap cut, the back end RAP2DGS-scores all old Gaussians and inherits the top 45% as the new submap's active initial state (Gaussian Inheritance), eliminating the cold-start coverage gap. The inherited Gaussians are re-optimizable and receive σ=1mm noise to break systematic biases.
 
 ### 7. Loop closure and PGO
 
@@ -142,7 +140,7 @@ The loop closure process runs as an independent process:
 2. **Reloc3R keyframe pair estimation** (Stage 3): DUSt3R-variant coarse relative pose for each keyframe pair. Raw translation preserved; scale search delegated to depth verification.
 3. **RGB-D depth geometric verification** (Stage 4): Back-project source depth, transform with Reloc3R pose, project to target, compare depth. Log-spaced scale search (0.1-20×) to find optimal scale. Filters pairs by overlap, depth RMSE, and inlier ratio.
 4. **Refinement → VerifiedLoopEdge** (Stage 5): Delta gates (vs odometry, final depth RMSE). Produces `VerifiedLoopEdge` with `accepted_for_pgo` decision.
-5. **Keyframe pose graph construction** (Stage 6): Nodes = keyframe global C2W (not submap seeds). Edges = temporal (adjacent KFs), handoff (cross-submap boundary), loop (verified closures).
+5. **Keyframe pose graph construction** (Stage 6): Nodes = keyframe global C2W (not submap seeds). Edges = temporal (adjacent KFs), inheritance (cross-submap boundary), loop (verified closures).
 6. **Keyframe PGO trial + safety evaluation** (Stage 7): Open3D `GlobalOptimizationLevenbergMarquardt` on keyframe graph. Safety gates: max correction t/r, odom residual increase ratio, loop residual decrease ratio, robust edge pruning (max 2 retries). Trial runs in memory only; does NOT write to ckpt by default.
 7. **Trajectory correction** (Stage 8): Accepted PGO → apply per-keyframe corrections (keyframes use optimized_c2w, non-keyframes use nearest-KF correction). Left-multiply: `corrected_c2w = delta @ original_c2w`.
 8. **Gaussian correction** (Stage 9): Per-submap median correction from keyframe corrections. Chordal-mean rotation, element-wise median translation.
@@ -164,46 +162,42 @@ After front end finishes, the main process:
 6. Evaluates ATE and rendering quality
 7. Optionally saves final PLY
 
-### 9. Cross-Submap Covisibility Handoff
+### 9. Gaussian Inheritance (replaces Handoff)
 
-To mitigate tracking degradation after submap cuts (caused by sudden loss of all old Gaussians), the system supports boundary handoff:
+To eliminate the cold-start coverage gap after submap cuts, the system inherits top-scoring old Gaussians as the new submap's active (re-optimizable) initial state:
 
-1. **Selection**: At submap cut, the seed frame and old submap tail keyframes are rendered against the old Gaussian map. Boundary Gaussians visible from both the seed frame and tail keyframes are selected by support count and opacity score.
-2. **Frozen container**: Selected Gaussians are exported via `capture_masked()` and stored as a frozen `GaussianModel` (no optimizer, no training).
-3. **Tracking support**: During warmup, the front end creates a merged render model (`create_merged_for_render`) combining active new Gaussians with frozen handoff Gaussians, providing dense photometric constraints for tracking.
-4. **Active-only insertion**: Error masks for new Gaussian insertion use active-only render (`self.gaussians`), preventing handoff from masking coverage holes.
-5. **Auto-drop**: Handoff is removed when the new submap reaches `handoff_warmup_keyframes` keyframes, `handoff_warmup_frames` frames, or active opacity coverage exceeds `handoff_new_coverage_th`.
-6. **Ckpt isolation**: Handoff Gaussians are never saved to new submap checkpoints and are cleared on handoff deactivation.
+1. **Scoring**: At submap cut, RAP2DGS Lite scores all old Gaussians using seed frame + tail keyframe covisibility rendering (support count, opacity, and 6 geometric features via KNN).
+2. **Selection**: Top `inherit_keep_percent` (45%) scored Gaussians are retained as active. `inherit_min_keep` (3000) guarantees sufficient coverage for the last submap. If RAP2DGS internal keep_percent truncates below target, simple scoring auto-supplements.
+3. **Noise injection**: Inherited Gaussian positions receive σ=1mm random noise to break systematic biases from the old submap's optimization frame.
+4. **Seed frame**: Uses `init=False` when Gaussians exist — only error-mask holes are seeded, avoiding duplicate coverage.
+5. **Optimizer reset**: `training_setup()` creates fresh Adam moments for all Gaussians (inherited + newly seeded).
 
 Configuration (all under `Submap`):
 ```yaml
-use_handoff: false          # master switch
-handoff_tail_kfs: 4         # old submap tail keyframes for covisibility
-handoff_max_points: 3000    # max boundary Gaussians to retain
-handoff_min_support: 2      # min keyframes that must observe a Gaussian
-handoff_opacity_min: 0.20   # min opacity threshold
-handoff_warmup_frames: 20   # max frames before forced drop
-handoff_warmup_keyframes: 3 # max keyframes before forced drop
-handoff_new_coverage_th: 0.85  # active coverage threshold for early drop
+use_inheritance: true         # master switch
+inherit_keep_percent: 0.45    # fraction of old Gaussians to retain
+inherit_min_keep: 3000        # floor to guarantee last-submap coverage
+inherit_tail_kfs: 4           # old submap tail keyframes for covisibility
+inherit_min_support: 2        # min keyframes that must observe a Gaussian
+inherit_opacity_min: 0.20     # min opacity threshold
+inherit_max_points: 30000     # hard cap on inherited count
 ```
 
-### 10. RAP2DGS Lite: Rule-Based Handoff Scoring
+### 10. RAP2DGS Lite: Rule-Based Inheritance Scoring
 
-To improve the quality of boundary Gaussian selection, the system includes RAP2DGS Lite (`utils/rap2dgs_lite/`), a lightweight rule-based scoring module that replaces the simple `support + 0.2 × opacity` heuristic in handoff selection:
+RAP2DGS Lite (`utils/rap2dgs_lite/`) provides lightweight rule-based scoring for Gaussian inheritance selection:
 
-1. **Candidate generation**: Same visibility-based mask as original handoff (seed frame + tail keyframes).
+1. **Candidate generation**: Visibility-based mask from seed frame + tail keyframe rendering.
 2. **Shared KNN**: Single chunked KNN on candidate positions, shared by all geometric features.
 3. **Six feature scores** (all normalized to [0,1]): support (percentile-norm), opacity (min-max norm), observation (log1p-norm), area (bounded midrange), normal consistency (mean |dot| with KNN), local density (bounded midrange of mean KNN distance).
 4. **Weighted fusion**: `S = 0.25·support + 0.20·opacity + 0.20·obs + 0.10·area + 0.15·normal + 0.10·density`.
-5. **Top-K selection**: Retain ρ=25% of candidates, capped at 8000.
-6. **Safety**: Never prunes active map. Auto-fallback to original heuristic on any failure. Default `enable: false` preserves baseline.
-
-On TUM fr3_long_office_household, RAP2DGS Lite (k=16) achieves ATE 0.0237m (vs 0.0253 no-handoff, 0.0263 original) and PSNR 25.12 dB, ~680ms avg latency per transition, zero fallbacks across 35 events.
+5. **Top-K selection**: Retain top-scoring Gaussians. Auto-supplement with simple scoring if RAP2DGS selection falls below target.
+6. **Safety**: Never prunes active map. Auto-fallback to simple heuristic on any failure.
 
 ```yaml
 RAP2DGSLite:
-  enable: false               # master switch; baseline unchanged when false
-  use_in_handoff: false
+  enable: true                # master switch
+  use_in_inheritance: true
   knn: {k: 16, chunk_size: 4096}
   features: {use_support, use_opacity, use_observation, use_area, use_normal, use_density: true}
   score_weights: {support: 0.25, opacity: 0.20, observation: 0.20, area: 0.10, normal: 0.15, density: 0.10}
@@ -235,7 +229,7 @@ FVO-GS-SLAM
 ├── utils/
 │   ├── slam_frontend.py            # tracking, keyframes, submap decisions, queue comms
 │   ├── slam_backend.py             # Gaussian mapping, densify/prune, submap save
-│   ├── rap2dgs_lite/               # lightweight rule-based handoff selection
+│   ├── rap2dgs_lite/               # lightweight rule-based inheritance selection
 │   ├── fft_edge_vo.py              # FFT Edge VO: dense DT alignment + LM optimization
 │   ├── fft_filter.py               # FFT high-frequency mask generation
 │   ├── loop_closure.py             # CosPlace, keyframe retrieval, Reloc3R/depth/PGO pipeline
@@ -284,9 +278,9 @@ BackEnd (independent process)
     ├── Densify / prune / opacity reset
     ├── occ_aware_visibility + pose sanity check
     ├── RSKM: randomly sampled keyframe supervision
-    ├── Push Gaussian snapshot + Handoff → FrontEnd
-    ├── Cross-submap boundary Handoff selection (seed + tail-kf covisibility)
-    ├── Frozen Handoff: short-term read-only tracking support
+    ├── Push Gaussian snapshot → FrontEnd
+    ├── Gaussian Inheritance: RAP2DGS-scored top-45% kept as active initial state
+    ├── σ=1mm noise breaks old-submap systematic biases
     └── Save submap ckpt + notify loop closure
     ↓ saved submap checkpoints
 LoopClosureProcess (independent process)
@@ -295,7 +289,7 @@ LoopClosureProcess (independent process)
     ├── Reloc3R keyframe pair coarse pose estimation
     ├── RGB-D depth geometric verification with scale search
     ├── Refine → VerifiedLoopEdge (delta gates)
-    ├── Build keyframe pose graph (temporal/handoff/loop edges)
+    ├── Build keyframe pose graph (temporal/inheritance/loop edges)
     ├── Keyframe PGO trial + safety evaluation
     │     Open3D LM optimization on keyframe nodes
     │     Safety gates: max correction, residual ratios, edge pruning
@@ -363,9 +357,9 @@ Key responsibilities:
 - Optimize Gaussian parameters with RSKM-sampled keyframe supervision
 - Collect visibility and densification statistics
 - Densify, reset opacity, and prune Gaussian points
-- Select boundary handoff Gaussians for submap transitions (frozen, read-only)
+- Select top-45% scored Gaussians for inheritance into new submap (active, re-optimizable)
 - Maintain `occ_aware_visibility` keyed by keyframe index
-- Push Gaussian snapshots, keyframe poses, and handoff to front end
+- Push Gaussian snapshots, keyframe poses, and inheritance to front end
 - Save submap checkpoints on `new_submap` and `stop`
 - Notify loop closure on submap save
 - Prune ALL Gaussian points and reset state for independent submap init
@@ -382,7 +376,7 @@ Key responsibilities:
 - Reloc3R keyframe pair coarse pose estimation
 - RGB-D depth geometric verification with log-scale search
 - Refine → VerifiedLoopEdge with delta gates
-- Build keyframe pose graph (temporal/handoff/loop edges)
+- Build keyframe pose graph (temporal/inheritance/loop edges)
 - Keyframe PGO trial + safety evaluation
 - Save keyframe_pgo_result.json when accepted
 - LoopClosure mode control (`off`/`detect_only`/`verify_only`/`keyframe_pgo`)
@@ -443,12 +437,10 @@ Front end → back end (multiprocessing Queue):
 Back end → front end:
 
 ```text
-["init", gaussians, occ_aware_visibility, keyframes, handoff_data]
-["keyframe", gaussians, occ_aware_visibility, keyframes, handoff_data]
-["sync_backend", gaussians, occ_aware_visibility, keyframes, handoff_data]
+["init", gaussians, occ_aware_visibility, keyframes]
+["keyframe", gaussians, occ_aware_visibility, keyframes]
+["sync_backend", gaussians, occ_aware_visibility, keyframes]
 ```
-
-`handoff_data` is `(frozen_gaussian_model, age_frames, warmup_frames)` or `None`.
 
 Back end → loop closure:
 
@@ -487,8 +479,8 @@ Important configuration groups:
 | `Training` | init/mapping/tracking iters, keyframe, window, LR, densify/prune, RSKM |
 | `FFTEdgeVO` | Edge VO pyramid, optimization, quality thresholds |
 | `Backend` | keyframe pose policy, pose sanity check |
-| `Submap` | motion thresholds (TUM: 2.0m/80°), seed init, handoff |
-| `RAP2DGSLite` | rule-based handoff scoring: KNN k, features, weights, selection budget |
+| `Submap` | motion thresholds (TUM: 2.0m/80°), seed init, Gaussian Inheritance |
+| `RAP2DGSLite` | inheritance scoring: KNN k, features, weights, selection budget |
 | `LoopClosure` | mode control, keyframe retrieval, depth verify, keyframe PGO safety, Reloc3R |
 | `opt_params` | Gaussian optimizer, densification, lambda_dist, lambda_sensor_normal |
 | `model_params` | SH degree, data device |

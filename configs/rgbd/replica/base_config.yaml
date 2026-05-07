@@ -141,21 +141,21 @@ Submap:
 
   seed_init_iters: 1500            # 新子图 seed 帧初始化迭代数，500-2000
 
-  # ===== Cross-Submap Covisibility Handoff =====
-  use_handoff: true                # 是否启用跨子图共视 handoff
-  handoff_tail_kfs: 4              # 参与共视的旧子图尾部关键帧数，2-6
-  handoff_max_points: 8000         # handoff 最大 Gaussian 数量，3000-15000
-  handoff_min_support: 2           # 最少共视关键帧数（含 seed 帧），1-4
-  handoff_opacity_min: 0.20        # 最低 opacity 阈值（sigmoid 后），0.10-0.40
-  handoff_warmup_keyframes: 3      # handoff 最少关键帧数，需与 coverage_th 同时满足才释放（AND 关系）
-  handoff_new_coverage_th: 0.85    # 新子图自身覆盖率 ≥85% 且关键帧达标后释放。200 帧安全兜底
+  # ===== Gaussian Inheritance (替代 Handoff) =====
+  use_inheritance: true             # 是否启用高斯继承
+  inherit_keep_percent: 0.45        # 保留比例 (0.35-0.55)
+  inherit_min_keep: 3000             # 最少保留数，保证最后子图覆盖充足
+  inherit_tail_kfs: 4               # 参与评分的旧子图尾部关键帧数，2-6
+  inherit_min_support: 2            # 最少共视关键帧数（含 seed 帧），1-4
+  inherit_opacity_min: 0.20         # 最低 opacity 阈值（sigmoid 后），0.10-0.40
+  inherit_max_points: 30000         # 继承高斯数量上限
 
 # ============================================================
-# RAP2DGS Lite Configuration (lightweight rule-based handoff scoring)
+# RAP2DGS Lite Configuration (用于 Inheritance 高斯评分)
 # ============================================================
 RAP2DGSLite:
   enable: true                     # 总开关，false 时模块完全不加载
-  use_in_handoff: true             # handoff 时使用 RAP2DGS Lite 替代原始支持度评分
+  use_in_inheritance: true         # inheritance 时使用 RAP2DGS Lite 替代原始支持度评分
 
   knn:
     k: 16                          # KNN 邻居数，消融验证 16 最优，8-32
