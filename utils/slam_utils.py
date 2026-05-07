@@ -117,13 +117,19 @@ def get_loss_mapping_rgbd(config, image, depth, viewpoint, initialization=False,
     loss = alpha * l1_rgb.mean() + (1 - alpha) * l1_depth.mean()
 
     # Depth distortion loss (surface compaction): active when lambda_dist > 0
-    # When use_sa=True: rend_dist = SA depth variance (thinner surface = lower variance)
-    # When use_sa=False: rend_dist = standard 3DGS distortion (m-based)
+    # When use_sa=True + use_sa_dist=True: rend_dist = SA depth variance around median
+    # When use_sa=False: rend_dist = standard 2DGS depth distortion
+    # Guard: use_sa=True without use_sa_dist=True skips dist loss to avoid untuned SA variance scale
     if rend_dist is not None:
         lambda_dist = config["opt_params"].get("lambda_dist", 0.0)
         if lambda_dist > 0:
-            dist_loss = lambda_dist * rend_dist[rgb_pixel_mask].mean()
-            loss += dist_loss
+            use_sa = config["pipeline_params"].get("use_sa", False)
+            use_sa_dist = config["opt_params"].get("use_sa_dist", False)
+            if use_sa and not use_sa_dist:
+                pass  # SA dist disabled: skip to isolate SA depth tracking from SA dist loss
+            else:
+                dist_loss = lambda_dist * rend_dist[rgb_pixel_mask].mean()
+                loss += dist_loss
 
     return loss
 

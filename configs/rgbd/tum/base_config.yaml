@@ -72,7 +72,7 @@ Training:
   max_init_gaussian_scale: 0.06    # 初始 Gaussian scale 上限 (m)，0.02-0.10
 
   # ===== RSKM (Random Sampling Keyframe Mapping) =====
-  use_rskm: True                   # 是否启用子图内随机关键帧重放
+  use_rskm: false                   # 是否启用子图内随机关键帧重放
   rskm_current_frame_interval: 4   # 每 N 次采样强制使用当前帧（避免遗忘），2-8
   rskm_seed: 42                    # RSKM 随机种子
   rskm_debug_log: false            # 是否输出 RSKM 调试统计
@@ -81,7 +81,7 @@ Training:
 # FFT Edge VO Configuration (dense DT alignment, Edge VO style)
 # ============================================================
 FFTEdgeVO:
-  use_fft_edge_vo: true            # 是否启用 FFT Edge VO 提供 tracking 初值
+  use_fft_edge_vo: false            # 是否启用 FFT Edge VO 提供 tracking 初值
 
   # Refinement control
   tracking_refine_iters: 120       # Edge VO 成功后的渲染精化迭代数，60-200,###120->80
@@ -130,7 +130,7 @@ Submap:
   # ===== Gaussian Inheritance (替代 Handoff) =====
   # 子图切图时保留 top-K% 旧高斯作为新子图 active 初始，其余删除。
   # 继承的高斯可被新子图优化，消除冷启动覆盖缺口。
-  use_inheritance: true             # 是否启用高斯继承
+  use_inheritance: false             # 是否启用高斯继承
   inherit_keep_percent: 0.45        # 保留比例 (0.35-0.55)
   inherit_min_keep: 3000             # 最少保留数，保证最后子图覆盖充足
   inherit_tail_kfs: 4               # 参与评分的旧子图尾部关键帧数，2-6
@@ -142,8 +142,8 @@ Submap:
 # RAP2DGS Lite Configuration (用于 Inheritance 高斯评分)
 # ============================================================
 RAP2DGSLite:
-  enable: true                     # 总开关，false 时模块完全不加载
-  use_in_inheritance: true         # inheritance 时使用 RAP2DGS Lite 替代原始支持度评分
+  enable: false                    # 总开关，false 时模块完全不加载
+  use_in_inheritance: false         # inheritance 时使用 RAP2DGS Lite 替代原始支持度评分
 
   knn:
     k: 16                          # KNN 邻居数，消融验证 16 最优，8-32
@@ -191,7 +191,7 @@ LoopClosure:
 
   # ===== Stage 4: Depth verification =====
   depth_verify:
-    enabled: true
+    enabled: false
     min_overlap: 0.20              # 最小深度重叠率，0.10-0.30
     max_depth_rmse: 0.80           # 最大深度 RMSE (m)，TUM 有尺度漂移设较大，0.03-1.0
     min_inlier_ratio: 0.05         # 最小内点比率，0.03-0.20
@@ -212,8 +212,8 @@ LoopClosure:
   keyframe_pgo_odom_info_scale: 10.0     # PGO 里程计边信息矩阵缩放
   keyframe_pgo_handoff_info_scale: 5.0   # PGO handoff 边信息矩阵缩放
   keyframe_pgo_safety:
-    max_correction_t: 1.00               # PGO 最大平移修正 (m)，0.5-2.0
-    max_correction_r_deg: 15.0           # PGO 最大旋转修正 (deg)，5-30
+    max_correction_t: 1.0                # PGO 最大平移修正 (m)，TUM 开环累积漂移可达 2-3m
+    max_correction_r_deg: 15.0           # PGO 最大旋转修正 (deg)
     max_odom_residual_increase_ratio: 2.00  # 里程计边残差膨胀比上限
     min_loop_residual_decrease_ratio: 0.30  # 回环边残差下降比下限
     max_single_loop_residual_after_t: 0.30  # 优化后单条回环边最大平移残差 (m)
@@ -234,7 +234,7 @@ LoopClosure:
 
   # ===== Reloc3R =====
   Reloc3R:
-    enabled: true
+    enabled: false
     mock_mode: false               # True=跳过推理（调试用）
     repo_path: third_party/reloc3r
     checkpoint: siyan824/reloc3r-224
@@ -279,7 +279,8 @@ opt_params:
   # ===== Loss Parameters =====
   lambda_sensor_normal: 0.001      # FDN 法向损失权重，0.0005-0.005
   lambda_dssim: 0.2                # SSIM 损失权重，0.1-0.3
-  lambda_dist: 0.0                 # 深度失真损失权重，0=关闭，0.01-0.1 用于压实表面消除浮空物。use_sa=true时语义为SA depth variance
+  lambda_dist: 0.005                 # 深度失真损失权重，0=关闭，0.01-0.1 用于压实表面消除浮空物。use_sa=true时语义为SA depth variance
+  use_sa_dist: true
 
 # ============================================================
 # Model Parameters
@@ -299,6 +300,7 @@ pipeline_params:
   use_sa_depth: true            # SA surfel-aware depth相关参数，Python 渲染层（深度选择策略）use_sa_depth 改变的是"SLAM loss 用哪个深度"
   depth_eps: 1.0e-6             # SA surfel-aware depth相关参数,计算期望深度时的安全除数
   debug_sa_depth: false
+
 #  ┌────────┬──────────────┬───────────────────────────────────────────────────────────────────────────────┐
 #  │ use_sa │ use_sa_depth │                                     效果                                       │
 #  ├────────┼──────────────┼───────────────────────────────────────────────────────────────────────────────┤
@@ -313,9 +315,9 @@ pipeline_params:
 # Ablation Switches
 # ============================================================
 Ablation:
-  use_submap: True                 # 子图切图策略 (关闭 → 全局单地图)
+  use_submap: False                 # 子图切图策略 (关闭 → 全局单地图)
   use_loop_closure: False           # 回环检测 + PGO 修正
-  use_fdn: True                    # FDN 有限差分法向监督
-  use_fft_mask: True               # FFT 高低频掩膜指导采样与初始 scale
-  use_error_mask: True             # 渲染误差掩膜指导动态补点
+  use_fdn: False                    # FDN 有限差分法向监督
+  use_fft_mask: False               # FFT 高低频掩膜指导采样与初始 scale
+  use_error_mask: False             # 渲染误差掩膜指导动态补点
   use_color_refinement: True       # final merge 后离线颜色精化

@@ -101,10 +101,14 @@ Porting GauS-SLAM's confidence-weighted expected depth into the differentiable s
 Key design decisions:
 - **Preserve pose gradient**: SA backward correctly propagates gradients through the confidence-adjusted depth path while keeping `dL_dtau` (SE(3) pose Jacobian) intact.
 - **Dual-switch control**: `use_sa` (CUDA forward/backward) and `use_sa_depth` (Python depth selection for loss) are independently configurable for ablation.
+- **SA distortion (depth variance)**: When `use_sa=true`, CUDA forward outputs median-centered depth variance `Σ w_i·(d_i - d_median)²` as `allmap[6]` instead of original m-based distortion. Backward fixed with correct `∂(SA_var)/∂w_i = (d_i - d_median)²` gradient (previously leaked non-SA distortion gradient). Python `use_sa_dist` guard prevents untuned SA variance from entering loss.
 - **Zero overhead**: Confidence computation (4 FMA + 1 exp per splat) runs inside the existing CUDA kernel; measured FPS difference < 5%.
 - **Default off**: `use_sa: false, use_sa_depth: false` preserves exact baseline behavior.
 
-On TUM fr3_office, SA expected depth (A2: `use_sa=true, use_sa_depth=true, depth_ratio=0.0`) improves Mid PGO ATE by 27.4% (0.01441 vs 0.01984 m) with no rendering quality degradation.
+Ablation results (TUM fr3_office full sequence):
+- SA depth alone (A1): ATE 0.02204m, Depth L1 0.1641m — **best trajectory**
+- SA depth + dist λ=0.01 (A4): ATE 0.02423m (+9.9%), Depth L1 0.1495m (-8.9%) — **trades trajectory for depth**
+- **SA dist vetoed**: depth improvement comes at the cost of trajectory accuracy (veto condition V2). SA depth adjustment alone provides the surface-awareness benefit without over-compaction.
 
 ```yaml
 pipeline_params:
@@ -113,6 +117,7 @@ pipeline_params:
   depth_eps: 1.0e-6       # safe division epsilon
   debug_sa_depth: false   # output debug fields
 opt_params:
+  use_sa_dist: false      # guard: enable SA variance in loss only when explicitly set
   lambda_dist: 0.0        # distortion loss weight (0=off)
 ```
 

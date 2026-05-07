@@ -247,6 +247,7 @@ renderCUDA(
 	float dL_dmax_dweight = 0.f;
 	float mm = 0.f;
 	float mstd = 0.f;
+	float D_pix = 0.f;
 
 	if (inside) {
 		dL_ddepth = dL_depths[DEPTH_OFFSET * H * W + pix_id];
@@ -260,6 +261,9 @@ renderCUDA(
 		// dL_dmax_dweight = dL_depths[MEDIAN_WEIGHT_OFFSET * H * W + pix_id];
 		mm = allmap[MIDDEPTH_OFFSET * H * W + pix_id];
 		mstd = allmap[DISTORTION_OFFSET * H * W + pix_id];
+		if (use_sa) {
+			D_pix = allmap[DEPTH_OFFSET * H * W + pix_id];
+		}
 	}
 
 	// for compute gradient with respect to depth and normal
@@ -425,24 +429,37 @@ renderCUDA(
 
 
 #if RENDER_AXUTILITY
-			const float m_d = far_n / (far_n - near_n) * (1 - near_n / c_d);
-			const float dmd_dd = (far_n * near_n) / ((far_n - near_n) * c_d * c_d);
-			if (contributor == median_contributor-1) {
-				dL_dz += dL_dmedian_depth;
-				// dL_dweight += dL_dmax_dweight;
-			}
-#if DETACH_WEIGHT 
-			// if not detached weight, sometimes 
-			// it will bia toward creating extragated 2D Gaussians near front
-			dL_dweight += 0;
+			if (use_sa) {
+				// SA depth variance gradient: d(SA_var)/dw_i = (d_i - median)^2
+				float diff = c_d - mm;
+				dL_dweight += diff * diff * dL_dreg;
+				// gradient through SA-adjusted depth -> raw depth
+				dL_dz += 2.0f * conf * w * diff * dL_dreg;
+				// median depth gradient from SA variance
+				if (contributor == median_contributor - 1) {
+					dL_dz += dL_dmedian_depth;
+					dL_dz += dL_dreg * (-2.0f * D_pix + 2.0f * mm * (1.0f - T_final));
+				}
+			} else {
+				const float m_d = far_n / (far_n - near_n) * (1 - near_n / c_d);
+				const float dmd_dd = (far_n * near_n) / ((far_n - near_n) * c_d * c_d);
+				if (contributor == median_contributor-1) {
+					dL_dz += dL_dmedian_depth;
+					// dL_dweight += dL_dmax_dweight;
+				}
+#if DETACH_WEIGHT
+				// if not detached weight, sometimes
+				// it will bia toward creating extragated 2D Gaussians near front
+				dL_dweight += 0;
 #else
-			dL_dweight += (final_D2 + m_d * m_d * final_A - 2 * m_d * final_D) * dL_dreg;
+				dL_dweight += (final_D2 + m_d * m_d * final_A - 2 * m_d * final_D) * dL_dreg;
 #endif
+				const float dL_dmd = 2.0f * (T * alpha) * (m_d * final_A - final_D) * dL_dreg;
+				dL_dz += dL_dmd * dmd_dd;
+			}
 			dL_dalpha += dL_dweight - last_dL_dT;
 			// propagate the current weight W_{i} to next weight W_{i-1}
 			last_dL_dT = skip ? last_dL_dT : dL_dweight * alpha + (1 - alpha) * last_dL_dT;
-			const float dL_dmd = 2.0f * (T * alpha) * (m_d * final_A - final_D) * dL_dreg;
-			dL_dz += dL_dmd * dmd_dd;
 
 			// Propagate gradients w.r.t ray-splat depths
 			accum_depth_rec = skip ? accum_depth_rec : last_alpha * last_depth + (1.f - last_alpha) * accum_depth_rec;

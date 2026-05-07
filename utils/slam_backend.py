@@ -294,6 +294,11 @@ class BackEnd(mp.Process):
                 self.push_to_frontend()
 
         self.occ_aware_visibility[cur_frame_idx] = (n_touched > 0).long()
+        use_sa = self.config.get("pipeline_params", {}).get("use_sa", False)
+        use_sa_depth = self.config.get("pipeline_params", {}).get("use_sa_depth", False)
+        use_sa_dist = self.config.get("opt_params", {}).get("use_sa_dist", False)
+        lambda_dist = self.config.get("opt_params", {}).get("lambda_dist", 0.0) # 仅供日志输出，实际是否启用 dist loss 还需同时满足 use_sa_dist=True 和 lambda_dist>0
+        Log(f"[SA Config] use_sa={use_sa} use_sa_depth={use_sa_depth} use_sa_dist={use_sa_dist} lambda_dist={lambda_dist}")
         Log("Initialized map")
 
     # ========================================================================

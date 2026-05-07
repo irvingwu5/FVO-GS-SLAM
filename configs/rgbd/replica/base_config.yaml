@@ -292,6 +292,7 @@ opt_params:
   lambda_sensor_normal: 0.001      # FDN 法向损失权重，0.0005-0.005
   lambda_dssim: 0.2                # SSIM 损失权重，0.1-0.3
   lambda_dist: 0.0                 # 深度失真损失权重，0=关闭，0.01-0.1 用于压实表面消除浮空物。use_sa=true时语义为SA depth variance
+  use_sa_dist: false               # use_sa=true时是否将SA depth variance加入loss。false=仅SA depth track，true=SA dist也进loss
 
 # ============================================================
 # Model Parameters
