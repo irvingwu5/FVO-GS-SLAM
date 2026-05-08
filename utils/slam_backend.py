@@ -418,8 +418,8 @@ class BackEnd(mp.Process):
                     gt_normal = (viewpoint.T[0:3, 0:3].T @ sensor_normal.view(3, -1)).view(
                         image.shape[0], image.shape[1], image.shape[2]
                     )
-                    normal_mask = gt_normal > 0
-                    normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask * normal_mask).sum(dim=0))[None].mean()
+                    # normal_mask = gt_normal > 0
+                    normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()
                     loss_view += (self.config["opt_params"]["lambda_sensor_normal"] * normal_error)
 
                 loss_view.backward()

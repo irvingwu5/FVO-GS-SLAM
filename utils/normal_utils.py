@@ -141,7 +141,7 @@ def d2n_tblr(
     valid_mask = (valid_mask > 0.5) & edge_mask.unsqueeze(1)
 
     # get cross product (B, 3, H, W)
-    cross_product = -torch.linalg.cross(vec_vert, vec_hori, dim=1)
+    cross_product = torch.linalg.cross(vec_vert, vec_hori, dim=1)
     normal = F.normalize(cross_product, p=2.0, dim=1, eps=1e-12)
 
     return normal, valid_mask

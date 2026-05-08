@@ -67,12 +67,12 @@ Training:
   prune_mode: 'slam'               # prune 模式: 'slam'（基于 covisibility）/ 'odometry'
   single_thread: False             # True=前端后端在同一进程运行
   spherical_harmonics: False       # True=启用高阶 SH（需 sh_degree>0）
-  low_freq_scale_multiplier: 2.0   # 低频区域初始 Gaussian scale 乘数，1.0-3.0
+  low_freq_scale_multiplier: 1.05   # 低频区域初始 Gaussian scale 乘数，1.0-3.0
   min_init_gaussian_scale: 0.002   # 初始 Gaussian scale 下限 (m)，0.001-0.005
   max_init_gaussian_scale: 0.06    # 初始 Gaussian scale 上限 (m)，0.02-0.10
 
   # ===== RSKM (Random Sampling Keyframe Mapping) =====
-  use_rskm: false                   # 是否启用子图内随机关键帧重放
+  use_rskm: true                   # 是否启用子图内随机关键帧重放
   rskm_current_frame_interval: 4   # 每 N 次采样强制使用当前帧（避免遗忘），2-8
   rskm_seed: 42                    # RSKM 随机种子
   rskm_debug_log: false            # 是否输出 RSKM 调试统计
@@ -277,7 +277,7 @@ opt_params:
   densify_grad_threshold: 0.0002   # 位置梯度阈值，超此值触发 densify，0.0001-0.001
 
   # ===== Loss Parameters =====
-  lambda_sensor_normal: 0.001      # FDN 法向损失权重，0.0005-0.005
+  lambda_sensor_normal: 0.0      # FDN 法向损失权重，0.0005-0.005
   lambda_dssim: 0.2                # SSIM 损失权重，0.1-0.3
   lambda_dist: 0.005                 # 深度失真损失权重，0=关闭，0.01-0.1 用于压实表面消除浮空物。use_sa=true时语义为SA depth variance
   use_sa_dist: true
