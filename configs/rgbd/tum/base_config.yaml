@@ -72,7 +72,7 @@ Training:
   max_init_gaussian_scale: 0.06    # 初始 Gaussian scale 上限 (m)，0.02-0.10
 
   # ===== RSKM (Random Sampling Keyframe Mapping) =====
-  use_rskm: true                   # 是否启用子图内随机关键帧重放
+  use_rskm: True                   # 是否启用子图内随机关键帧重放
   rskm_current_frame_interval: 4   # 每 N 次采样强制使用当前帧（避免遗忘），2-8
   rskm_seed: 42                    # RSKM 随机种子
   rskm_debug_log: false            # 是否输出 RSKM 调试统计
@@ -102,7 +102,7 @@ FFTEdgeVO:
   # Quality
   dt_mean_fail_threshold: 15.0     # dt_mean 超过此值视为跟踪失败，8-30
   require_visible_ratio: 0.3       # 最少可见点比率，低于此值视为失败，0.2-0.5
-  min_dt_mean: 2.0                 # 最低 dt_mean 阈值（触发参考帧自动刷新），0.3-2.0,从 0.5 提高到 2.0，减少 auto-refresh 频率
+  min_dt_mean: 2.0                 # 最低 dt_mean 阈值（触发参考帧自动刷新），0.3-2.0,从 0.5 提高到 2.0，减少 auto-refresh 频率,粗层 dt_mean < 2px 就跳过精层经常提前退出，VO 快
 
   # Point budget & depth gate (Stage 8)
   max_cur_points: 8000             # 每帧最大采样点数
@@ -145,7 +145,7 @@ FFTEdgeVO:
 # Backend Mapping Configuration (EAGS-style: Gaussian only)
 # ============================================================
 Backend:
-  optimize_keyframe_pose: true     # 后端是否优化关键帧位姿（EAGS 风格）
+  optimize_keyframe_pose: true     # 后端是否优化关键帧位姿
   optimize_keyframe_exposure: false # 后端是否优化关键帧曝光参数
   backend_pose_sanity_check: false # 是否对后端优化后的关键帧位姿做 sanity check
   backend_restore_pose_if_changed: true  # sanity check 失败时恢复原始位姿
@@ -314,7 +314,7 @@ opt_params:
   lambda_sensor_normal: 0.0      # FDN 法向损失权重，0.0005-0.005
   lambda_dssim: 0.2                # SSIM 损失权重，0.1-0.3
   lambda_dist: 0.005                 # 深度失真损失权重，0=关闭，0.01-0.1 用于压实表面消除浮空物。use_sa=true时语义为SA depth variance
-  use_sa_dist: true
+  use_sa_dist: true               # use_sa=true时是否将SA depth variance加入loss。false=仅SA depth track，true=SA dist也进loss
 
 # ============================================================
 # Model Parameters

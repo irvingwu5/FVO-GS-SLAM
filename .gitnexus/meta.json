@@ -1,14 +1,14 @@
 {
   "repoPath": "/home/wxy/Documents/PycharmProjects/FVO-GS-SLAM",
-  "lastCommit": "a6aa76a355a2e7cd5a1b8044d4c699717fbfce3f",
-  "indexedAt": "2026-05-08T16:04:45.939Z",
+  "lastCommit": "f288963537ed6a3683d0b21830b1f724cfe9ceb5",
+  "indexedAt": "2026-05-09T06:45:06.586Z",
   "remoteUrl": "https://github.com/irvingwu5/FVO-GS-SLAM",
   "stats": {
-    "files": 1649,
-    "nodes": 14744,
-    "edges": 21257,
+    "files": 1648,
+    "nodes": 14780,
+    "edges": 21307,
     "communities": 378,
-    "processes": 106,
+    "processes": 107,
     "embeddings": 0
   }
 }

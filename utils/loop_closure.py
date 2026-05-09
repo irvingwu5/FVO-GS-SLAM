@@ -427,6 +427,7 @@ class LoopClosureProcess(mp.Process):
                             f"(query_kfs={query_kfs})")
 
                     # ---- Reloc3R keyframe-pair estimation (Stage 3) ----
+                    reloc3r_estimates = []
                     if self.reloc3r_enabled and self.mode in ("verify_only", "keyframe_pgo"):
                         reloc3r_log_path = os.path.join(
                             self.save_dir, "reloc3r_keyframe_pairs.jsonl"
@@ -434,7 +435,6 @@ class LoopClosureProcess(mp.Process):
                         reloc3r_cfg = self.config.get("LoopClosure", {}).get("Reloc3R", {})
                         top_cands = [c for c in all_candidates if c.accepted_by_retrieval][:5]
                         reloc3r_accepted = 0
-                        reloc3r_estimates = []
                         for cand in top_cands:
                             src_rec = self.keyframe_db.get(cand.query_keyframe_id)
                             tgt_rec = self.keyframe_db.get(cand.target_keyframe_id)
