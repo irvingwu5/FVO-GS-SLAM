@@ -84,8 +84,8 @@ FFTEdgeVO:
   use_fft_edge_vo: true             # 是否启用 FFT Edge VO 提供 tracking 初值
 
   # Refinement control
-  tracking_refine_iters: 120       # Edge VO 成功后的渲染精化迭代数，60-200,###120->80
-  tracking_fallback_iters: 100     # Edge VO 失败时的退化跟踪迭代数，60-150
+  tracking_refine_iters: 40        # VO render-accepted 后精化迭代数（最优平衡），20-60
+  tracking_fallback_iters: 120     # VO 失败/未选中时渲染精化迭代数，原100
 
   # Pyramid
   num_levels: 3                    # 金字塔层数，2-4
@@ -102,7 +102,7 @@ FFTEdgeVO:
   # Quality
   dt_mean_fail_threshold: 15.0     # dt_mean 超过此值视为跟踪失败，8-30
   require_visible_ratio: 0.3       # 最少可见点比率，低于此值视为失败，0.2-0.5
-  min_dt_mean: 0.5                 # 最低 dt_mean 阈值（触发参考帧自动刷新），0.3-2.0
+  min_dt_mean: 2.0                 # 最低 dt_mean 阈值（触发参考帧自动刷新），0.3-2.0,从 0.5 提高到 2.0，减少 auto-refresh 频率
 
   # Point budget & depth gate (Stage 8)
   max_cur_points: 8000             # 每帧最大采样点数
@@ -117,9 +117,10 @@ FFTEdgeVO:
   # Stage 4: VO reference pose sync with backend
   ref_pose_sync_trans_th: 0.01    # ref pose 平移同步阈值 (m)
   ref_pose_sync_rot_deg: 0.5      # ref pose 旋转同步阈值 (deg)
+  max_ref_age: 4                   # VO reference 最大帧龄，超过触发强制刷新
 
   # Logging
-  debug_log: true                 # 是否输出 FFTEdgeVO 逐帧调试日志
+  debug_log: false                 # 是否输出 FFTEdgeVO 逐帧调试日志
 
   # Candidate Selection (Stage 2: multi-candidate render arbitration)
   candidate_selection_enable: true        # 是否启用多候选初值仲裁
@@ -129,7 +130,7 @@ FFTEdgeVO:
 
   # VO Render Gate (Stage 3: render-based VO acceptance)
   vo_render_gate_enable: true             # 是否启用 VO render 二次验证
-  vo_max_score_ratio_to_best: 1.25        # VO score / best score 上限
+  vo_max_score_ratio_to_best: 1.25        # VO score / best score 上限（推荐最优值）
   vo_max_score_ratio_to_previous: 1.10    # VO score / previous score 上限
   vo_min_opacity_ratio: 0.05              # VO 候选最低不透明度覆盖率
   vo_max_depth_loss:                      # VO 候选最大深度损失 (null=不限制)

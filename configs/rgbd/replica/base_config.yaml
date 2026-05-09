@@ -131,6 +131,7 @@ FFTEdgeVO:
   # Stage 4: VO reference pose sync with backend
   ref_pose_sync_trans_th: 0.01    # ref pose 平移同步阈值 (m)
   ref_pose_sync_rot_deg: 0.5      # ref pose 旋转同步阈值 (deg)
+  max_ref_age: 4                   # VO reference 最大帧龄，超过触发强制刷新
 
   # Logging
   debug_log: false                 # 是否输出 FFTEdgeVO 逐帧调试日志

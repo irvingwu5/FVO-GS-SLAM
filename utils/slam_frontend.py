@@ -106,6 +106,7 @@ class FrontEnd(mp.Process):
         self.submap_cut_gate_enable = evo_cfg.get("submap_cut_gate_enable", False)
         self.submap_cut_min_opacity = float(evo_cfg.get("submap_cut_min_opacity", 0.05))
         self.submap_cut_max_delay = int(evo_cfg.get("submap_cut_max_delay", 3))
+        self.fft_edge_vo_max_ref_age = int(evo_cfg.get("max_ref_age", 4))
         self.submap_cut_delay_count = 0
         self.last_tracking_diag = {}
 
@@ -445,7 +446,17 @@ class FrontEnd(mp.Process):
             else:
                 vo_success, est_c2w, vo_info = self.fft_edge_vo.track(rgb_bgr, depth_np, init_c2w)
 
-        # ---- Step 2: Pose initialization (candidate selection / direct VO) ---
+            # Direction 3: skip VO candidate when output ≈ previous pose
+            # (saves 1 render precheck per frame when VO contributes nothing)
+            if vo_success and est_c2w is not None and prev_cam is not None:
+                prev_c2w_check = torch.linalg.inv(prev_cam.T).cpu().numpy().astype(np.float64)
+                delta_T = np.linalg.inv(prev_c2w_check) @ est_c2w
+                delta_trans = np.linalg.norm(delta_T[:3, 3])
+                delta_rot_rad = np.arccos(np.clip(
+                    (np.trace(delta_T[:3, :3]) - 1.0) / 2.0, -1.0, 1.0))
+                if delta_trans < 1e-4 and delta_rot_rad < 1e-5:
+                    vo_success = False  # same as previous, no need for VO candidate
+
         # ---- Step 2: Pose initialization (candidate selection / direct VO) ---
         vo_render_accepted = False
         vo_reject_reason = None
@@ -464,27 +475,31 @@ class FrontEnd(mp.Process):
                             f"selected={selected_candidate_name}")
 
                     # Stage 3: VO render acceptance gate
-                    if self.vo_render_gate_enable and vo_success and selected_candidate_name == "fft_vo":
-                        vo_metrics = selected.get("metrics", {})
-                        vo_score = selected.get("score", float("inf"))
-                        vo_l1_rgb = vo_metrics.get("l1_rgb", float("inf"))
-                        vo_l1_depth = vo_metrics.get("l1_depth", float("inf"))
-                        vo_opacity = vo_metrics.get("opacity_ratio", 0)
+                    if self.vo_render_gate_enable:
+                        # Find VO candidate (may not be the winner)
+                        vo_cand = next((c for c in candidates if c["name"] == "fft_vo"), None)
+                        if vo_cand is not None and not vo_cand.get("rejected", False):
+                            vo_metrics = vo_cand.get("metrics", {})
+                            vo_score = vo_cand.get("score", float("inf"))
+                            vo_l1_rgb = vo_metrics.get("l1_rgb", float("inf"))
+                            vo_l1_depth = vo_metrics.get("l1_depth", float("inf"))
+                            vo_opacity = vo_metrics.get("opacity_ratio", 0)
+                            best_score = selected.get("score", float("inf")) if selected else float("inf")
 
-                        # Check against absolute thresholds
-                        checks = []
-                        if self.vo_max_color_loss is not None and vo_l1_rgb > self.vo_max_color_loss:
-                            vo_reject_reason = f"color_loss {vo_l1_rgb:.4f} > {self.vo_max_color_loss}"
-                        elif self.vo_max_depth_loss is not None and vo_l1_depth > self.vo_max_depth_loss:
-                            vo_reject_reason = f"depth_loss {vo_l1_depth:.4f} > {self.vo_max_depth_loss}"
-                        elif vo_opacity < self.vo_min_opacity_ratio:
-                            vo_reject_reason = f"opacity_ratio {vo_opacity:.4f} < {self.vo_min_opacity_ratio}"
-                        else:
-                            # Check relative to best candidate
-                            vo_render_accepted = True
+                            # Absolute checks
+                            if self.vo_max_color_loss is not None and vo_l1_rgb > self.vo_max_color_loss:
+                                vo_reject_reason = f"color_loss {vo_l1_rgb:.4f} > {self.vo_max_color_loss}"
+                            elif self.vo_max_depth_loss is not None and vo_l1_depth > self.vo_max_depth_loss:
+                                vo_reject_reason = f"depth_loss {vo_l1_depth:.4f} > {self.vo_max_depth_loss}"
+                            elif vo_opacity < self.vo_min_opacity_ratio:
+                                vo_reject_reason = f"opacity_ratio {vo_opacity:.4f} < {self.vo_min_opacity_ratio}"
+                            elif (best_score > 0 and vo_score / best_score > self.vo_max_score_ratio_to_best):
+                                vo_reject_reason = f"score_ratio {vo_score/best_score:.2f} > {self.vo_max_score_ratio_to_best}"
+                            else:
+                                vo_render_accepted = True
 
-                        if not vo_render_accepted and self.debug_log:
-                            Log(f"[VO Gate] frame {cur_frame_idx}: VO render REJECTED ({vo_reject_reason})")
+                            if not vo_render_accepted and self.debug_log:
+                                Log(f"[VO Gate] frame {cur_frame_idx}: VO render REJECTED ({vo_reject_reason})")
                     elif not self.vo_render_gate_enable:
                         # Gate disabled: VO accepted if it won the candidate race
                         vo_render_accepted = (selected_candidate_name == "fft_vo")
@@ -1097,11 +1112,15 @@ class FrontEnd(mp.Process):
                 current_c2w = torch.linalg.inv(viewpoint.T)
 
                 # Auto-refresh FFT Edge VO reference when quality degrades
-                # (large rotation / scene change causes mask overlap to drop)
+                # or reference is too old (VO accuracy decays with baseline).
                 if self.use_fft_edge_vo and self.fft_edge_vo is not None:
-                    _min_vis = max(300, self.fft_edge_vo.ref_count * 0.5)
+                    _min_vis = max(300, int(self.fft_edge_vo.max_cur_pts * 0.3))
+                    _ref_age = (cur_frame_idx - self.fft_edge_vo.ref_frame_id
+                                if self.fft_edge_vo.ref_frame_id is not None else 0)
+                    _max_ref_age = self.fft_edge_vo_max_ref_age
                     if (self.fft_edge_vo.last_dt_mean > 8.0
-                            or self.fft_edge_vo.last_visible < _min_vis):
+                            or self.fft_edge_vo.last_visible < _min_vis
+                            or _ref_age >= _max_ref_age):
                         rgb_bgr = self._camera_rgb_to_bgr(viewpoint)
                         depth_np = viewpoint.depth
                         c2w_np = current_c2w.cpu().numpy().astype(np.float64)
