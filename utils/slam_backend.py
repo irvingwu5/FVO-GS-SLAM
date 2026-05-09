@@ -842,7 +842,20 @@ class BackEnd(mp.Process):
     # ========================================================================
     # 10. Frontend Communication
     # ========================================================================
-    def push_to_frontend(self, tag=None):
+    @staticmethod
+    def _parse_backend_msg(data):
+        """Parse incoming message, handling old and new (meta) formats.
+
+        Returns (tag, meta_or_None, payload_start_index).
+        New format: [tag, meta_dict, payload...]  → payload starts at 2
+        Old format: [tag, payload...]             → payload starts at 1
+        """
+        tag = data[0]
+        if len(data) >= 2 and isinstance(data[1], dict) and "submap_id" in data[1]:
+            return tag, data[1], 2
+        return tag, None, 1
+
+    def push_to_frontend(self, tag=None, meta=None):
         self.last_sent = 0
         keyframes = []
 
@@ -858,13 +871,22 @@ class BackEnd(mp.Process):
                 keyframes.append((latest_kf_idx, kf.T.clone()))
         if tag is None:
             tag = "sync_backend"
+
+        # Stage 6: include meta for version checking
+        if meta is None:
+            meta = {
+                "submap_id": self.current_submap_id,
+                "request_id": -1,
+                "frame_id": self.current_window[-1] if self.current_window else -1,
+            }
+
         n_curr = self.gaussians._xyz.shape[0]
         if n_curr > 0:
             safe_occ = {k: v for k, v in self.occ_aware_visibility.items()
                         if isinstance(v, torch.Tensor) and v.shape[0] == n_curr}
         else:
             safe_occ = {}
-        msg = [tag, clone_obj(self.gaussians), safe_occ, keyframes]
+        msg = [tag, meta, clone_obj(self.gaussians), safe_occ, keyframes]
         self.frontend_queue.put(msg)
 
     # ========================================================================
@@ -937,9 +959,10 @@ class BackEnd(mp.Process):
                 elif data[0] == "unpause":
                     self.pause = False
                 elif data[0] == "init":
-                    cur_frame_idx = data[1]
-                    viewpoint = data[2]
-                    depth_map = data[3]
+                    _, meta, off = self._parse_backend_msg(data)
+                    cur_frame_idx = data[off]
+                    viewpoint = data[off + 1]
+                    depth_map = data[off + 2]
 
                     seed_global_c2w_from_viewpoint = (
                         torch.linalg.inv(viewpoint.T.detach()).cpu().numpy().astype(np.float64)
@@ -978,12 +1001,13 @@ class BackEnd(mp.Process):
 
                     self.initialize_map(cur_frame_idx, viewpoint, iters=init_iters)
 
-                    self.push_to_frontend("init")
+                    self.push_to_frontend("init", meta=meta)
                 elif data[0] == "keyframe":
-                    cur_frame_idx = data[1]
-                    viewpoint = data[2]
-                    current_window = data[3]
-                    depth_map = data[4]
+                    _, meta, off = self._parse_backend_msg(data)
+                    cur_frame_idx = data[off]
+                    viewpoint = data[off + 1]
+                    current_window = data[off + 2]
+                    depth_map = data[off + 3]
 
                     self.viewpoints[cur_frame_idx] = viewpoint
                     self.current_window = current_window
@@ -1043,14 +1067,15 @@ class BackEnd(mp.Process):
                         self.keyframe_optimizers = None
                     self.map(self.current_window, iters=iter_per_kf)
                     self.map(self.current_window, prune=True)
-                    self.push_to_frontend("keyframe")
+                    self.push_to_frontend("keyframe", meta=meta)
 
                 elif data[0] == "new_submap":
-                    completed_submap_id = data[1]
-                    relative_pose_prev_seed_to_curr_seed = data[2] if len(data) > 2 else np.eye(4, dtype=np.float64)
+                    _, meta, off = self._parse_backend_msg(data)
+                    completed_submap_id = data[off]
+                    relative_pose_prev_seed_to_curr_seed = data[off + 1] if len(data) > off + 1 else np.eye(4, dtype=np.float64)
                     relative_pose_prev_seed_to_curr_seed = np.array(relative_pose_prev_seed_to_curr_seed, dtype=np.float64)
                     new_seed_global_c2w = (
-                        data[3] if len(data) > 3 else np.eye(4, dtype=np.float64)
+                        data[off + 2] if len(data) > off + 2 else np.eye(4, dtype=np.float64)
                     )
                     new_seed_global_c2w = np.array(new_seed_global_c2w, dtype=np.float64)
 

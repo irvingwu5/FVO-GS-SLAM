@@ -81,7 +81,7 @@ Training:
 # FFT Edge VO Configuration (dense DT alignment, Edge VO style)
 # ============================================================
 FFTEdgeVO:
-  use_fft_edge_vo: false            # 是否启用 FFT Edge VO 提供 tracking 初值
+  use_fft_edge_vo: true             # 是否启用 FFT Edge VO 提供 tracking 初值
 
   # Refinement control
   tracking_refine_iters: 120       # Edge VO 成功后的渲染精化迭代数，60-200,###120->80
@@ -104,8 +104,41 @@ FFTEdgeVO:
   require_visible_ratio: 0.3       # 最少可见点比率，低于此值视为失败，0.2-0.5
   min_dt_mean: 0.5                 # 最低 dt_mean 阈值（触发参考帧自动刷新），0.3-2.0
 
+  # Point budget & depth gate (Stage 8)
+  max_cur_points: 8000             # 每帧最大采样点数
+  min_cur_points: 300              # 每帧最小有效点数
+  min_depth: 0.1                   # 最小有效深度 (m)
+  max_depth: 8.0                   # 最大有效深度 (m)
+
+  # Sampling (Stage 8)
+  sampling_strategy: "grid"        # 采样策略: "grid" (均匀网格) 或 "random" (固定种子随机)
+  vo_random_seed: 42               # random 采样的随机种子
+
+  # Stage 4: VO reference pose sync with backend
+  ref_pose_sync_trans_th: 0.01    # ref pose 平移同步阈值 (m)
+  ref_pose_sync_rot_deg: 0.5      # ref pose 旋转同步阈值 (deg)
+
   # Logging
-  debug_log: false                 # 是否输出 FFTEdgeVO 逐帧调试日志
+  debug_log: true                 # 是否输出 FFTEdgeVO 逐帧调试日志
+
+  # Candidate Selection (Stage 2: multi-candidate render arbitration)
+  candidate_selection_enable: true        # 是否启用多候选初值仲裁
+  candidate_lambda_depth: 1.0             # 候选评分深度损失权重
+  candidate_lambda_coverage: 1.0          # 候选评分覆盖率惩罚权重
+  candidate_min_opacity_ratio: 0.05       # 候选最低不透明度覆盖率
+
+  # VO Render Gate (Stage 3: render-based VO acceptance)
+  vo_render_gate_enable: true             # 是否启用 VO render 二次验证
+  vo_max_score_ratio_to_best: 1.25        # VO score / best score 上限
+  vo_max_score_ratio_to_previous: 1.10    # VO score / previous score 上限
+  vo_min_opacity_ratio: 0.05              # VO 候选最低不透明度覆盖率
+  vo_max_depth_loss:                      # VO 候选最大深度损失 (null=不限制)
+  vo_max_color_loss:                      # VO 候选最大颜色损失 (null=不限制)
+
+  # Submap Cut Quality Gate (Stage 7)
+  submap_cut_gate_enable: true           # 是否启用子图切换质量门控
+  submap_cut_min_opacity: 0.05           # 子图切换最低不透明度覆盖率
+  submap_cut_max_delay: 3                # 最大延迟切图帧数
 
 # ============================================================
 # Backend Mapping Configuration (EAGS-style: Gaussian only)

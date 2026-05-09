@@ -99,6 +99,14 @@ class FFTEdgeVO:
         self.max_cur_pts = int(cfg.get("max_cur_points", 8000))
         self.min_cur_pts = int(cfg.get("min_cur_points", 300))
 
+        # ---- depth gate (Stage 8) --------------------------------------------
+        self.min_depth = float(cfg.get("min_depth", 0.1))
+        self.max_depth = float(cfg.get("max_depth", 8.0))
+
+        # ---- sampling (Stage 8) ----------------------------------------------
+        self.sampling_strategy = cfg.get("sampling_strategy", "grid")
+        self.vo_random_seed = int(cfg.get("vo_random_seed", 42))
+
         # ---- quality --------------------------------------------------------
         self.dt_mean_fail       = float(cfg.get("dt_mean_fail_threshold", 15.0))
         self.require_visible_ratio = float(cfg.get("require_visible_ratio", 0.3))
@@ -111,11 +119,19 @@ class FFTEdgeVO:
         self.K_pyr          = None   # list of (fx, fy, cx, cy) per level
         self.T_wr           = None   # 4×4 world→ref camera, numpy float64
         self.ref_count      = 0
+        self.ref_frame_id   = None   # frame id of the reference (Stage 4)
+        self.ref_c2w        = None   # reference C2W, numpy float64 (Stage 4)
+        self.ref_rgb_bgr    = None   # cached reference BGR image (Stage 4)
+        self.ref_depth_np   = None   # cached reference depth (Stage 4)
 
         # ---- diagnostics ----------------------------------------------------
         self.last_dt_mean = float("inf")
         self.last_visible = 0
         self.last_iters   = 0
+
+        # ---- Stage 4: reference pose sync ---------------------------------
+        self.ref_pose_sync_trans_th = float(cfg.get("ref_pose_sync_trans_th", 0.01))
+        self.ref_pose_sync_rot_deg = float(cfg.get("ref_pose_sync_rot_deg", 0.5))
 
         # ----
         self.debug       = cfg.get("debug_log", True)
@@ -195,7 +211,7 @@ class FFTEdgeVO:
 
         return struct_pyr, K_pyr
 
-    def set_reference(self, image_bgr, depth_np, c2w):
+    def set_reference(self, image_bgr, depth_np, c2w, frame_id=None):
         """Build optimisation structure from reference FFT mask + store T_world_ref."""
         mask = self._compute_mask(image_bgr)
         n_mask = int(mask.sum().item())
@@ -208,13 +224,32 @@ class FFTEdgeVO:
             return False
 
         self.opt_struct_pyr, self.K_pyr = self._build_opt_struct_pyramid(mask)
-        self.T_wr = np.linalg.inv(c2w.astype(np.float64))  # world→ref (w2c)
+        c2w_f64 = c2w.astype(np.float64)
+        self.T_wr = np.linalg.inv(c2w_f64)  # world→ref (w2c)
         self.ref_count = n_mask
+        # Stage 4: cache reference metadata for backend pose sync
+        self.ref_c2w = c2w_f64.copy()
+        self.ref_frame_id = frame_id
+        self.ref_rgb_bgr = image_bgr
+        self.ref_depth_np = depth_np
 
         if self.debug:
             Log(f"[FFTEdgeVO] reference: {n_mask} mask px, "
                 f"{len(self.opt_struct_pyr)} pyramid levels, T_wr ready")
         return True
+
+    def update_reference_pose(self, ref_c2w):
+        """Update only the global reference pose (T_wr).
+
+        Does NOT rebuild the image pyramid — reference image/depth unchanged.
+        Call this when the backend optimises the reference keyframe's pose.
+        """
+        c2w_f64 = ref_c2w.astype(np.float64)
+        self.T_wr = np.linalg.inv(c2w_f64)
+        self.ref_c2w = c2w_f64.copy()
+        if self.debug:
+            Log(f"[FFTEdgeVO] ref pose updated (frame {self.ref_frame_id}), "
+                f"pyramid unchanged")
 
     # ====================================================================
     # Current-frame 3D points (camera frame, NOT world)
@@ -222,6 +257,10 @@ class FFTEdgeVO:
 
     def _backproject_cur_mask(self, mask, depth_np):
         """Backproject current-frame FFT-mask pixels to 3D in CURRENT camera frame.
+
+        Sampling strategy (Stage 8):
+          - "grid": uniform grid sampling (deterministic)
+          - "random": random sampling with fixed seed
 
         Returns  torch float32 (N,3) on CUDA, empty if too few valid points.
         """
@@ -231,15 +270,26 @@ class FFTEdgeVO:
         if len(ys) == 0:
             return torch.zeros((0, 3), device="cuda", dtype=torch.float32)
 
-        # random subset
+        # Depth gate
+        Z_all = depth_np[ys, xs]
+        depth_ok = (Z_all > self.min_depth) & (Z_all < self.max_depth)
+        ys, xs = ys[depth_ok], xs[depth_ok]
+
+        if len(ys) == 0:
+            return torch.zeros((0, 3), device="cuda", dtype=torch.float32)
+
+        # Subsampling
         target = min(len(ys), self.max_cur_pts)
         if len(ys) > target:
-            idx = np.random.choice(len(ys), target, replace=False)
+            if self.sampling_strategy == "random":
+                rng = np.random.RandomState(self.vo_random_seed)
+                idx = rng.choice(len(ys), target, replace=False)
+            else:  # "grid" (default)
+                step = max(1, len(ys) // target)
+                idx = np.arange(0, len(ys), step)[:target]
             ys, xs = ys[idx], xs[idx]
 
         Z = depth_np[ys, xs]
-        ok = (Z > 0.1) & (Z < 8.0)
-        ys, xs, Z = ys[ok], xs[ok], Z[ok]
 
         if len(ys) < self.min_cur_pts:
             return torch.zeros((0, 3), device="cuda", dtype=torch.float32)
@@ -327,6 +377,13 @@ class FFTEdgeVO:
             "visible_ratio": float(n_vis / max(1, X_cur.shape[0])),
             "iters": int(total_iters),
             "success": success,
+            # Stage 8: additional diagnostics
+            "n_mask_points": int(mask.sum().item()),
+            "n_sampled_points": int(X_cur.shape[0]),
+            "sampling": self.sampling_strategy,
+            "reject_reason": ("dt_mean_high" if dt_mean >= self.dt_mean_fail
+                            else "low_visible" if n_vis < self.min_cur_pts * self.require_visible_ratio
+                            else None) if not success else None,
         }
 
         if self.debug:
