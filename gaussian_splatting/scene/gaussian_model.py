@@ -550,8 +550,7 @@ class GaussianModel:
             "denom": self.denom.detach().cpu(),
             "unique_kfIDs": self.unique_kfIDs.detach().cpu(),
             "n_obs": self.n_obs.detach().cpu(),
-            "_normal": (self._normal.detach().cpu() if len(self._normal) == len(self._xyz)
-                         else self._derive_normal_from_rotation().detach().cpu()),
+            "_normal": self._derive_normal_from_rotation().detach().cpu(),
         }
 
         # 提取 Adam 优化器的当前动量状态（如果需要热启动）
@@ -791,7 +790,8 @@ class GaussianModel:
         mkdir_p(os.path.dirname(path))
 
         xyz = self._xyz.detach().cpu().numpy()
-        normals = np.zeros_like(xyz)
+        rot_matrix = build_rotation(self._rotation).detach().cpu().numpy()
+        normals = rot_matrix[:, :, 2]
         f_dc = (
             self._features_dc.detach()
             .transpose(1, 2)
@@ -1127,8 +1127,8 @@ class GaussianModel:
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.unique_kfIDs = self.unique_kfIDs[valid_points_mask.cpu()]
         self.n_obs = self.n_obs[valid_points_mask.cpu()]
-        if len(self._normal) == len(valid_points_mask):
-            self._normal = self._normal[valid_points_mask]
+        # 从 _rotation 实时推导法线，保证 _normal 不滞后于优化后的 _rotation
+        self._normal = self._derive_normal_from_rotation()
 
     # 将新的张量（tensors_dict 中的张量）添加到现有的优化器参数中，并更新优化器的状态
     # def cat_tensors_to_optimizer(self, tensors_dict):
@@ -1236,12 +1236,8 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
-        # 更新 _normal: 优先使用传入的 normals，否则从 _rotation 推导后清零重建
-        if new_normals is not None:
-            nn_new = new_normals.float().cuda()
-            self._normal = (torch.cat([self._normal, nn_new], dim=0) if len(self._normal) > 0 else nn_new)
-        else:
-            self._normal = torch.empty(0, device="cuda")
+        # 从 _rotation 实时推导法线，保证 _normal 始终与当前 surfel 朝向一致
+        self._normal = self._derive_normal_from_rotation()
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")

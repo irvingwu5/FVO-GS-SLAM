@@ -278,12 +278,13 @@ class RAP2DGSLiteScorer:
 
     @staticmethod
     def _get_normals(gaussians, N, device):
-        """Extract normals from GaussianModel, falling back to rotation derivation."""
+        """从 _rotation 实时推导法线（_normal 非优化参数，可能滞后于 _rotation）。"""
+        if hasattr(gaussians, "_derive_normal_from_rotation"):
+            normals = gaussians._derive_normal_from_rotation().to(device)
+            if normals.shape[0] == N:
+                return normalize_normals(normals)
         if hasattr(gaussians, "_normal") and gaussians._normal.shape[0] == N:
             normals = gaussians._normal.to(device).float()
             if normals.abs().sum() > 0:
                 return normalize_normals(normals)
-        if hasattr(gaussians, "_derive_normal_from_rotation"):
-            normals = gaussians._derive_normal_from_rotation().to(device)
-            return normalize_normals(normals)
         return None
