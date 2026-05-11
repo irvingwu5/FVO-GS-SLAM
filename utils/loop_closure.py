@@ -11,7 +11,8 @@ from utils.keyframe_pgo import (KeyframeRecord, Reloc3RPairEstimate, VerifiedLoo
                                  build_keyframe_database, build_keyframe_pose_graph,
                                  keyframe_db_stats, retrieve_keyframe_loop_candidates,
                                  KeyframeRetrievalCandidate, refine_keyframe_loop_edge,
-                                 run_keyframe_pgo_trial, evaluate_keyframe_pgo_result)
+                                 run_keyframe_pgo_trial, evaluate_keyframe_pgo_result,
+                                 log_pgo_summary)
 from utils.loop_depth_verifier import verify_reloc3r_pair_with_rgbd
 import torchvision.transforms as T
 import torchvision.models as models
@@ -287,6 +288,14 @@ class LoopClosureProcess(mp.Process):
     # 4.9 Main Loop
     # ========================================================================
     def run(self):
+        # ---- Seed Reproducibility (loop closure process) ----
+        from utils.reproducibility import seed_everything
+        base_seed = self.config.get("Experiment", {}).get("seed", 42)
+        deterministic = self.config.get("Experiment", {}).get("deterministic", True)
+        loop_seed = base_seed + 2
+        seed_everything(loop_seed, deterministic=deterministic)
+        Log(f"[Seed] loop_seed={loop_seed}")
+
         Log(f"Loop Closure 进程已启动 mode={self.mode}")
         if self.mode == "off":
             Log("[LoopClosure] mode=off, idle loop (no feature extraction, no PGO)")
@@ -583,7 +592,8 @@ class LoopClosureProcess(mp.Process):
                             Log(f"[KeyframePGO] graph: {len(graph.nodes)} nodes, "
                                 f"{graph.num_temporal_edges} temporal, "
                                 f"{graph.num_handoff_edges} handoff, "
-                                f"{graph.num_loop_edges} loop edges")
+                                f"{graph.num_loop_edges} loop, "
+                                f"{graph.num_skipped_duplicate_edges} skipped_duplicate ({'OK' if graph.num_skipped_duplicate_edges <= graph.num_handoff_edges else 'WARN'}) edges")
 
                             trial_result = run_keyframe_pgo_trial(
                                 graph, config=self.config.get("LoopClosure", {}),
@@ -597,6 +607,10 @@ class LoopClosureProcess(mp.Process):
 
                             trial_result = evaluate_keyframe_pgo_result(
                                 trial_result, graph,
+                                config=self.config.get("LoopClosure", {}),
+                            )
+                            log_pgo_summary(
+                                graph, trial_result,
                                 config=self.config.get("LoopClosure", {}),
                             )
                             if trial_result.accepted:

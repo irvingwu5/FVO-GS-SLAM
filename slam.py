@@ -40,6 +40,7 @@ from utils.eval_utils import eval_ate, eval_rendering, save_gaussians
 from utils.logging_utils import Log
 from utils.loop_closure import LoopClosureProcess, rigid_transform_2dgs
 from utils.multiprocessing_utils import FakeQueue
+from utils.reproducibility import seed_everything
 from utils.slam_backend import BackEnd
 from utils.slam_frontend import FrontEnd
 
@@ -304,7 +305,12 @@ class SLAM:
                     ).float()
                 Log(f"Loaded {len(kf_pgo_corrections)} keyframe PGO corrections from {kf_pgo_path}")
 
-        # Build per-submap median correction from keyframe PGO result
+        # Build per-submap median correction from keyframe PGO result.
+        # TODO(Stage-9): Submap-median correction cannot fix intra-submap drift.
+        #  2DGS-SLAM uses per-keyframe owner correction (each Gaussian gets its
+        #  owner KF's delta). To enable this, need to store owner_keyframe_ids
+        #  in GaussianModel ckpt and implement the "owner_keyframe" path in
+        #  apply_keyframe_corrections_to_gaussians().
         submap_kf_corrections = {}
         if kf_pgo_corrections:
             for kf_id, delta in kf_pgo_corrections.items():
@@ -662,6 +668,26 @@ if __name__ == "__main__":
         with open(os.path.join(save_dir, "config.yml"), "w") as file:
             documents = yaml.dump(config, file)
         Log("saving results in " + save_dir)
+
+        # ---- Save seed reproducibility info ----
+        import json as _json
+        base_seed_val = config.get("Experiment", {}).get("seed", 42)
+        det_val = config.get("Experiment", {}).get("deterministic", True)
+        seed_info = {
+            "seed": base_seed_val,
+            "deterministic": det_val,
+            "frontend_seed": base_seed_val,
+            "backend_seed": base_seed_val + 1,
+            "loop_seed": base_seed_val + 2,
+            "torch_version": torch.__version__,
+            "cuda_version": torch.version.cuda if torch.cuda.is_available() else "N/A",
+            "cudnn_deterministic": torch.backends.cudnn.deterministic if det_val else False,
+            "cudnn_benchmark": torch.backends.cudnn.benchmark if det_val else True,
+        }
+        with open(os.path.join(save_dir, "seed_info.json"), "w") as f:
+            _json.dump(seed_info, f, indent=2)
+        Log(f"[Seed] seed_info saved to {save_dir}/seed_info.json")
+
         run = wandb.init(
             project="MonoGS",
             name=f"{tmp}_{current_datetime}",
@@ -670,6 +696,17 @@ if __name__ == "__main__":
         )
         wandb.define_metric("frame_idx")
         wandb.define_metric("ate*", step_metric="frame_idx")
+
+    # ---- Seed Reproducibility ----
+    base_seed = config.get("Experiment", {}).get("seed", 42)
+    deterministic = config.get("Experiment", {}).get("deterministic", True)
+    seed_everything(base_seed, deterministic=deterministic)
+    Log(f"[Seed] base_seed={base_seed}, deterministic={deterministic}")
+    Log(f"[Seed] frontend_seed={base_seed}")
+    Log(f"[Seed] backend_seed={base_seed + 1}")
+    Log(f"[Seed] loop_seed={base_seed + 2}")
+    Log(f"[Seed] cudnn.deterministic={torch.backends.cudnn.deterministic}, "
+        f"cudnn.benchmark={torch.backends.cudnn.benchmark}")
 
     # GPU Memory Monitor
     gpu_id_str = os.environ.get("CUDA_VISIBLE_DEVICES", "0")

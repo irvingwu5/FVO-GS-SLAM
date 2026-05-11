@@ -106,11 +106,18 @@ class FFTEdgeVO:
 
         # ---- sampling (Stage 8) ----------------------------------------------
         self.sampling_strategy = cfg.get("sampling_strategy", "grid")
-        self.vo_random_seed = int(cfg.get("vo_random_seed", 42))
+        self.vo_random_seed = int(cfg.get("vo_random_seed",
+            config.get("Experiment", {}).get("seed", 42)))
 
         # ---- quality --------------------------------------------------------
         self.dt_mean_fail       = float(cfg.get("dt_mean_fail_threshold", 15.0))
         self.require_visible_ratio = float(cfg.get("require_visible_ratio", 0.3))
+
+        # ---- multi-condition success gate (Stage 2) ------------------------
+        self.dt_all_p90_fail  = float(cfg.get("dt_all_p90_fail_threshold", 20.0))
+        self.max_outside_ratio = float(cfg.get("max_outside_ratio", 0.25))
+        self.min_near_edge_ratio = float(cfg.get("min_near_edge_ratio", 0.10))
+        self.max_near_edge_ratio = float(cfg.get("max_near_edge_ratio", 0.95))
 
         # ---- FFT filter (lazy) ----------------------------------------------
         self.fft_filter = None
@@ -397,23 +404,94 @@ class FFTEdgeVO:
         T_rc_opt = _se3_exp(xi).detach().cpu().numpy().astype(np.float64)
         c2w = np.linalg.inv(self.T_wr) @ T_rc_opt  # T_world_cur = T_world_ref @ T_ref_cur
 
-        # ---- 5.  Quality (Bug 6: tighter success gate) ----------------------
+        # ---- 5.  All-inside DT diagnostics (evaluate at finest level) --------
+        fx_f, fy_f, cx_f, cy_f = self.K_pyr[-1]
+        struct_f = self.opt_struct_pyr[-1]
+
+        # Evaluate at final xi with full debug (use torch tensor, not numpy)
+        T_rc_opt_t = _se3_exp(xi)
+        _, _, _, _, _, _, dbg_final = self._evaluate_residuals(
+            T_rc_opt_t, X_cur, struct_f, fx_f, fy_f, cx_f, cy_f,
+            return_debug=True,
+        )
+
+        # Evaluate at init xi for before/after comparison
+        T_rc_init_eval = _se3_exp(xi_init_for_diag)
+        _, _, _, _, _, _, dbg_init = self._evaluate_residuals(
+            T_rc_init_eval, X_cur, struct_f, fx_f, fy_f, cx_f, cy_f,
+            return_debug=True,
+        )
+
+        # Aggregate diagnostics
+        if dbg_final is not None:
+            dt_all_mean = dbg_final["dt_all_mean"]
+            dt_all_p90  = dbg_final["dt_all_p90"]
+            dt_all_p95  = dbg_final["dt_all_p95"]
+            outside_count = dbg_final["outside_count"]
+            outside_ratio = outside_count / max(1, X_cur.shape[0])
+            near_edge_ratio = (dbg_final.get("near_edge_count", 0)
+                               / max(1, lm_diag_agg["inside_count"]))
+            mask_density = mask.sum().item() / (self.H * self.W)
+            ref_mask_density = (self.ref_count / (self.H * self.W)
+                                if self.ref_count > 0 else 0.0)
+            # Merge debug stats into lm_diag_agg
+            lm_diag_agg["dt_all_mean"] = dt_all_mean
+            lm_diag_agg["dt_all_p90"] = dt_all_p90
+            lm_diag_agg["dt_all_p95"] = dt_all_p95
+            lm_diag_agg["outside_ratio"] = outside_ratio
+            lm_diag_agg["near_edge_ratio"] = near_edge_ratio
+            lm_diag_agg["mask_density"] = mask_density
+            lm_diag_agg["ref_mask_density"] = ref_mask_density
+        else:
+            dt_all_mean = float("inf")
+            dt_all_p90  = float("inf")
+            dt_all_p95  = float("inf")
+            outside_ratio = 1.0
+            near_edge_ratio = 0.0
+            mask_density = 0.0
+            ref_mask_density = 0.0
+
+        # ---- 6.  Quality (multi-condition success gate) --------------------
         visible_ratio = n_vis / max(1, X_cur.shape[0])
         min_visible = max(self.min_cur_pts, X_cur.shape[0] * self.require_visible_ratio)
         final_error = lm_diag_agg["final_error"]
         error_ok = (final_error < float("inf")
                     and final_error < self.dt_mean_fail * self.dt_mean_fail)
+
+        # New multi-condition check
+        p90_ok = (dt_all_p90 < self.dt_all_p90_fail)
+        outside_ok = (outside_ratio < self.max_outside_ratio)
+        ne_ratio_ok = (self.min_near_edge_ratio < near_edge_ratio < self.max_near_edge_ratio)
+
         success = (dt_mean < self.dt_mean_fail
                    and n_vis >= min_visible
-                   and error_ok)
+                   and error_ok
+                   and p90_ok
+                   and outside_ok
+                   and ne_ratio_ok)
 
-        # ---- 6.  Delta from init --------------------------------------------
+        # ---- 7.  Delta from init --------------------------------------------
         T_rc_init_for_diag = _se3_exp(xi_init_for_diag).detach().cpu().numpy().astype(np.float64)
         delta_T = np.linalg.inv(T_rc_init_for_diag) @ T_rc_opt
         delta_t = float(np.linalg.norm(delta_T[:3, 3]))
         delta_r_rad = float(np.arccos(
             np.clip((np.trace(delta_T[:3, :3]) - 1.0) / 2.0, -1.0, 1.0)))
         delta_r_deg = delta_r_rad * 180.0 / np.pi
+
+        # Build reject reason
+        reject_reasons = []
+        if dt_mean >= self.dt_mean_fail:
+            reject_reasons.append("dt_mean_high")
+        if n_vis < min_visible:
+            reject_reasons.append("low_visible")
+        if not error_ok:
+            reject_reasons.append("high_error")
+        if not p90_ok:
+            reject_reasons.append("dt_all_p90_high")
+        if not outside_ok:
+            reject_reasons.append("too_many_outside")
+        if not ne_ratio_ok:
+            reject_reasons.append("near_edge_ratio_out_of_range")
 
         info = {
             "dt_mean": float(dt_mean) if not np.isinf(dt_mean) else float("inf"),
@@ -425,7 +503,7 @@ class FFTEdgeVO:
             "n_mask_points": int(mask.sum().item()),
             "n_sampled_points": int(X_cur.shape[0]),
             "sampling": self.sampling_strategy,
-            # Stage 2 diagnostics
+            # Previous diagnostics
             "initial_error": lm_diag_agg["initial_error"],
             "final_error": lm_diag_agg["final_error"],
             "accepted_iters": lm_diag_agg["accepted_iters"],
@@ -434,16 +512,22 @@ class FFTEdgeVO:
             "near_edge_count": lm_diag_agg["near_edge_count"],
             "delta_t_from_init": delta_t,
             "delta_r_deg_from_init": delta_r_deg,
-            "reject_reason": ("dt_mean_high" if dt_mean >= self.dt_mean_fail
-                            else "low_visible" if n_vis < min_visible
-                            else "high_error" if not error_ok
-                            else None) if not success else None,
+            # New all-inside diagnostics
+            "dt_all_mean": dt_all_mean,
+            "dt_all_p90": dt_all_p90,
+            "dt_all_p95": dt_all_p95,
+            "outside_ratio": outside_ratio,
+            "near_edge_ratio": near_edge_ratio,
+            "mask_density": mask_density,
+            "ref_mask_density": ref_mask_density,
+            "reject_reason": " + ".join(reject_reasons) if reject_reasons else None,
         }
 
         if self.debug:
-            Log(f"[FFTEdgeVO] track: dt_mean={dt_mean:.2f}px "
+            Log(f"[FFTEdgeVO] track: dt_mean={dt_mean:.2f}px (all p90={dt_all_p90:.1f}) "
                 f"visible={n_vis}/{X_cur.shape[0]} "
-                f"inside={lm_diag_agg['inside_count']} near_edge={lm_diag_agg['near_edge_count']} "
+                f"inside={lm_diag_agg['inside_count']} ne_ratio={near_edge_ratio:.2f} "
+                f"outside_r={outside_ratio:.2f} "
                 f"err={lm_diag_agg['initial_error']:.2f}→{final_error:.2f} "
                 f"acc={lm_diag_agg['accepted_iters']}/{lm_diag_agg['rejected_iters']} "
                 f"Δ_t={delta_t:.4f}m Δ_r={delta_r_deg:.2f}° "
@@ -457,6 +541,7 @@ class FFTEdgeVO:
                     self._save_debug_visualization(
                         image_bgr, mask, X_cur, xi_init_for_diag, xi,
                         dt_mean, n_vis, lm_diag_agg, info,
+                        dbg_final=dbg_final, dbg_init=dbg_init,
                     )
                 except Exception as e:
                     Log(f"[FFTEdgeVO] debug viz ERROR: {e}")
@@ -467,13 +552,18 @@ class FFTEdgeVO:
     # Residual evaluation (shared by LM init and candidate re-evaluation)
     # ====================================================================
 
-    def _evaluate_residuals(self, T, X_cur, opt_struct, fx, fy, cx, cy):
+    def _evaluate_residuals(self, T, X_cur, opt_struct, fx, fy, cx, cy,
+                            return_debug=False):
         """Evaluate weighted residuals at T_ref_cur.
 
         Returns (error, dt_mean, n_vis, inside_count, near_edge_count, data).
 
         data is a dict with keys (gx, gy, dt_vals, Xo, Yo, Zo, w) for
         Jacobian construction, or None when evaluation fails (too few points).
+
+        When return_debug=True, also returns a debug dict with:
+          u_raw, v_raw, dt_vals_all_inside, edge_ok, outside_count,
+          dt_all_mean, dt_all_p50, dt_all_p75, dt_all_p90, dt_all_p95.
         """
         H, W = opt_struct.shape[0], opt_struct.shape[1]
         R = T[:3, :3]
@@ -482,7 +572,10 @@ class FFTEdgeVO:
         X_ref = (R @ X_cur.T).T + t                     # (N,3)
         Z = X_ref[:, 2]
         ok = Z > 0.05
-        if ok.sum() < 10:
+        total_ok = int(ok.sum().item())
+        if total_ok < 10:
+            if return_debug:
+                return float("inf"), float("inf"), 0, 0, 0, None, None
             return float("inf"), float("inf"), 0, 0, 0, None
 
         Xo, Yo, Zo = X_ref[ok, 0], X_ref[ok, 1], Z[ok]
@@ -493,7 +586,16 @@ class FFTEdgeVO:
         inside = (u_raw >= 1.0) & (u_raw <= W - 2.0) & \
                  (v_raw >= 1.0) & (v_raw <= H - 2.0)
         inside_count = int(inside.sum().item())
+        outside_count = total_ok - inside_count
+
         if inside_count < 10:
+            if return_debug:
+                dbg = {"outside_count": outside_count, "u_raw": None, "v_raw": None,
+                       "dt_vals_all_inside": None, "edge_ok": None,
+                       "dt_all_mean": float("inf"), "dt_all_p50": float("inf"),
+                       "dt_all_p75": float("inf"), "dt_all_p90": float("inf"),
+                       "dt_all_p95": float("inf")}
+                return float("inf"), float("inf"), 0, inside_count, 0, None, dbg
             return float("inf"), float("inf"), 0, inside_count, 0, None
 
         u = u_raw[inside]
@@ -502,15 +604,34 @@ class FFTEdgeVO:
 
         # Bilinear sample
         vals = _bilinear_sample_4ch(opt_struct, u, v)
-        gx, gy, dt_vals, _ = vals[:, 0], vals[:, 1], vals[:, 2], vals[:, 3]
+        gx, gy, dt_vals_all, _ = vals[:, 0], vals[:, 1], vals[:, 2], vals[:, 3]
+
+        # ---- debug: all-inside DT statistics (before edge_ok filter) ---------
+        debug_data = None
+        if return_debug:
+            dt_all_np = dt_vals_all.detach().cpu().numpy()
+            dt_all_sorted = np.sort(dt_all_np)
+            n_dt = len(dt_all_sorted)
+            debug_data = {
+                "u_raw": u_raw, "v_raw": v_raw, "inside_mask": inside,
+                "dt_vals_all_inside": dt_vals_all,
+                "outside_count": outside_count,
+                "dt_all_mean": float(dt_all_np.mean()),
+                "dt_all_p50": float(dt_all_sorted[int(n_dt * 0.50)] if n_dt > 1 else dt_all_np[0]),
+                "dt_all_p75": float(dt_all_sorted[int(n_dt * 0.75)] if n_dt > 3 else dt_all_np[0]),
+                "dt_all_p90": float(dt_all_sorted[int(n_dt * 0.90)] if n_dt > 9 else dt_all_np[0]),
+                "dt_all_p95": float(dt_all_sorted[int(n_dt * 0.95)] if n_dt > 19 else dt_all_np[0]),
+            }
 
         # Near-edge filter
-        edge_ok = dt_vals < self.dt_huber * 3.0
+        edge_ok = dt_vals_all < self.dt_huber * 3.0
         near_edge_count = int(edge_ok.sum().item())
         if near_edge_count < 10:
+            if return_debug:
+                return float("inf"), float("inf"), 0, inside_count, near_edge_count, None, debug_data
             return float("inf"), float("inf"), 0, inside_count, near_edge_count, None
 
-        gx, gy, dt_vals = gx[edge_ok], gy[edge_ok], dt_vals[edge_ok]
+        gx, gy, dt_vals = gx[edge_ok], gy[edge_ok], dt_vals_all[edge_ok]
         Xo_ne, Yo_ne, Zo_ne = Xo_in[edge_ok], Yo_in[edge_ok], Zo_in[edge_ok]
 
         # Huber weights
@@ -523,8 +644,15 @@ class FFTEdgeVO:
         dt_mean = float(dt_vals.mean().item())
         n_vis = near_edge_count
 
+        # Update debug with edge_ok mask (on the inside subset)
+        if debug_data is not None:
+            debug_data["edge_ok"] = edge_ok
+            debug_data["near_edge_count"] = near_edge_count
+
         data = {"gx": gx, "gy": gy, "dt_vals": dt_vals,
                 "Xo": Xo_ne, "Yo": Yo_ne, "Zo": Zo_ne, "w": w}
+        if return_debug:
+            return error, dt_mean, n_vis, inside_count, near_edge_count, data, debug_data
         return error, dt_mean, n_vis, inside_count, near_edge_count, data
 
     # ====================================================================
@@ -669,21 +797,99 @@ class FFTEdgeVO:
     # Debug visualization
     # ====================================================================
 
+    def _draw_projection_points(self, bg_img, u_raw, v_raw, inside_mask,
+                                 edge_ok_on_inside, dt_vals_inside, H_l, W_l,
+                                 mode="all_inside"):
+        """Draw projected points on reference background.
+
+        mode: "all_inside" | "used_near_edge" | "residual_colormap"
+        Returns BGR image.
+        """
+        proj_img = bg_img.copy()
+        u_np = u_raw.detach().cpu().numpy()
+        v_np = v_raw.detach().cpu().numpy()
+        inside_np = inside_mask.detach().cpu().numpy()
+
+        u_inside = u_np[inside_np]
+        v_inside = v_np[inside_np]
+
+        if mode == "all_inside":
+            # Green: inside FOV
+            u_in = np.clip(u_inside, 0, W_l - 1).astype(int)
+            v_in = np.clip(v_inside, 0, H_l - 1).astype(int)
+            if len(u_in) > 0:
+                proj_img[v_in, u_in] = [0, 255, 0]
+            # Blue: outside FOV
+            u_out = u_np[~inside_np]
+            v_out = v_np[~inside_np]
+            u_out_c = np.clip(u_out, 0, W_l - 1).astype(int)
+            v_out_c = np.clip(v_out, 0, H_l - 1).astype(int)
+            if len(u_out_c) > 0:
+                proj_img[v_out_c, u_out_c] = [255, 0, 0]
+
+        elif mode == "used_near_edge":
+            if edge_ok_on_inside is not None and dt_vals_inside is not None:
+                eo_np = edge_ok_on_inside.detach().cpu().numpy()
+                u_ne = u_inside[eo_np]
+                v_ne = v_inside[eo_np]
+                u_ne_c = np.clip(u_ne, 0, W_l - 1).astype(int)
+                v_ne_c = np.clip(v_ne, 0, H_l - 1).astype(int)
+                if len(u_ne_c) > 0:
+                    proj_img[v_ne_c, u_ne_c] = [0, 255, 255]  # yellow: near-edge (used)
+                # Red: inside but NOT near-edge (filtered out)
+                u_fe = u_inside[~eo_np]
+                v_fe = v_inside[~eo_np]
+                u_fe_c = np.clip(u_fe, 0, W_l - 1).astype(int)
+                v_fe_c = np.clip(v_fe, 0, H_l - 1).astype(int)
+                if len(u_fe_c) > 0:
+                    proj_img[v_fe_c, u_fe_c] = [0, 0, 255]  # red: inside but far from edge
+
+        elif mode == "residual_colormap":
+            if dt_vals_inside is not None:
+                dt_np = dt_vals_inside.detach().cpu().numpy()
+                # Color by DT value
+                # Green:  dt < 2
+                # Yellow: 2 ≤ dt < 5
+                # Orange: 5 ≤ dt < 15
+                # Red:    dt ≥ 15
+                mask_g = dt_np < 2
+                mask_y = (dt_np >= 2) & (dt_np < 5)
+                mask_o = (dt_np >= 5) & (dt_np < 15)
+                mask_r = dt_np >= 15
+                for mask, color in [(mask_g, [0, 255, 0]),
+                                     (mask_y, [0, 255, 255]),
+                                     (mask_o, [0, 165, 255]),
+                                     (mask_r, [0, 0, 255])]:
+                    if mask.sum() > 0:
+                        u_m = np.clip(u_inside[mask], 0, W_l - 1).astype(int)
+                        v_m = np.clip(v_inside[mask], 0, H_l - 1).astype(int)
+                        proj_img[v_m, u_m] = color
+
+        return proj_img
+
     def _save_debug_visualization(self, image_bgr, mask, X_cur,
                                    xi_init, xi_final, dt_mean, n_vis,
-                                   lm_diag, info):
+                                   lm_diag, info,
+                                   dbg_final=None, dbg_init=None):
         """Save debug images for FFTEdgeVO diagnostics.
 
         Outputs (to self.debug_save_dir / frame_{id}_*.png):
-          1. fft_mask overlay on current frame
-          2. reference DT heatmap
-          3. projection overlay (cur→ref)
-          4. diagnostics bar chart
+          1. fft_mask.png            — current frame FFT mask overlay
+          2. ref_dt.png              — reference DT heatmap
+          3. projection_all_inside.png     — all inside (green) + outside (blue)
+          4. projection_used_near_edge.png — near_edge used (yellow) vs filtered (red)
+          5. projection_residual_colormap.png — DT color: g<2, y 2-5, o 5-15, r≥15
+          6. projection_before_after.png  — left=init, right=final
+          7. diagnostics.png              — bar chart
         """
         frame_id = info.get("frame_id", self._debug_frame_count)
         save_dir = self.debug_save_dir
         os.makedirs(save_dir, exist_ok=True)
         prefix = os.path.join(save_dir, f"frame_{frame_id:04d}")
+
+        has_ref = self.ref_rgb_bgr is not None
+        H_l = self.ref_rgb_bgr.shape[0] if has_ref else self.H
+        W_l = self.ref_rgb_bgr.shape[1] if has_ref else self.W
 
         # --- 1. FFT mask overlay on current RGB -----------------------------
         mask_np = mask.cpu().numpy().astype(np.uint8) * 255
@@ -693,7 +899,8 @@ class FFTEdgeVO:
         cv2.imwrite(f"{prefix}_fft_mask.png", blended)
 
         # --- 2. Reference DT heatmap ----------------------------------------
-        if self.ref_rgb_bgr is not None:
+        ref_mask_np = None
+        if has_ref:
             ref_mask = self._compute_mask(self.ref_rgb_bgr)
             ref_mask_np = ref_mask.cpu().numpy().astype(np.uint8) * 255
             dt_full = cv2.distanceTransform(
@@ -703,50 +910,80 @@ class FFTEdgeVO:
             dt_color = cv2.applyColorMap(dt_vis, cv2.COLORMAP_JET)
             cv2.imwrite(f"{prefix}_ref_dt.png", dt_color)
 
-        # --- 3. Projection overlay (cur→ref) --------------------------------
-        if self.ref_rgb_bgr is not None and X_cur is not None and X_cur.shape[0] > 0:
-            T_final = _se3_exp(xi_final)
-            R = T_final[:3, :3]
-            t = T_final[:3, 3]
-            X_ref = (R @ X_cur.T).T + t
-            Z = X_ref[:, 2]
-            ok = Z > 0.05
-            Xo, Yo, Zo = X_ref[ok, 0], X_ref[ok, 1], Z[ok]
+        if not has_ref:
+            return
 
-            fx_l, fy_l, cx_l, cy_l = self.K_pyr[-1] if self.K_pyr else (self.fx, self.fy, self.cx, self.cy)
-            H_l, W_l = self.ref_rgb_bgr.shape[:2]
-            u_raw = fx_l * Xo / Zo + cx_l
-            v_raw = fy_l * Yo / Zo + cy_l
+        ref_bg = self.ref_rgb_bgr.copy()
+        # Semi-transparent reference mask overlay (green contour on projection bg)
+        if ref_mask_np is not None:
+            ref_overlay = ref_bg.copy()
+            ref_overlay[ref_mask_np > 0] = [0, 255, 0]
+            ref_bg = cv2.addWeighted(ref_bg, 0.85, ref_overlay, 0.15, 0)
 
-            # Vectorized point rendering (fast, no for-loops)
-            proj_img = self.ref_rgb_bgr.copy()
-            inside = (u_raw >= 0) & (u_raw < W_l) & (v_raw >= 0) & (v_raw < H_l)
-            u_in = u_raw[inside].cpu().numpy().astype(int)
-            v_in = v_raw[inside].cpu().numpy().astype(int)
-            if len(u_in) > 0:
-                proj_img[v_in, u_in] = [0, 255, 0]  # green: inside FOV
+        # --- 3. projection_all_inside ---------------------------------------
+        if dbg_final is not None and dbg_final.get("u_raw") is not None:
+            img3 = self._draw_projection_points(
+                ref_bg, dbg_final["u_raw"], dbg_final["v_raw"],
+                dbg_final["inside_mask"], None, None, H_l, W_l,
+                mode="all_inside")
+            cv2.imwrite(f"{prefix}_projection_all_inside.png", img3)
 
-            u_out = u_raw[~inside].cpu().numpy()
-            v_out = v_raw[~inside].cpu().numpy()
-            u_out_c = np.clip(u_out, 0, W_l - 1).astype(int)
-            v_out_c = np.clip(v_out, 0, H_l - 1).astype(int)
-            if len(u_out_c) > 0:
-                proj_img[v_out_c, u_out_c] = [255, 0, 0]  # blue: outside FOV
+        # --- 4. projection_used_near_edge -----------------------------------
+        if dbg_final is not None and dbg_final.get("u_raw") is not None:
+            img4 = self._draw_projection_points(
+                ref_bg, dbg_final["u_raw"], dbg_final["v_raw"],
+                dbg_final["inside_mask"],
+                dbg_final.get("edge_ok"),
+                dbg_final.get("dt_vals_all_inside"),
+                H_l, W_l,
+                mode="used_near_edge")
+            cv2.imwrite(f"{prefix}_projection_used_near_edge.png", img4)
 
-            cv2.imwrite(f"{prefix}_projection.png", proj_img)
+        # --- 5. projection_residual_colormap --------------------------------
+        if dbg_final is not None and dbg_final.get("u_raw") is not None:
+            img5 = self._draw_projection_points(
+                ref_bg, dbg_final["u_raw"], dbg_final["v_raw"],
+                dbg_final["inside_mask"],
+                None,
+                dbg_final.get("dt_vals_all_inside"),
+                H_l, W_l,
+                mode="residual_colormap")
+            cv2.imwrite(f"{prefix}_projection_residual_colormap.png", img5)
 
-        # --- 4. Diagnostics bar chart (matplotlib, optional) -----------------
+        # --- 6. projection_before_after -------------------------------------
+        if dbg_init is not None and dbg_final is not None:
+            img_left = self._draw_projection_points(
+                ref_bg, dbg_init["u_raw"], dbg_init["v_raw"],
+                dbg_init["inside_mask"], None, None, H_l, W_l,
+                mode="all_inside")
+            img_right = self._draw_projection_points(
+                ref_bg, dbg_final["u_raw"], dbg_final["v_raw"],
+                dbg_final["inside_mask"], None, None, H_l, W_l,
+                mode="all_inside")
+            # Label left/right
+            cv2.putText(img_left, "init", (10, 25),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(img_right, "final", (10, 25),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            img_ba = np.hstack([img_left, img_right])
+            cv2.imwrite(f"{prefix}_projection_before_after.png", img_ba)
+
+        # --- 7. Diagnostics bar chart (matplotlib, optional) -----------------
         try:
             import matplotlib
             matplotlib.use("Agg")
             import matplotlib.pyplot as plt
 
-            fig, ax = plt.subplots(figsize=(6, 4))
+            fig, ax = plt.subplots(figsize=(8, 5))
             metrics = [
                 ("dt_mean", dt_mean),
+                ("dt_all_p90", info.get("dt_all_p90", 0)),
+                ("dt_all_p95", info.get("dt_all_p95", 0)),
                 ("visible", n_vis),
                 ("inside", lm_diag.get("inside_count", 0)),
                 ("near_edge", lm_diag.get("near_edge_count", 0)),
+                ("ne_ratio", info.get("near_edge_ratio", 0)),
+                ("outside_r", info.get("outside_ratio", 0)),
                 ("acc_iters", lm_diag.get("accepted_iters", 0)),
                 ("rej_iters", lm_diag.get("rejected_iters", 0)),
                 ("Δ_t(mm)", info.get("delta_t_from_init", 0) * 1000),
@@ -755,15 +992,16 @@ class FFTEdgeVO:
             names = [m[0] for m in metrics]
             values = [m[1] for m in metrics]
             bars = ax.bar(names, values)
-            ax.bar_label(bars, fmt="%.2f", fontsize=7)
+            ax.bar_label(bars, fmt="%.2f", fontsize=6)
             ax.set_title(f"FFTEdgeVO Frame {frame_id}  "
-                         f"err {lm_diag.get('initial_error',0):.1f}→{lm_diag.get('final_error',0):.1f}")
-            ax.tick_params(axis="x", rotation=30, labelsize=7)
+                         f"err {lm_diag.get('initial_error',0):.1f}→{lm_diag.get('final_error',0):.1f}  "
+                         f"success={info.get('success',False)}")
+            ax.tick_params(axis="x", rotation=45, labelsize=6)
             fig.tight_layout()
             fig.savefig(f"{prefix}_diagnostics.png", dpi=100)
             plt.close(fig)
         except Exception:
-            pass  # matplotlib unavailable — skip chart, images 1-3 still saved
+            pass  # matplotlib unavailable — skip chart, images 1-6 still saved
 
         if self.debug:
             Log(f"[FFTEdgeVO] debug images saved to {prefix}_*.png")

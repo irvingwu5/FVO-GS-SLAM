@@ -112,12 +112,20 @@ class BackEnd(mp.Process):
         # ===== RSKM (Random Sampling Keyframe Mapping) =====
         self.use_rskm = self.config.get("Training", {}).get("use_rskm", False)
         self.rskm_current_frame_interval = self.config.get("Training", {}).get("rskm_current_frame_interval", 4)
-        rskm_seed = self.config.get("Training", {}).get("rskm_seed", 42)
+        rskm_seed = self.config.get("Training", {}).get("rskm_seed",
+            self.config.get("Experiment", {}).get("seed", 42))
         self.rskm_rng = random.Random(rskm_seed)
         self.rskm_debug_log = self.config.get("Training", {}).get("rskm_debug_log", False)
         self._rskm_stats = None
         if self.use_rskm and self.rskm_debug_log:
             Log(f"[RSKM] enabled interval={self.rskm_current_frame_interval} seed={rskm_seed}")
+
+        # ===== Normal Debug Log =====
+        self.normal_debug_log = self.config.get("Training", {}).get("normal_debug_log", False)
+        self.normal_debug_log_every = int(self.config.get("Training", {}).get(
+            "normal_debug_log_every", 50
+        ))
+        self._normal_debug_iter_count = 0
 
     # ========================================================================
     # 2. Hyperparameters
@@ -381,6 +389,12 @@ class BackEnd(mp.Process):
                     supervision_pairs.append((None, random_viewpoint_stack[cam_idx]))
                 keyframes_opt = viewpoint_stack[:]
 
+            # 法线 debug 统计量初始化
+            if self.normal_debug_log and self.use_fdn:
+                self._normal_debug_dot_sum = 0.0
+                self._normal_debug_err_sum = 0.0
+                self._normal_debug_count = 0
+
             for kf_idx, viewpoint in supervision_pairs:
                 render_pkg = render(
                     viewpoint, self.gaussians, self.pipeline_params, self.background, surf=False
@@ -422,6 +436,15 @@ class BackEnd(mp.Process):
                     normal_error = (1 - (rend_normal * gt_normal * depth_pixel_mask).sum(dim=0))[None].mean()
                     loss_view += (self.config["opt_params"]["lambda_sensor_normal"] * normal_error)
 
+                    if self.normal_debug_log:
+                        # 累积法线对齐统计量（在有效深度像素上计算平均点积）
+                        dot_per_pixel = (rend_normal * gt_normal).sum(dim=0)  # (H, W)
+                        valid_mask = depth_pixel_mask.squeeze(0) > 0.5
+                        if valid_mask.any():
+                            self._normal_debug_dot_sum += float(dot_per_pixel[valid_mask].mean())
+                            self._normal_debug_err_sum += float(normal_error)
+                            self._normal_debug_count += 1
+
                 loss_view.backward()
 
                 viewspace_point_tensor_acm.append(viewspace_point_tensor)
@@ -431,6 +454,21 @@ class BackEnd(mp.Process):
 
                 del render_pkg
                 torch.cuda.empty_cache()
+
+            # 法线 debug：每 N 次迭代输出一次对齐统计量
+            if self.normal_debug_log and self.use_fdn:
+                self._normal_debug_iter_count += 1
+                if (self._normal_debug_iter_count % self.normal_debug_log_every == 0
+                        and self._normal_debug_count > 0):
+                    avg_dot = self._normal_debug_dot_sum / self._normal_debug_count
+                    avg_err = self._normal_debug_err_sum / self._normal_debug_count
+                    # 平均点积越接近 1.0，说明 rend_normal 与 sensor 法线方向越一致
+                    Log(
+                        f"[NormalAlign] iter={self._normal_debug_iter_count} "
+                        f"avg_dot={avg_dot:.4f} avg_err={avg_err:.4f} "
+                        f"n_pairs={self._normal_debug_count} "
+                        f"(dot→1.0=法线方向一致)"
+                    )
 
             gaussian_split = False
 
@@ -893,6 +931,14 @@ class BackEnd(mp.Process):
     # 11. Main Loop
     # ========================================================================
     def run(self):
+        # ---- Seed Reproducibility (backend process) ----
+        from utils.reproducibility import seed_everything
+        base_seed = self.config.get("Experiment", {}).get("seed", 42)
+        deterministic = self.config.get("Experiment", {}).get("deterministic", True)
+        backend_seed = base_seed + 1
+        seed_everything(backend_seed, deterministic=deterministic)
+        Log(f"[Seed] backend_seed={backend_seed}")
+
         while True:
             if self.backend_queue.empty():
                 if self.pause:
