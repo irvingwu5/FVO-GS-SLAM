@@ -76,6 +76,8 @@ Training:
   rskm_current_frame_interval: 4   # 每 N 次采样强制使用当前帧（避免遗忘），2-8
   rskm_seed: 42                    # RSKM 随机种子
   rskm_debug_log: false            # 是否输出 RSKM 调试统计
+  normal_debug_log: false          # 是否输出法线对齐调试统计
+  normal_debug_log_every: 50       # 法线对齐日志输出间隔（iterations）
 
 # ============================================================
 # FFT Edge VO Configuration (dense DT alignment, Edge VO style)
@@ -120,7 +122,12 @@ FFTEdgeVO:
   max_ref_age: 4                   # VO reference 最大帧龄，超过触发强制刷新
 
   # Logging
-  debug_log: false                 # 是否输出 FFTEdgeVO 逐帧调试日志
+  debug_log: true                 # 是否输出 FFTEdgeVO 逐帧调试日志
+
+  # Debug visualization (save images to disk for offline inspection)
+  debug_save_images: true         # 是否保存调试图像到磁盘
+  debug_save_dir: "debug_vo"       # 调试图像保存目录
+  debug_save_interval: 10          # 每隔多少帧保存一次
 
   # Candidate Selection (Stage 2: multi-candidate render arbitration)
   candidate_selection_enable: true        # 是否启用多候选初值仲裁
@@ -222,6 +229,7 @@ LoopClosure:
   keyframe_retrieval_min_temporal_gap: 10  # 最小帧间隔（防止相邻帧自匹配）
   keyframe_retrieval_mutual_nearest: true  # 是否要求互为最近邻
   keyframe_retrieval_mutual_top_n: 20      # 互为最近邻检索的候选池大小
+  allow_same_submap_loops: false           # 允许同子图回环检索（无子图策略时需开启）
 
   # ===== Stage 4: Depth verification =====
   depth_verify:
@@ -245,6 +253,7 @@ LoopClosure:
   # ===== Stage 7: Keyframe PGO safety =====
   keyframe_pgo_odom_info_scale: 10.0     # PGO 里程计边信息矩阵缩放
   keyframe_pgo_handoff_info_scale: 5.0   # PGO handoff 边信息矩阵缩放
+  keyframe_pgo_debug_log: false           # PGO 详细摘要日志（开启后每轮输出完整残差/修正统计）
   keyframe_pgo_safety:
     max_correction_t: 1.0                # PGO 最大平移修正 (m)，TUM 开环累积漂移可达 2-3m
     max_correction_r_deg: 15.0           # PGO 最大旋转修正 (deg)
@@ -352,6 +361,6 @@ Ablation:
   use_submap: False                 # 子图切图策略 (关闭 → 全局单地图)
   use_loop_closure: False           # 回环检测 + PGO 修正
   use_fdn: False                    # FDN 有限差分法向监督
-  use_fft_mask: False               # FFT 高低频掩膜指导采样与初始 scale
+  use_fft_mask: True               # FFT 高低频掩膜指导采样与初始 scale
   use_error_mask: False             # 渲染误差掩膜指导动态补点
   use_color_refinement: True       # final merge 后离线颜色精化

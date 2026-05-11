@@ -12,6 +12,7 @@
 import numpy as np
 import torch
 import cv2
+import os
 from utils.fft_filter import FFTFrequencyFilter
 from utils.logging_utils import Log
 
@@ -136,6 +137,21 @@ class FFTEdgeVO:
         # ----
         self.debug       = cfg.get("debug_log", True)
         self.min_dt_mean = float(cfg.get("min_dt_mean", 0.5))
+
+        # ---- debug visualization -------------------------------------------
+        self.debug_save_images  = cfg.get("debug_save_images", False)
+        self.debug_save_dir     = cfg.get("debug_save_dir", "debug_vo")
+        self.debug_save_interval = int(cfg.get("debug_save_interval", 10))
+        self._debug_frame_count = 0  # internal counter for interval gating
+
+        # Resolve debug_save_dir under experiment save_dir if available
+        exp_save_dir = config.get("Results", {}).get("save_dir")
+        if exp_save_dir and not os.path.isabs(self.debug_save_dir):
+            self.debug_save_dir = os.path.join(exp_save_dir, self.debug_save_dir)
+
+        if self.debug and self.debug_save_images:
+            Log(f"[FFTEdgeVO] debug viz ENABLED: saving to '{self.debug_save_dir}/' "
+                f"every {self.debug_save_interval} frames")
 
     # ====================================================================
     # FFT mask
@@ -333,12 +349,18 @@ class FFTEdgeVO:
         # parameterise T_ref_cur = exp(xi) from actual initial guess
         T_rc_init_t = torch.from_numpy(T_rc_init).float().cuda()
         xi = _se3_log(T_rc_init_t)
+        xi_init_for_diag = xi.clone()  # saved for delta-from-init diagnostics
 
         # ---- 3.  Coarse-to-fine LM -----------------------------------------
         num_levels = len(self.opt_struct_pyr)
         dt_mean = float("inf")
         n_vis = 0
         total_iters = 0
+
+        # Per-level diagnostics accumulation
+        lm_diag_agg = {"initial_error": float("inf"), "final_error": float("inf"),
+                       "accepted_iters": 0, "rejected_iters": 0,
+                       "inside_count": 0, "near_edge_count": 0}
 
         for level in range(num_levels):
             fx_l, fy_l, cx_l, cy_l = self.K_pyr[level]
@@ -347,7 +369,7 @@ class FFTEdgeVO:
             max_it = (self.max_iters_coarse if level < num_levels - 1
                       else self.max_iters_fine)
 
-            xi, n_vis, dt_mean, n_it = self._lm_optimise(
+            xi, n_vis, dt_mean, n_it, lm_diag = self._lm_optimise(
                 X_cur, struct, fx_l, fy_l, cx_l, cy_l,
                 xi.detach().clone(), max_it,
             )
@@ -356,6 +378,15 @@ class FFTEdgeVO:
             self.last_visible = n_vis
             self.last_dt_mean = dt_mean
             self.last_iters   = n_it
+
+            # Accumulate diagnostics (finest level overwrites coarse)
+            if level == 0:
+                lm_diag_agg["initial_error"] = lm_diag["initial_error"]
+            lm_diag_agg["final_error"] = lm_diag["final_error"]
+            lm_diag_agg["accepted_iters"] += lm_diag["accepted_iters"]
+            lm_diag_agg["rejected_iters"] += lm_diag["rejected_iters"]
+            lm_diag_agg["inside_count"] = lm_diag["inside_count"]
+            lm_diag_agg["near_edge_count"] = lm_diag["near_edge_count"]
 
             if dt_mean < self.min_dt_mean and level < num_levels - 1:
                 if self.debug:
@@ -366,32 +397,135 @@ class FFTEdgeVO:
         T_rc_opt = _se3_exp(xi).detach().cpu().numpy().astype(np.float64)
         c2w = np.linalg.inv(self.T_wr) @ T_rc_opt  # T_world_cur = T_world_ref @ T_ref_cur
 
-        # ---- 5.  Quality ---------------------------------------------------
+        # ---- 5.  Quality (Bug 6: tighter success gate) ----------------------
+        visible_ratio = n_vis / max(1, X_cur.shape[0])
+        min_visible = max(self.min_cur_pts, X_cur.shape[0] * self.require_visible_ratio)
+        final_error = lm_diag_agg["final_error"]
+        error_ok = (final_error < float("inf")
+                    and final_error < self.dt_mean_fail * self.dt_mean_fail)
         success = (dt_mean < self.dt_mean_fail
-                   and n_vis >= self.min_cur_pts * self.require_visible_ratio)
+                   and n_vis >= min_visible
+                   and error_ok)
+
+        # ---- 6.  Delta from init --------------------------------------------
+        T_rc_init_for_diag = _se3_exp(xi_init_for_diag).detach().cpu().numpy().astype(np.float64)
+        delta_T = np.linalg.inv(T_rc_init_for_diag) @ T_rc_opt
+        delta_t = float(np.linalg.norm(delta_T[:3, 3]))
+        delta_r_rad = float(np.arccos(
+            np.clip((np.trace(delta_T[:3, :3]) - 1.0) / 2.0, -1.0, 1.0)))
+        delta_r_deg = delta_r_rad * 180.0 / np.pi
 
         info = {
             "dt_mean": float(dt_mean) if not np.isinf(dt_mean) else float("inf"),
             "visible": int(n_vis),
             "total_cur": int(X_cur.shape[0]),
-            "visible_ratio": float(n_vis / max(1, X_cur.shape[0])),
+            "visible_ratio": float(visible_ratio),
             "iters": int(total_iters),
             "success": success,
-            # Stage 8: additional diagnostics
             "n_mask_points": int(mask.sum().item()),
             "n_sampled_points": int(X_cur.shape[0]),
             "sampling": self.sampling_strategy,
+            # Stage 2 diagnostics
+            "initial_error": lm_diag_agg["initial_error"],
+            "final_error": lm_diag_agg["final_error"],
+            "accepted_iters": lm_diag_agg["accepted_iters"],
+            "rejected_iters": lm_diag_agg["rejected_iters"],
+            "inside_count": lm_diag_agg["inside_count"],
+            "near_edge_count": lm_diag_agg["near_edge_count"],
+            "delta_t_from_init": delta_t,
+            "delta_r_deg_from_init": delta_r_deg,
             "reject_reason": ("dt_mean_high" if dt_mean >= self.dt_mean_fail
-                            else "low_visible" if n_vis < self.min_cur_pts * self.require_visible_ratio
+                            else "low_visible" if n_vis < min_visible
+                            else "high_error" if not error_ok
                             else None) if not success else None,
         }
 
         if self.debug:
             Log(f"[FFTEdgeVO] track: dt_mean={dt_mean:.2f}px "
                 f"visible={n_vis}/{X_cur.shape[0]} "
-                f"iters={total_iters} success={success}")
+                f"inside={lm_diag_agg['inside_count']} near_edge={lm_diag_agg['near_edge_count']} "
+                f"err={lm_diag_agg['initial_error']:.2f}→{final_error:.2f} "
+                f"acc={lm_diag_agg['accepted_iters']}/{lm_diag_agg['rejected_iters']} "
+                f"Δ_t={delta_t:.4f}m Δ_r={delta_r_deg:.2f}° "
+                f"success={success}")
+
+        # ---- Debug visualization -------------------------------------------
+        if self.debug_save_images:
+            self._debug_frame_count += 1
+            if self._debug_frame_count == 1 or self._debug_frame_count % self.debug_save_interval == 0:
+                try:
+                    self._save_debug_visualization(
+                        image_bgr, mask, X_cur, xi_init_for_diag, xi,
+                        dt_mean, n_vis, lm_diag_agg, info,
+                    )
+                except Exception as e:
+                    Log(f"[FFTEdgeVO] debug viz ERROR: {e}")
 
         return success, c2w.astype(np.float64), info
+
+    # ====================================================================
+    # Residual evaluation (shared by LM init and candidate re-evaluation)
+    # ====================================================================
+
+    def _evaluate_residuals(self, T, X_cur, opt_struct, fx, fy, cx, cy):
+        """Evaluate weighted residuals at T_ref_cur.
+
+        Returns (error, dt_mean, n_vis, inside_count, near_edge_count, data).
+
+        data is a dict with keys (gx, gy, dt_vals, Xo, Yo, Zo, w) for
+        Jacobian construction, or None when evaluation fails (too few points).
+        """
+        H, W = opt_struct.shape[0], opt_struct.shape[1]
+        R = T[:3, :3]
+        t = T[:3, 3]
+
+        X_ref = (R @ X_cur.T).T + t                     # (N,3)
+        Z = X_ref[:, 2]
+        ok = Z > 0.05
+        if ok.sum() < 10:
+            return float("inf"), float("inf"), 0, 0, 0, None
+
+        Xo, Yo, Zo = X_ref[ok, 0], X_ref[ok, 1], Z[ok]
+
+        # Project — check inside BEFORE clamping (Bug 5 fix)
+        u_raw = fx * Xo / Zo + cx
+        v_raw = fy * Yo / Zo + cy
+        inside = (u_raw >= 1.0) & (u_raw <= W - 2.0) & \
+                 (v_raw >= 1.0) & (v_raw <= H - 2.0)
+        inside_count = int(inside.sum().item())
+        if inside_count < 10:
+            return float("inf"), float("inf"), 0, inside_count, 0, None
+
+        u = u_raw[inside]
+        v = v_raw[inside]
+        Xo_in, Yo_in, Zo_in = Xo[inside], Yo[inside], Zo[inside]
+
+        # Bilinear sample
+        vals = _bilinear_sample_4ch(opt_struct, u, v)
+        gx, gy, dt_vals, _ = vals[:, 0], vals[:, 1], vals[:, 2], vals[:, 3]
+
+        # Near-edge filter
+        edge_ok = dt_vals < self.dt_huber * 3.0
+        near_edge_count = int(edge_ok.sum().item())
+        if near_edge_count < 10:
+            return float("inf"), float("inf"), 0, inside_count, near_edge_count, None
+
+        gx, gy, dt_vals = gx[edge_ok], gy[edge_ok], dt_vals[edge_ok]
+        Xo_ne, Yo_ne, Zo_ne = Xo_in[edge_ok], Yo_in[edge_ok], Zo_in[edge_ok]
+
+        # Huber weights
+        abs_dt = torch.abs(dt_vals)
+        w = torch.where(abs_dt <= self.dt_huber,
+                        torch.ones_like(dt_vals),
+                        self.dt_huber / (abs_dt + 1e-8))
+
+        error = float((w * dt_vals * dt_vals).mean().item())
+        dt_mean = float(dt_vals.mean().item())
+        n_vis = near_edge_count
+
+        data = {"gx": gx, "gy": gy, "dt_vals": dt_vals,
+                "Xo": Xo_ne, "Yo": Yo_ne, "Zo": Zo_ne, "w": w}
+        return error, dt_mean, n_vis, inside_count, near_edge_count, data
 
     # ====================================================================
     # Damped Gauss-Newton (LM-style) at one pyramid level
@@ -404,100 +538,74 @@ class FFTEdgeVO:
         opt_struct:  (H,W,4)  (gx, gy, dt, 0)       (GPU)
         xi:     6-vector, T_ref_cur = exp(xi)
 
-        Returns  (xi_opt, n_visible, dt_mean, n_iters).
+        Returns  (xi_opt, n_visible, dt_mean, n_iters, lm_diag).
         """
         xi = xi_init.clone().detach().requires_grad_(False)
-        H, W, _ = opt_struct.shape
+        H_img, W_img = opt_struct.shape[0], opt_struct.shape[1]
 
         lm_lambda = self.lm_lambda_init
-        last_error = float("inf")
+        accepted_iters = 0
+        rejected_iters = 0
+
+        # ---- initial evaluation -------------------------------------------
+        T_init = _se3_exp(xi)
+        err_init, dt_init, nvis_init, inside_init, near_init, data_init = \
+            self._evaluate_residuals(T_init, X_cur, opt_struct, fx, fy, cx, cy)
+
+        best_error = err_init
+        best_dt_mean = dt_init
+        best_n_vis = nvis_init
+        best_inside_count = inside_init
+        best_near_edge_count = near_init
         best_xi = xi.clone()
-        best_dt_mean = float("inf")
-        best_n_vis = 0
+        last_error = err_init
 
+        initial_error = err_init
+
+        if data_init is None:
+            return best_xi.detach(), best_n_vis, best_dt_mean, 0, {
+                "initial_error": initial_error, "final_error": best_error,
+                "accepted_iters": 0, "rejected_iters": 0,
+                "inside_count": inside_init, "near_edge_count": near_init,
+            }
+
+        # ---- LM loop -------------------------------------------------------
         for it in range(max_iters):
-            T = _se3_exp(xi)                              # T_ref_cur
-            R = T[:3, :3]
-            t = T[:3, 3]
+            # 1. Evaluate at current xi (build Jacobian)
+            T_cur = _se3_exp(xi)
+            err_cur, dt_cur, nvis_cur, inside_cur, near_cur, data_cur = \
+                self._evaluate_residuals(T_cur, X_cur, opt_struct, fx, fy, cx, cy)
 
-            # Transform cur→ref: X_ref = R * X_cur + t
-            X_ref = (R @ X_cur.T).T + t                  # (N,3)
-
-            Z = X_ref[:, 2]
-            ok = Z > 0.05
-            if ok.sum() < 10:
+            if data_cur is None:
                 break
 
-            Xo, Yo, Zo = X_ref[ok, 0], X_ref[ok, 1], Z[ok]
-
-            # Project into reference image
-            u = fx * Xo / Zo + cx
-            v = fy * Yo / Zo + cy
-
-            # Clamp to valid image region
-            u = u.clamp(0.5, W - 1.5)
-            v = v.clamp(0.5, H - 1.5)
-
-            # Bilinear sample opt_struct (gx, gy, dt, _)
-            vals = _bilinear_sample_4ch(opt_struct, u, v)
-            gx, gy, dt_vals, _ = vals[:, 0], vals[:, 1], vals[:, 2], vals[:, 3]
-
-            # Skip points beyond edge distance
-            edge_ok = dt_vals < self.dt_huber * 3.0
-            if edge_ok.sum() < 10:
-                break
-
-            gx, gy, dt_vals = gx[edge_ok], gy[edge_ok], dt_vals[edge_ok]
-            Xo, Yo, Zo = Xo[edge_ok], Yo[edge_ok], Zo[edge_ok]
-
-            # Huber weights
-            abs_dt = torch.abs(dt_vals)
-            w = torch.where(abs_dt <= self.dt_huber,
-                            torch.ones_like(dt_vals),
-                            self.dt_huber / (abs_dt + 1e-8))
-
-            # Weighted error
-            error = float((w * dt_vals * dt_vals).mean().item())
-            n_vis = int(edge_ok.sum().item())
-            dt_mean = float(dt_vals.mean().item())
-
-            if error < best_dt_mean:
-                best_dt_mean = dt_mean
-                best_n_vis = n_vis
-                best_xi = xi.clone()
+            gx, gy, dt_vals, Xo, Yo, Zo, w = (
+                data_cur["gx"], data_cur["gy"], data_cur["dt_vals"],
+                data_cur["Xo"], data_cur["Yo"], data_cur["Zo"], data_cur["w"],
+            )
 
             # ---- Build normal equations  J^T W J  Δξ = -J^T W r -----------
             z = 1.0 / Zo
             z2 = z * z
             px, py = Xo, Yo
 
-            # Jacobian rows (Kerl 2012, p.34 — gx, gy already pre-multiplied by fx, fy)
-            J0 = gx * z                                      # v_x
-            J1 = gy * z                                      # v_y
-            J2 = -(px * gx + py * gy) * z2                   # v_z
-            J3 = -(px * py * z2) * gx - (1.0 + py * py * z2) * gy   # ω_x
-            J4 = (1.0 + px * px * z2) * gx + (px * py * z2) * gy    # ω_y
-            J5 = (-py * z) * gx + (px * z) * gy             # ω_z
+            J0 = gx * z
+            J1 = gy * z
+            J2 = -(px * gx + py * gy) * z2
+            J3 = -(px * py * z2) * gx - (1.0 + py * py * z2) * gy
+            J4 = (1.0 + px * px * z2) * gx + (px * py * z2) * gy
+            J5 = (-py * z) * gx + (px * z) * gy
 
-            # Weighted Jacobian and residual
-            w_gx = w * gx
-            w_gy = w * gy
             wr = w * dt_vals
+            J_stack = torch.stack([J0, J1, J2, J3, J4, J5], dim=1)  # (M,6)
 
-            # Accumulate 6×6 Hessian and 6×1 rhs (loop-free, batched)
-            # J^T W J  = sum_i w_i J_i^T J_i  (outer product)
-            # J^T W r  = sum_i w_i J_i^T r_i
-            J_stack = torch.stack([J0, J1, J2, J3, J4, J5], dim=1)  # (M, 6)
+            H = (J_stack.unsqueeze(2) * J_stack.unsqueeze(1)
+                 * w.unsqueeze(1).unsqueeze(2)).sum(dim=0)
+            b = -(J_stack * wr.unsqueeze(1)).sum(dim=0)
 
-            # Weighted normal equations
-            H = (J_stack.unsqueeze(2) * J_stack.unsqueeze(1) * w.unsqueeze(1).unsqueeze(2)).sum(dim=0)  # (6,6)
-            b = -(J_stack * wr.unsqueeze(1)).sum(dim=0)  # (6,)
-
-            # LM damping:  H_damped = H + λ * diag(H)
             diag_H = torch.diag(H)
             H_damped = H + lm_lambda * torch.diag(diag_H)
 
-            # Solve
             try:
                 inc = torch.linalg.solve(H_damped, b)
             except torch.linalg.LinAlgError:
@@ -506,41 +614,159 @@ class FFTEdgeVO:
             if not torch.isfinite(inc).all():
                 break
 
-            # Update:  T_new = exp(inc) * T_old
-            # This corresponds to left-multiplicative increment Δξ
-            xi_new = _se3_log(_se3_exp(inc) @ T)  # I'll compute this more efficiently
+            # 2. Re-evaluate at candidate  T_new = exp(inc) · T_cur (Bug 4 fix)
+            T_new = _se3_exp(inc) @ T_cur
+            err_new, dt_new, nvis_new, inside_new, near_new, data_new = \
+                self._evaluate_residuals(T_new, X_cur, opt_struct, fx, fy, cx, cy)
 
-            # Actually, for small inc, T_new ≈ exp(inc) * T_old,
-            # and xi_new is the log of that.  For the next iteration we just need
-            # the new xi.  But actually, it's easier: we're parameterising as
-            # T = exp(xi), and updating T ← exp(inc)·T.
-            # We need the new xi such that exp(xi_new) = exp(inc)·exp(xi_old).
-            # Rather than computing the Baker-Campbell-Hausdorff formula, we
-            # just compute the matrix product and take its log (inexpensive).
-
-            # Simple update: evaluate T_new = exp(inc) @ exp(xi_old), then take log
-            T_new = _se3_exp(inc) @ T
-
-            # Check error reduction
-            if error < last_error:
+            # 3. Accept / reject based on candidate error (Bug 4 fix)
+            if err_new < err_cur and err_new < float("inf"):
                 # Accept
                 xi = _se3_log(T_new)
-                last_error = error
-                lm_lambda *= 0.5
+                accepted_iters += 1
 
-                if error / max(last_error, 1e-10) > self.conv_eps:
-                    break
+                # Update best state AFTER accept (Bug 2 fix)
+                if err_new < best_error:
+                    best_error = err_new
+                    best_dt_mean = dt_new
+                    best_n_vis = nvis_new
+                    best_inside_count = inside_new
+                    best_near_edge_count = near_new
+                    best_xi = xi.clone()
+
+                # Convergence: check improvement ratio BEFORE overwriting last_error (Bug 1 fix)
+                if last_error < float("inf"):
+                    improvement_ratio = err_new / last_error
+                    if improvement_ratio > self.conv_eps:
+                        last_error = err_new
+                        break
+
+                last_error = err_new
+                lm_lambda *= 0.5
             else:
                 # Reject
+                rejected_iters += 1
                 lm_lambda *= 4.0
                 if lm_lambda > 100:
                     break
 
-            # Convergence check
+            # Step-size convergence
             if inc.dot(inc) < 0.5 and it > 2:
                 break
 
-        return best_xi.detach(), best_n_vis, best_dt_mean, it + 1
+        lm_diag = {
+            "initial_error": initial_error,
+            "final_error": best_error,
+            "accepted_iters": accepted_iters,
+            "rejected_iters": rejected_iters,
+            "inside_count": best_inside_count,
+            "near_edge_count": best_near_edge_count,
+        }
+        return best_xi.detach(), best_n_vis, best_dt_mean, accepted_iters + rejected_iters, lm_diag
+
+
+    # ====================================================================
+    # Debug visualization
+    # ====================================================================
+
+    def _save_debug_visualization(self, image_bgr, mask, X_cur,
+                                   xi_init, xi_final, dt_mean, n_vis,
+                                   lm_diag, info):
+        """Save debug images for FFTEdgeVO diagnostics.
+
+        Outputs (to self.debug_save_dir / frame_{id}_*.png):
+          1. fft_mask overlay on current frame
+          2. reference DT heatmap
+          3. projection overlay (cur→ref)
+          4. diagnostics bar chart
+        """
+        frame_id = info.get("frame_id", self._debug_frame_count)
+        save_dir = self.debug_save_dir
+        os.makedirs(save_dir, exist_ok=True)
+        prefix = os.path.join(save_dir, f"frame_{frame_id:04d}")
+
+        # --- 1. FFT mask overlay on current RGB -----------------------------
+        mask_np = mask.cpu().numpy().astype(np.uint8) * 255
+        overlay = image_bgr.copy()
+        overlay[mask_np > 0] = [0, 255, 0]
+        blended = cv2.addWeighted(image_bgr, 0.6, overlay, 0.4, 0)
+        cv2.imwrite(f"{prefix}_fft_mask.png", blended)
+
+        # --- 2. Reference DT heatmap ----------------------------------------
+        if self.ref_rgb_bgr is not None:
+            ref_mask = self._compute_mask(self.ref_rgb_bgr)
+            ref_mask_np = ref_mask.cpu().numpy().astype(np.uint8) * 255
+            dt_full = cv2.distanceTransform(
+                255 - ref_mask_np, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+            dt_full = np.clip(dt_full, 0.0, self.dt_max)
+            dt_vis = (dt_full / max(self.dt_max, 1.0) * 255).astype(np.uint8)
+            dt_color = cv2.applyColorMap(dt_vis, cv2.COLORMAP_JET)
+            cv2.imwrite(f"{prefix}_ref_dt.png", dt_color)
+
+        # --- 3. Projection overlay (cur→ref) --------------------------------
+        if self.ref_rgb_bgr is not None and X_cur is not None and X_cur.shape[0] > 0:
+            T_final = _se3_exp(xi_final)
+            R = T_final[:3, :3]
+            t = T_final[:3, 3]
+            X_ref = (R @ X_cur.T).T + t
+            Z = X_ref[:, 2]
+            ok = Z > 0.05
+            Xo, Yo, Zo = X_ref[ok, 0], X_ref[ok, 1], Z[ok]
+
+            fx_l, fy_l, cx_l, cy_l = self.K_pyr[-1] if self.K_pyr else (self.fx, self.fy, self.cx, self.cy)
+            H_l, W_l = self.ref_rgb_bgr.shape[:2]
+            u_raw = fx_l * Xo / Zo + cx_l
+            v_raw = fy_l * Yo / Zo + cy_l
+
+            # Vectorized point rendering (fast, no for-loops)
+            proj_img = self.ref_rgb_bgr.copy()
+            inside = (u_raw >= 0) & (u_raw < W_l) & (v_raw >= 0) & (v_raw < H_l)
+            u_in = u_raw[inside].cpu().numpy().astype(int)
+            v_in = v_raw[inside].cpu().numpy().astype(int)
+            if len(u_in) > 0:
+                proj_img[v_in, u_in] = [0, 255, 0]  # green: inside FOV
+
+            u_out = u_raw[~inside].cpu().numpy()
+            v_out = v_raw[~inside].cpu().numpy()
+            u_out_c = np.clip(u_out, 0, W_l - 1).astype(int)
+            v_out_c = np.clip(v_out, 0, H_l - 1).astype(int)
+            if len(u_out_c) > 0:
+                proj_img[v_out_c, u_out_c] = [255, 0, 0]  # blue: outside FOV
+
+            cv2.imwrite(f"{prefix}_projection.png", proj_img)
+
+        # --- 4. Diagnostics bar chart (matplotlib, optional) -----------------
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            fig, ax = plt.subplots(figsize=(6, 4))
+            metrics = [
+                ("dt_mean", dt_mean),
+                ("visible", n_vis),
+                ("inside", lm_diag.get("inside_count", 0)),
+                ("near_edge", lm_diag.get("near_edge_count", 0)),
+                ("acc_iters", lm_diag.get("accepted_iters", 0)),
+                ("rej_iters", lm_diag.get("rejected_iters", 0)),
+                ("Δ_t(mm)", info.get("delta_t_from_init", 0) * 1000),
+                ("Δ_r(deg)", info.get("delta_r_deg_from_init", 0)),
+            ]
+            names = [m[0] for m in metrics]
+            values = [m[1] for m in metrics]
+            bars = ax.bar(names, values)
+            ax.bar_label(bars, fmt="%.2f", fontsize=7)
+            ax.set_title(f"FFTEdgeVO Frame {frame_id}  "
+                         f"err {lm_diag.get('initial_error',0):.1f}→{lm_diag.get('final_error',0):.1f}")
+            ax.tick_params(axis="x", rotation=30, labelsize=7)
+            fig.tight_layout()
+            fig.savefig(f"{prefix}_diagnostics.png", dpi=100)
+            plt.close(fig)
+        except Exception:
+            pass  # matplotlib unavailable — skip chart, images 1-3 still saved
+
+        if self.debug:
+            Log(f"[FFTEdgeVO] debug images saved to {prefix}_*.png")
 
 
 # ============================================================================

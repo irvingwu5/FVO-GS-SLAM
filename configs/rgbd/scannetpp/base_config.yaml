@@ -91,6 +91,8 @@ Training:
   rskm_current_frame_interval: 4
   rskm_seed: 42
   rskm_debug_log: false
+  normal_debug_log: false          # 是否输出法线对齐调试统计
+  normal_debug_log_every: 50       # 法线对齐日志输出间隔（iterations）
 
 # ============================================================
 # FFT Edge VO Configuration (dense DT alignment, Edge VO style)
@@ -125,6 +127,11 @@ FFTEdgeVO:
   max_ref_age: 4                   # VO reference 最大帧龄，超过触发强制刷新
 
   debug_log: true
+
+  # Debug visualization (save images to disk for offline inspection)
+  debug_save_images: false         # 是否保存调试图像到磁盘
+  debug_save_dir: "debug_vo"       # 调试图像保存目录
+  debug_save_interval: 10          # 每隔多少帧保存一次
 
   # Candidate Selection (Stage 2: multi-candidate render arbitration)
   candidate_selection_enable: false       # 是否启用多候选初值仲裁
@@ -224,6 +231,7 @@ LoopClosure:
   keyframe_retrieval_min_temporal_gap: 10
   keyframe_retrieval_mutual_nearest: true
   keyframe_retrieval_mutual_top_n: 20
+  allow_same_submap_loops: false           # 允许同子图回环检索（无子图策略时需开启）
 
   # ===== Stage 4: Depth verification =====
   depth_verify:
@@ -247,6 +255,7 @@ LoopClosure:
   # ===== Stage 7: Keyframe PGO safety =====
   keyframe_pgo_odom_info_scale: 10.0
   keyframe_pgo_handoff_info_scale: 5.0
+  keyframe_pgo_debug_log: false           # PGO 详细摘要日志
   keyframe_pgo_safety:
     max_correction_t: 1.00
     max_correction_r_deg: 15.0

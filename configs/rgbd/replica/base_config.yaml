@@ -72,7 +72,7 @@ Training:
   # ===== Learning Rate =====
   lr:
     cam_rot_delta: 0.003           # 位姿旋转 delta 学习率，0.001-0.01
-    cam_trans_delta: 0.001         # 位姿平移 delta 学习率，0.0005-0.005
+    cam_trans_delta: 0.001         # 位姿平移 delta 学习率，0.0005-0.00
 
   # ===== Other Training Parameters =====
   edge_threshold: 4                # 深度边缘阈值，Replica 深度噪声低设 4（TUM: 1.1）
@@ -86,10 +86,12 @@ Training:
   max_init_gaussian_scale: 0.06    # 初始 Gaussian scale 上限 (m)，0.02-0.10
 
   # ===== RSKM (Random Sampling Keyframe Mapping) =====
-  use_rskm: False                  # Replica 子图小不启用 RSKM（参考 0.1cm 配置）
+  use_rskm: true                  # Replica 子图小不启用 RSKM（参考 0.1cm 配置）
   rskm_current_frame_interval: 4   # 每 N 次采样强制使用当前帧（避免遗忘），2-8
   rskm_seed: 42                    # RSKM 随机种子
   rskm_debug_log: false            # 是否输出 RSKM 调试统计
+  normal_debug_log: false          # 是否输出法线对齐调试统计
+  normal_debug_log_every: 50       # 法线对齐日志输出间隔（iterations）
 
 # ============================================================
 # FFT Edge VO Configuration (dense DT alignment, Edge VO style)
@@ -98,7 +100,7 @@ FFTEdgeVO:
   use_fft_edge_vo: true            # 是否启用 FFT Edge VO 提供 tracking 初值
 
   # Refinement control
-  tracking_refine_iters: 120       # Replica: 120（参考 0.1cm 配置），VO 成功后渲染精化迭代数
+  tracking_refine_iters: 80       # Replica: 120（参考 0.1cm 配置），VO 成功后渲染精化迭代数
   tracking_fallback_iters: 100     # Edge VO 失败时的退化跟踪迭代数，60-150
 
   # Pyramid
@@ -136,24 +138,29 @@ FFTEdgeVO:
   # Logging
   debug_log: false                 # 是否输出 FFTEdgeVO 逐帧调试日志
 
+  # Debug visualization (save images to disk for offline inspection)
+  debug_save_images: false         # 是否保存调试图像到磁盘
+  debug_save_dir: "debug_vo"       # 调试图像保存目录
+  debug_save_interval: 10          # 每隔多少帧保存一次
+
   # Candidate Selection (Stage 2): Replica 关闭，VO 足够可靠
-  candidate_selection_enable: false
-  candidate_lambda_depth: 1.0
-  candidate_lambda_coverage: 1.0
-  candidate_min_opacity_ratio: 0.05
+  candidate_selection_enable: true
+  candidate_lambda_depth: 1.0             # 候选评分深度损失权重
+  candidate_lambda_coverage: 1.0          # 候选评分覆盖率惩罚权重
+  candidate_min_opacity_ratio: 0.05       # 候选最低不透明度覆盖率
 
   # VO Render Gate (Stage 3): Replica 关闭
-  vo_render_gate_enable: false
-  vo_max_score_ratio_to_best: 1.25
-  vo_max_score_ratio_to_previous: 1.10
-  vo_min_opacity_ratio: 0.05
-  vo_max_depth_loss:
-  vo_max_color_loss:
+  vo_render_gate_enable: true
+  vo_max_score_ratio_to_best: 1.25        # VO score / best score 上限
+  vo_max_score_ratio_to_previous: 1.10    # VO score / previous score 上限
+  vo_min_opacity_ratio: 0.05              # VO 候选最低不透明度覆盖率
+  vo_max_depth_loss:                      # VO 候选最大深度损失 (null=不限制)
+  vo_max_color_loss:                      # VO 候选最大颜色损失 (null=不限制)
 
   # Submap Cut Quality Gate (Stage 7): Replica 关闭，子图切图由运动阈值触发
   submap_cut_gate_enable: false
-  submap_cut_min_opacity: 0.05
-  submap_cut_max_delay: 3
+  submap_cut_min_opacity: 0.05           # 子图切换最低不透明度覆盖率
+  submap_cut_max_delay: 3                # 最大延迟切图帧数
 
 # ============================================================
 # Backend Mapping Configuration (EAGS-style: Gaussian only)
@@ -241,6 +248,7 @@ LoopClosure:
   keyframe_retrieval_min_temporal_gap: 10  # 最小帧间隔（防止相邻帧自匹配）
   keyframe_retrieval_mutual_nearest: true  # 是否要求互为最近邻
   keyframe_retrieval_mutual_top_n: 20      # 互为最近邻检索的候选池大小
+  allow_same_submap_loops: false           # 允许同子图回环检索（无子图策略时需开启）
 
   # ===== Stage 4: Depth verification =====
   depth_verify:
@@ -264,6 +272,7 @@ LoopClosure:
   # ===== Stage 7: Keyframe PGO safety =====
   keyframe_pgo_odom_info_scale: 120.0    # [Replica] PGO 里程计边信息矩阵缩放（参考 0.1cm: 120.0）
   keyframe_pgo_handoff_info_scale: 5.0   # PGO handoff 边信息矩阵缩放
+  keyframe_pgo_debug_log: false           # PGO 详细摘要日志（开启后每轮输出完整残差/修正统计）
   keyframe_pgo_safety:
     max_correction_t: 1.00               # PGO 最大平移修正 (m)，0.5-2.0
     max_correction_r_deg: 15.0           # PGO 最大旋转修正 (deg)，5-30
@@ -361,10 +370,10 @@ opt_params:
   densify_grad_threshold: 0.0002   # 位置梯度阈值，超此值触发 densify，0.0001-0.001
 
   # ===== Loss Parameters =====
-  lambda_sensor_normal: 0.001      # [Replica] FDN 法向损失权重（参考 0.1cm: 0.001）
+  lambda_sensor_normal: 0.0      # [Replica] FDN 法向损失权重（参考 0.1cm: 0.001）
   lambda_dssim: 0.2                # SSIM 损失权重，0.1-0.3
-  lambda_dist: 0.005               # SA depth variance 损失权重，0.005 用于压实表面消除浮空物
-  use_sa_dist: true                # SA depth variance 进入 mapping loss
+  lambda_dist: 0.005                 # Replica 关闭 dist loss（参考 0.1cm 不使用 SA）
+  use_sa_dist: true               # Replica 关闭 SA dist（参考 0.1cm 不使用 SA）
 
 # ============================================================
 # Model Parameters
@@ -379,9 +388,9 @@ model_params:
 pipeline_params:
   convert_SHs_python: False
   compute_cov3D_python: False
-  depth_ratio: 0.0                 # 0.0=expected depth（SA 模式使用 SA expected depth）
-  use_sa: true                     # SA surfel-aware depth：confidence-weighted 期望深度
-  use_sa_depth: true               # SA expected depth 进入 SLAM loss（完整 SA pipeline）
+  depth_ratio: 0.0                 # Replica: 1.0=median depth，合成深度无噪声用 median 最优
+  use_sa: true                    # Replica 关闭 SA（SA 平滑损害遮挡边界 tracking 精度）
+  use_sa_depth: true              # Replica 关闭 SA depth（参考 0.1cm 不使用 SA）
   depth_eps: 1.0e-6                # 计算期望深度时的安全除数
   debug_sa_depth: false
 
@@ -389,9 +398,9 @@ pipeline_params:
 # Ablation Switches
 # ============================================================
 Ablation:
-  use_submap: True                  # [Replica] 子图切图策略（参考 0.1cm 开启，控制漂移）
-  use_loop_closure: True            # [Replica] 回环检测+子图管理（参考 0.1cm 开启，PGO 由 debug_disable 关闭）
-  use_fdn: True                     # [Replica] FDN 有限差分法向监督（参考 0.1cm 开启）
+  use_submap: False                  # [Replica] 子图切图策略（参考 0.1cm 开启，控制漂移）
+  use_loop_closure: False            # [Replica] 回环检测+子图管理（参考 0.1cm 开启，PGO 由 debug_disable 关闭）
+  use_fdn: False                     # [Replica] FDN 有限差分法向监督（参考 0.1cm 开启）
   use_fft_mask: True                # [Replica] FFT 高低频掩膜指导采样与初始 scale（参考 0.1cm 开启）
-  use_error_mask: True              # [Replica] 渲染误差掩膜指导动态补点（参考 0.1cm 开启）
+  use_error_mask: False              # [Replica] 渲染误差掩膜指导动态补点（参考 0.1cm 开启）
   use_color_refinement: True       # [Replica] 关闭离线颜色精化（参考 0.1cm 关闭）
