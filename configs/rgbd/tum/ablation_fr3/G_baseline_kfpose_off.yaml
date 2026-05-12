@@ -1,0 +1,46 @@
+# Round G: 全开 + optimize_keyframe_pose=false（解耦 A/B confound）
+# 与 A 轮唯一差异：后端不优化关键帧位姿
+inherit_from: "configs/rgbd/tum/base_config.yaml"
+
+Dataset:
+  dataset_path: "/home/wuxiangyu/Desktop/data/2d_gaussian_slam/datasets/tum/rgbd_dataset_freiburg3_long_office_household/"
+  Calibration:
+    fx: 535.4
+    fy: 539.2
+    cx: 320.1
+    cy: 247.6
+    k1: 0.0
+    k2: 0.0
+    p1: 0.0
+    p2: 0.0
+    k3: 0.0
+    distorted: False
+    width: 640
+    height: 480
+    depth_scale: 5000.0
+
+# === 五个模块全开（同 A 轮）===
+Ablation:
+  use_submap: False
+  use_loop_closure: False
+  use_fdn: False
+  use_fft_mask: True
+  use_error_mask: False
+
+VOPrior:
+  type: simple_rgbd_odom
+
+Training:
+  use_rskm: True
+
+opt_params:
+  use_sa_dist: true
+  lambda_dist: 0.005
+  lambda_sensor_normal: 0.0
+
+pipeline_params:
+  use_sa: true
+  use_sa_depth: true
+
+Backend:
+  optimize_keyframe_pose: false    # ← 与 A 轮唯一差异：关闭后端 kf pose 优化

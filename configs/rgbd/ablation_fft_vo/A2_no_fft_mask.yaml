@@ -4,8 +4,8 @@ Results:
   eval_rendering: true
 
 # A2: No FFT mask seeding — all Gaussians get uniform initial scale (no freq-guided scaling)
-FFTEdgeVO:
-  use_fft_edge_vo: true
+VOPrior:
+  type: simple_rgbd_odom
 
 Ablation:
   use_loop_closure: false

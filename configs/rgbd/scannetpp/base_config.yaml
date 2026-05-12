@@ -102,55 +102,18 @@ Training:
   normal_debug_log_every: 50       # 法线对齐日志输出间隔（iterations）
   debug_seed_vis: false             # 是否保存 FFT mask 播种可视化
 
+  # Depth edge filter (keep only geometric edges for FFT mask)
+  use_depth_edge_filter: false      # 开启深度边缘筛选
+  depth_grad_percentile: 80         # 深度梯度百分位阈值
+
 # ============================================================
-# FFT Edge VO Configuration (dense DT alignment, Edge VO style)
+# VOPrior Configuration (tracking initial pose source)
 # ============================================================
-FFTEdgeVO:
-  use_fft_edge_vo: true
-  tracking_refine_iters: 20
-  tracking_fallback_iters: 100
-  num_levels: 3
-  level_scale: 0.5
-  max_iters_coarse: 25
-  max_iters_fine: 15
-  dt_max_dist: 50.0
-  dt_huber_delta: 5.0
-  dt_mean_fail_threshold: 15.0
-  require_visible_ratio: 0.3
-  min_dt_mean: 0.5
-
-  # Point budget & depth gate (Stage 8)
-  max_cur_points: 8000             # 每帧最大采样点数
-  min_cur_points: 300              # 每帧最小有效点数
-  min_depth: 0.1                   # 最小有效深度 (m)
-  max_depth: 8.0                   # 最大有效深度 (m)
-
-  # Depth edge filter (EAGS-style: keep only geometric edges for VO)
-  use_depth_edge_filter: false      # 开启深度边缘筛选（仅保留深度不连续处的 FFT 高频点）
-  depth_grad_percentile: 80        # 深度梯度百分位阈值
-
-  # Sampling (Stage 8)
-  sampling_strategy: "grid"        # 采样策略: "grid" (均匀网格) 或 "random" (固定种子随机)
-  vo_random_seed: 42               # random 采样的随机种子（省略则使用 Experiment.seed）
-
-  # Stage 4: VO reference pose sync with backend
-  ref_pose_sync_trans_th: 0.01    # ref pose 平移同步阈值 (m)
-  ref_pose_sync_rot_deg: 0.5      # ref pose 旋转同步阈值 (deg)
-  max_ref_age: 4                   # VO reference 最大帧龄，超过触发强制刷新
-
-  debug_log: true
-
-  # Debug visualization (save images to disk for offline inspection)
-  debug_save_images: false         # 是否保存调试图像到磁盘
-  debug_save_dir: "debug_vo"       # 调试图像保存目录
-  debug_save_interval: 10          # 每隔多少帧保存一次
-
-  # Multi-condition success gate (Stage 2: prevent over-optimistic success)
-  dt_all_p90_fail_threshold: 20.0  # all-inside DT p90 超此值判定失败
-  max_outside_ratio: 0.25           # 最大 FOV 外点比例
-  min_near_edge_ratio: 0.10         # near_edge/inside 下限（过低=没对齐）
-  max_near_edge_ratio: 0.95         # near_edge/inside 上限（过高=DT退化）
-  min_good_bad_ratio: 2.0           # good/bad 点比值下限（EAGS 风格）
+VOPrior:
+  type: none                       # VO prior type: "none" | "simple_rgbd_odom"
+  debug_log: true                  # 是否输出 VOPrior 调试日志
+  tracking_refine_iters: 40         # VO render-accepted 后精化迭代数
+  tracking_fallback_iters: 120      # VO 失败/未选中时渲染精化迭代数
 
   # Candidate Selection (Stage 2: multi-candidate render arbitration)
   candidate_selection_enable: false       # 是否启用多候选初值仲裁
@@ -170,6 +133,32 @@ FFTEdgeVO:
   submap_cut_gate_enable: false          # 是否启用子图切换质量门控
   submap_cut_min_opacity: 0.05           # 子图切换最低不透明度覆盖率
   submap_cut_max_delay: 3                # 最大延迟切图帧数
+
+# ============================================================
+# Simple-RGBD-Odometry Configuration (external VO prior)
+# ============================================================
+SimpleRGBDOdom:
+  enable: true
+  image_order: rgb
+  max_correspondence_distance: 0.20
+  voxel_size: 0.50
+  max_distance: 5.0
+  max_points_per_voxel: 20
+  depth_factor: 1.0
+  min_range: 0.05
+  max_range: 5.0
+  orb_nfeatures: 1000
+  orb_scale_factor: 1.2
+  orb_nlevels: 8
+  search_radius: 5.0
+  min_valid_keypoints: 80
+  min_inliers: 20
+  min_inlier_ratio: 0.15
+  max_motion_trans: 0.50
+  max_motion_rot_deg: 30.0
+  reset_on_submap_cut: false
+  reset_on_tracking_lost: true
+  debug_log: false
 
 # ============================================================
 # Backend Mapping Configuration (EAGS-style: Gaussian only)

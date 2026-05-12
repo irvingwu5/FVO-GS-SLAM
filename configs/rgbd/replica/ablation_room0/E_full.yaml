@@ -1,0 +1,31 @@
+# Round E: Full — 五模块全开（对应 fr1_desk A 轮）
+inherit_from: "configs/rgbd/replica/base_config.yaml"
+
+Dataset:
+  dataset_path: "/home/wuxiangyu/Desktop/data/2d_gaussian_slam/datasets/replica/room0"
+
+# === 五模块全开 ===
+Ablation:
+  use_fft_mask: True
+  use_submap: False
+  use_loop_closure: False
+  use_fdn: False
+  use_error_mask: False
+
+VOPrior:
+  type: simple_rgbd_odom
+
+Training:
+  use_rskm: True
+
+opt_params:
+  use_sa_dist: true
+  lambda_dist: 0.005
+
+pipeline_params:
+  use_sa: true
+  use_sa_depth: true
+  depth_ratio: 0.0
+
+Backend:
+  optimize_keyframe_pose: true

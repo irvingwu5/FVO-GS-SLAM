@@ -4,8 +4,8 @@ Results:
   eval_rendering: true
 
 # A0: Baseline — FFT Edge VO on, FFT mask seeding on
-FFTEdgeVO:
-  use_fft_edge_vo: true
+VOPrior:
+  type: simple_rgbd_odom
 
 Ablation:
   use_loop_closure: false

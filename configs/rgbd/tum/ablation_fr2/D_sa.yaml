@@ -1,0 +1,46 @@
+# Round D: B + SA only（在 MonoGS baseline 上只加回 SA depth + SA dist）
+inherit_from: "configs/rgbd/tum/base_config.yaml"
+
+Dataset:
+  dataset_path: "/home/wuxiangyu/Desktop/data/2d_gaussian_slam/datasets/tum/rgbd_dataset_freiburg2_xyz/"
+  Calibration:
+    fx: 520.90862
+    fy: 521.007327
+    cx: 325.141442
+    cy: 249.701764
+    k1: 0.2312
+    k2: -0.7849
+    p1: -0.0033
+    p2: -0.0001
+    k3: 0.9172
+    distorted: True
+    width: 640
+    height: 480
+    depth_scale: 5000.0
+
+# === 同 B baseline，仅开 SA depth + SA dist ===
+Ablation:
+  use_submap: False
+  use_loop_closure: False
+  use_fdn: False
+  use_fft_mask: False
+  use_error_mask: False
+
+VOPrior:
+  type: none
+
+Training:
+  use_rskm: False
+
+opt_params:
+  use_sa_dist: true
+  lambda_dist: 0.005
+  lambda_sensor_normal: 0.0
+
+pipeline_params:
+  use_sa: true
+  use_sa_depth: true
+  # depth_ratio 在 use_sa_depth=true 时被忽略
+
+Backend:
+  optimize_keyframe_pose: false

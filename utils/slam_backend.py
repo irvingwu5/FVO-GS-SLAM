@@ -206,8 +206,8 @@ class BackEnd(mp.Process):
             viewpoint.freq_mask = self.fft_filter.generate_frequency_mask(img_bgr)
 
             # ---- 深度边缘过滤：纹理平面上 RGB 高频 ≠ 几何边缘，重新归类 ----
-            evo_cfg = self.config.get("FFTEdgeVO", {})
-            if evo_cfg.get("use_depth_edge_filter", False):
+            train_cfg = self.config.get("Training", {})
+            if train_cfg.get("use_depth_edge_filter", False):
                 depth_np = viewpoint.depth
                 depth_f32 = depth_np.astype(np.float32, copy=False)
                 gx = cv2.Sobel(depth_f32, cv2.CV_32F, 1, 0, ksize=3)
@@ -215,7 +215,7 @@ class BackEnd(mp.Process):
                 grad = np.sqrt(gx ** 2 + gy ** 2)
                 valid = (depth_np > 0.01) & np.isfinite(depth_np)
                 if valid.sum() > 100:
-                    th = np.percentile(grad[valid], evo_cfg.get("depth_grad_percentile", 80))
+                    th = np.percentile(grad[valid], train_cfg.get("depth_grad_percentile", 80))
                     depth_edge = grad > th
                     freq_np = viewpoint.freq_mask.cpu().numpy()
                     # 高频但不在深度边缘 → 降级为低频

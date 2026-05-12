@@ -54,7 +54,7 @@ Training:
   init_gaussian_extent: 30         # 初始化阶段 densify extent 系数，越大越倾向 clone
 
   # ===== Tracking Parameters =====
-  tracking_itr_num: 100            # 每帧 tracking 渲染精化迭代次数（未使用 FFTEdgeVO 时的 fallback）
+  tracking_itr_num: 100            # 每帧 tracking 渲染精化迭代次数
 
   # ===== Mapping Parameters =====
   mapping_itr_num: 150             # 每关键帧 mapping 迭代次数，Replica 收敛快设 150（TUM: 180）
@@ -92,6 +92,10 @@ Training:
   min_init_gaussian_scale: 0.002   # 初始 Gaussian scale 下限 (m)，0.001-0.005
   max_init_gaussian_scale: 0.06    # 初始 Gaussian scale 上限 (m)，0.02-0.10
 
+  # Depth edge filter (keep only geometric edges for FFT mask)
+  use_depth_edge_filter: true       # 开启深度边缘筛选
+  depth_grad_percentile: 80         # 深度梯度百分位阈值
+
   # ===== RSKM (Random Sampling Keyframe Mapping) =====
   use_rskm: false                 # C1: 关闭 RSKM 排查（注释原说"子图小不启用"）
   rskm_current_frame_interval: 4   # 每 N 次采样强制使用当前帧（避免遗忘），2-8
@@ -102,84 +106,58 @@ Training:
   debug_seed_vis: true             # 是否保存 FFT mask 播种可视化
 
 # ============================================================
-# FFT Edge VO Configuration (dense DT alignment, Edge VO style)
+# VOPrior Configuration (tracking initial pose source)
 # ============================================================
-FFTEdgeVO:
-  use_fft_edge_vo: false            # 是否启用 FFT Edge VO 提供 tracking 初值
+VOPrior:
+  type: none                       # VO prior type: "none" | "simple_rgbd_odom"
+  debug_log: true                  # 是否输出 VOPrior 调试日志
+  tracking_refine_iters: 40         # VO render-accepted 后精化迭代数
+  tracking_fallback_iters: 120      # VO 失败/未选中时渲染精化迭代数
 
-  # Refinement control
-  tracking_refine_iters: 100       # Replica: 120（参考 0.1cm 配置），VO 成功后渲染精化迭代数
-  tracking_fallback_iters: 100     # Edge VO 失败时的退化跟踪迭代数，60-150
-
-  # Pyramid
-  num_levels: 3                    # 金字塔层数，2-4
-  level_scale: 0.5                 # 金字塔逐层缩放因子，0.4-0.6
-
-  # Optimisation
-  max_iters_coarse: 25             # 粗层最大 LM 迭代次数，10-50
-  max_iters_fine: 15               # 精层最大 LM 迭代次数，5-30
-
-  # Distance transform
-  dt_max_dist: 50.0                # DT 最大截断距离 (pixels)，20-100
-  dt_huber_delta: 5.0              # DT 残差的 Huber delta (pixels)，2-15
-
-  # Quality
-  dt_mean_fail_threshold: 15.0     # dt_mean 超过此值视为跟踪失败，8-30
-  require_visible_ratio: 0.3       # 最少可见点比率，低于此值视为失败，0.2-0.5
-  min_dt_mean: 0.5                 # Replica: 0.5（参考 0.1cm），最低 dt_mean 阈值，0.3-2.0
-
-  # Point budget & depth gate (Stage 8)
-  max_cur_points: 8000             # 每帧最大采样点数
-  min_cur_points: 300              # 每帧最小有效点数
-  min_depth: 0.1                   # 最小有效深度 (m)
-  max_depth: 8.0                   # 最大有效深度 (m)
-
-  # Depth edge filter (EAGS-style: keep only geometric edges for VO)
-  use_depth_edge_filter: true      # 开启深度边缘筛选（仅保留深度不连续处的 FFT 高频点）
-  depth_grad_percentile: 80        # 深度梯度百分位阈值
-
-  # Sampling (Stage 8)
-  sampling_strategy: "grid"        # 采样策略: "grid" (均匀网格) 或 "random" (固定种子随机)
-  vo_random_seed: 42               # random 采样的随机种子（省略则使用 Experiment.seed）
-
-  # Stage 4: VO reference pose sync with backend
-  ref_pose_sync_trans_th: 0.01    # ref pose 平移同步阈值 (m)
-  ref_pose_sync_rot_deg: 0.5      # ref pose 旋转同步阈值 (deg)
-  max_ref_age: 4                   # VO reference 最大帧龄，超过触发强制刷新
-
-  # Logging
-  debug_log: false                 # 是否输出 FFTEdgeVO 逐帧调试日志
-
-  # Debug visualization (save images to disk for offline inspection)
-  debug_save_images: false         # 是否保存调试图像到磁盘
-  debug_save_dir: "debug_vo"       # 调试图像保存目录
-  debug_save_interval: 10          # 每隔多少帧保存一次
-
-  # Multi-condition success gate (Stage 2: prevent over-optimistic success)
-  dt_all_p90_fail_threshold: 20.0  # all-inside DT p90 超此值判定失败
-  max_outside_ratio: 0.25           # 最大 FOV 外点比例
-  min_near_edge_ratio: 0.10         # near_edge/inside 下限（过低=没对齐）
-  max_near_edge_ratio: 0.95         # near_edge/inside 上限（过高=DT退化）
-  min_good_bad_ratio: 2.0           # good/bad 点比值下限（EAGS 风格）
-
-  # Candidate Selection (Stage 2): Replica 关闭，VO 足够可靠
-  candidate_selection_enable: true
+  # Candidate Selection (Stage 2: multi-candidate render arbitration)
+  candidate_selection_enable: true        # 是否启用多候选初值仲裁
   candidate_lambda_depth: 1.0             # 候选评分深度损失权重
   candidate_lambda_coverage: 1.0          # 候选评分覆盖率惩罚权重
   candidate_min_opacity_ratio: 0.05       # 候选最低不透明度覆盖率
 
-  # VO Render Gate (Stage 3): Replica 关闭
-  vo_render_gate_enable: true
+  # VO Render Gate (Stage 3: render-based VO acceptance)
+  vo_render_gate_enable: true             # 是否启用 VO render 二次验证
   vo_max_score_ratio_to_best: 1.25        # VO score / best score 上限
   vo_max_score_ratio_to_previous: 1.10    # VO score / previous score 上限
   vo_min_opacity_ratio: 0.05              # VO 候选最低不透明度覆盖率
   vo_max_depth_loss:                      # VO 候选最大深度损失 (null=不限制)
   vo_max_color_loss:                      # VO 候选最大颜色损失 (null=不限制)
 
-  # Submap Cut Quality Gate (Stage 7): Replica 关闭，子图切图由运动阈值触发
-  submap_cut_gate_enable: false
+  # Submap Cut Quality Gate (Stage 7)
+  submap_cut_gate_enable: false          # 是否启用子图切换质量门控
   submap_cut_min_opacity: 0.05           # 子图切换最低不透明度覆盖率
   submap_cut_max_delay: 3                # 最大延迟切图帧数
+
+# ============================================================
+# Simple-RGBD-Odometry Configuration (external VO prior)
+# ============================================================
+SimpleRGBDOdom:
+  enable: true
+  image_order: rgb
+  max_correspondence_distance: 0.20
+  voxel_size: 0.50
+  max_distance: 5.0
+  max_points_per_voxel: 20
+  depth_factor: 1.0
+  min_range: 0.05
+  max_range: 5.0
+  orb_nfeatures: 1000
+  orb_scale_factor: 1.2
+  orb_nlevels: 8
+  search_radius: 5.0
+  min_valid_keypoints: 80
+  min_inliers: 20
+  min_inlier_ratio: 0.15
+  max_motion_trans: 0.50
+  max_motion_rot_deg: 30.0
+  reset_on_submap_cut: false
+  reset_on_tracking_lost: true
+  debug_log: false
 
 # ============================================================
 # Backend Mapping Configuration (EAGS-style: Gaussian only)

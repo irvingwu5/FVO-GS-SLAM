@@ -16,3 +16,49 @@ Dataset:
     width: 640
     height: 480
     depth_scale: 5000.0
+
+#Training:
+#  normal_debug_log: true          # 是否输出法线对齐调试统计
+#  normal_debug_log_every: 50       # 法线对齐日志输出间隔（iterations）
+#  use_rskm: True
+#
+#Ablation:
+#  use_fdn: False
+#
+#VOPrior:
+#  type: none             # 是否启用 FFT Edge VO 提供 tracking 初值
+#
+#  # Refinement control
+#  tracking_refine_iters: 100        # VO render-accepted 后精化迭代数（最优平衡），20-60
+#  tracking_fallback_iters: 120     # VO 失败/未选中时渲染精化迭代数，原100
+#
+#opt_params:
+#  lambda_dist: 0.0                 # 深度失真损失权重，0=关闭，0.01-0.1 用于压实表面消除浮空物。use_sa=true时语义为SA depth variance
+#  use_sa_dist: false               # use_sa=true时是否将SA depth variance加入loss。false=仅SA depth track，true=SA dist也进loss
+#
+#pipeline_params:
+#  convert_SHs_python: False
+#  compute_cov3D_python: False
+#  depth_ratio: 1.0              # 1.0=median depth (bounded scene), 0=expected depth # bounded scene 用 1，unbounded scene 用 0 减少混叠
+#  use_sa: false                  # SA surfel-aware depth相关参数，改变的是"渲染器算出什么深度"
+#  use_sa_depth: false            # SA surfel-aware depth相关参数，Python 渲染层（深度选择策略）use_sa_depth 改变的是"SLAM loss 用哪个深度"
+#  depth_eps: 1.0e-6             # SA surfel-aware depth相关参数,计算期望深度时的安全除数
+#  debug_sa_depth: false
+
+# ===== A1 Ablation: 全部五个模块关闭 =====
+Training:
+  use_rskm: false
+
+VOPrior:
+  type: none
+
+Ablation:
+  use_fft_mask: false
+
+pipeline_params:
+  use_sa: false
+  use_sa_depth: false
+
+opt_params:
+  use_sa_dist: false
+  lambda_dist: 0.0
