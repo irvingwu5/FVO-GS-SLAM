@@ -104,6 +104,10 @@ class FFTEdgeVO:
         self.min_depth = float(cfg.get("min_depth", 0.1))
         self.max_depth = float(cfg.get("max_depth", 8.0))
 
+        # ---- depth edge filter (EAGS-style geometric edge constraint) ------
+        self.use_depth_edge_filter = cfg.get("use_depth_edge_filter", False)
+        self.depth_grad_percentile = int(cfg.get("depth_grad_percentile", 80))
+
         # ---- sampling (Stage 8) ----------------------------------------------
         self.sampling_strategy = cfg.get("sampling_strategy", "grid")
         self.vo_random_seed = int(cfg.get("vo_random_seed",
@@ -118,6 +122,7 @@ class FFTEdgeVO:
         self.max_outside_ratio = float(cfg.get("max_outside_ratio", 0.25))
         self.min_near_edge_ratio = float(cfg.get("min_near_edge_ratio", 0.10))
         self.max_near_edge_ratio = float(cfg.get("max_near_edge_ratio", 0.95))
+        self.min_good_bad_ratio = float(cfg.get("min_good_bad_ratio", 2.0))
 
         # ---- FFT filter (lazy) ----------------------------------------------
         self.fft_filter = None
@@ -301,6 +306,22 @@ class FFTEdgeVO:
         if len(ys) == 0:
             return torch.zeros((0, 3), device="cuda", dtype=torch.float32)
 
+        # Depth edge filter (EAGS-style: keep only geometric edges)
+        if self.use_depth_edge_filter:
+            depth_f32 = depth_np.astype(np.float32, copy=False)
+            depth_grad_x = cv2.Sobel(depth_f32, cv2.CV_32F, 1, 0, ksize=3)
+            depth_grad_y = cv2.Sobel(depth_f32, cv2.CV_32F, 0, 1, ksize=3)
+            depth_grad = np.sqrt(depth_grad_x ** 2 + depth_grad_y ** 2)
+            valid_depth_mask = (depth_np > self.min_depth) & (depth_np < self.max_depth)
+            if valid_depth_mask.sum() > 100:
+                grad_th = np.percentile(depth_grad[valid_depth_mask], self.depth_grad_percentile)
+                depth_edge = depth_grad > grad_th
+                edge_ok = depth_edge[ys, xs]
+                ys, xs = ys[edge_ok], xs[edge_ok]
+
+        if len(ys) == 0:
+            return torch.zeros((0, 3), device="cuda", dtype=torch.float32)
+
         # Subsampling
         target = min(len(ys), self.max_cur_pts)
         if len(ys) > target:
@@ -404,73 +425,32 @@ class FFTEdgeVO:
         T_rc_opt = _se3_exp(xi).detach().cpu().numpy().astype(np.float64)
         c2w = np.linalg.inv(self.T_wr) @ T_rc_opt  # T_world_cur = T_world_ref @ T_ref_cur
 
-        # ---- 5.  All-inside DT diagnostics (evaluate at finest level) --------
-        fx_f, fy_f, cx_f, cy_f = self.K_pyr[-1]
-        struct_f = self.opt_struct_pyr[-1]
-
-        # Evaluate at final xi with full debug (use torch tensor, not numpy)
-        T_rc_opt_t = _se3_exp(xi)
-        _, _, _, _, _, _, dbg_final = self._evaluate_residuals(
-            T_rc_opt_t, X_cur, struct_f, fx_f, fy_f, cx_f, cy_f,
-            return_debug=True,
-        )
-
-        # Evaluate at init xi for before/after comparison
-        T_rc_init_eval = _se3_exp(xi_init_for_diag)
-        _, _, _, _, _, _, dbg_init = self._evaluate_residuals(
-            T_rc_init_eval, X_cur, struct_f, fx_f, fy_f, cx_f, cy_f,
-            return_debug=True,
-        )
-
-        # Aggregate diagnostics
-        if dbg_final is not None:
-            dt_all_mean = dbg_final["dt_all_mean"]
-            dt_all_p90  = dbg_final["dt_all_p90"]
-            dt_all_p95  = dbg_final["dt_all_p95"]
-            outside_count = dbg_final["outside_count"]
-            outside_ratio = outside_count / max(1, X_cur.shape[0])
-            near_edge_ratio = (dbg_final.get("near_edge_count", 0)
-                               / max(1, lm_diag_agg["inside_count"]))
-            mask_density = mask.sum().item() / (self.H * self.W)
-            ref_mask_density = (self.ref_count / (self.H * self.W)
-                                if self.ref_count > 0 else 0.0)
-            # Merge debug stats into lm_diag_agg
-            lm_diag_agg["dt_all_mean"] = dt_all_mean
-            lm_diag_agg["dt_all_p90"] = dt_all_p90
-            lm_diag_agg["dt_all_p95"] = dt_all_p95
-            lm_diag_agg["outside_ratio"] = outside_ratio
-            lm_diag_agg["near_edge_ratio"] = near_edge_ratio
-            lm_diag_agg["mask_density"] = mask_density
-            lm_diag_agg["ref_mask_density"] = ref_mask_density
-        else:
-            dt_all_mean = float("inf")
-            dt_all_p90  = float("inf")
-            dt_all_p95  = float("inf")
-            outside_ratio = 1.0
-            near_edge_ratio = 0.0
-            mask_density = 0.0
-            ref_mask_density = 0.0
-
-        # ---- 6.  Quality (multi-condition success gate) --------------------
+        # ---- 5.  Quality ---------------------------------------------------
         visible_ratio = n_vis / max(1, X_cur.shape[0])
         min_visible = max(self.min_cur_pts, X_cur.shape[0] * self.require_visible_ratio)
         final_error = lm_diag_agg["final_error"]
         error_ok = (final_error < float("inf")
                     and final_error < self.dt_mean_fail * self.dt_mean_fail)
 
-        # New multi-condition check
-        p90_ok = (dt_all_p90 < self.dt_all_p90_fail)
-        outside_ok = (outside_ratio < self.max_outside_ratio)
-        ne_ratio_ok = (self.min_near_edge_ratio < near_edge_ratio < self.max_near_edge_ratio)
+        # Compute simple diagnostics from LM data (no extra eval overhead)
+        inside_count = lm_diag_agg["inside_count"]
+        near_edge_count = lm_diag_agg["near_edge_count"]
+        outside_ratio = (X_cur.shape[0] - inside_count) / max(1, X_cur.shape[0])
+        near_edge_ratio = near_edge_count / max(1, inside_count)
+        mask_density = mask.sum().item() / (self.H * self.W)
+        ref_mask_density = (self.ref_count / (self.H * self.W)
+                            if self.ref_count > 0 else 0.0)
+
+        # EAGS-style good/bad ratio: bad_pts = outside FOV + inside but far from edge
+        bad_pts = (X_cur.shape[0] - inside_count) + (inside_count - near_edge_count)
+        good_bad_ratio = n_vis / max(1, bad_pts)
 
         success = (dt_mean < self.dt_mean_fail
                    and n_vis >= min_visible
                    and error_ok
-                   and p90_ok
-                   and outside_ok
-                   and ne_ratio_ok)
+                   and good_bad_ratio >= self.min_good_bad_ratio)
 
-        # ---- 7.  Delta from init --------------------------------------------
+        # ---- 6.  Delta from init --------------------------------------------
         T_rc_init_for_diag = _se3_exp(xi_init_for_diag).detach().cpu().numpy().astype(np.float64)
         delta_T = np.linalg.inv(T_rc_init_for_diag) @ T_rc_opt
         delta_t = float(np.linalg.norm(delta_T[:3, 3]))
@@ -486,12 +466,8 @@ class FFTEdgeVO:
             reject_reasons.append("low_visible")
         if not error_ok:
             reject_reasons.append("high_error")
-        if not p90_ok:
-            reject_reasons.append("dt_all_p90_high")
-        if not outside_ok:
-            reject_reasons.append("too_many_outside")
-        if not ne_ratio_ok:
-            reject_reasons.append("near_edge_ratio_out_of_range")
+        if good_bad_ratio < self.min_good_bad_ratio:
+            reject_reasons.append("good_bad_ratio_low")
 
         info = {
             "dt_mean": float(dt_mean) if not np.isinf(dt_mean) else float("inf"),
@@ -503,41 +479,52 @@ class FFTEdgeVO:
             "n_mask_points": int(mask.sum().item()),
             "n_sampled_points": int(X_cur.shape[0]),
             "sampling": self.sampling_strategy,
-            # Previous diagnostics
             "initial_error": lm_diag_agg["initial_error"],
             "final_error": lm_diag_agg["final_error"],
             "accepted_iters": lm_diag_agg["accepted_iters"],
             "rejected_iters": lm_diag_agg["rejected_iters"],
-            "inside_count": lm_diag_agg["inside_count"],
-            "near_edge_count": lm_diag_agg["near_edge_count"],
+            "inside_count": inside_count,
+            "near_edge_count": near_edge_count,
             "delta_t_from_init": delta_t,
             "delta_r_deg_from_init": delta_r_deg,
-            # New all-inside diagnostics
-            "dt_all_mean": dt_all_mean,
-            "dt_all_p90": dt_all_p90,
-            "dt_all_p95": dt_all_p95,
             "outside_ratio": outside_ratio,
             "near_edge_ratio": near_edge_ratio,
+            "good_bad_ratio": good_bad_ratio,
+            "bad_pts": bad_pts,
             "mask_density": mask_density,
             "ref_mask_density": ref_mask_density,
             "reject_reason": " + ".join(reject_reasons) if reject_reasons else None,
         }
 
         if self.debug:
-            Log(f"[FFTEdgeVO] track: dt_mean={dt_mean:.2f}px (all p90={dt_all_p90:.1f}) "
+            Log(f"[FFTEdgeVO] track: dt_mean={dt_mean:.2f}px "
+                f"good/bad={good_bad_ratio:.1f} "
                 f"visible={n_vis}/{X_cur.shape[0]} "
-                f"inside={lm_diag_agg['inside_count']} ne_ratio={near_edge_ratio:.2f} "
+                f"inside={inside_count} ne_ratio={near_edge_ratio:.2f} "
                 f"outside_r={outside_ratio:.2f} "
                 f"err={lm_diag_agg['initial_error']:.2f}→{final_error:.2f} "
                 f"acc={lm_diag_agg['accepted_iters']}/{lm_diag_agg['rejected_iters']} "
                 f"Δ_t={delta_t:.4f}m Δ_r={delta_r_deg:.2f}° "
                 f"success={success}")
 
-        # ---- Debug visualization -------------------------------------------
+        # ---- Debug visualization (expensive: only when enabled) ------------
         if self.debug_save_images:
             self._debug_frame_count += 1
             if self._debug_frame_count == 1 or self._debug_frame_count % self.debug_save_interval == 0:
                 try:
+                    # Collect debug eval data on demand (expensive!)
+                    fx_f, fy_f, cx_f, cy_f = self.K_pyr[-1]
+                    struct_f = self.opt_struct_pyr[-1]
+                    T_rc_t = _se3_exp(xi)
+                    _, _, _, _, _, _, dbg_final = self._evaluate_residuals(
+                        T_rc_t, X_cur, struct_f, fx_f, fy_f, cx_f, cy_f,
+                        return_debug=True,
+                    )
+                    T_rc_init_t = _se3_exp(xi_init_for_diag)
+                    _, _, _, _, _, _, dbg_init = self._evaluate_residuals(
+                        T_rc_init_t, X_cur, struct_f, fx_f, fy_f, cx_f, cy_f,
+                        return_debug=True,
+                    )
                     self._save_debug_visualization(
                         image_bgr, mask, X_cur, xi_init_for_diag, xi,
                         dt_mean, n_vis, lm_diag_agg, info,

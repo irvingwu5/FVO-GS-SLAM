@@ -205,6 +205,28 @@ class BackEnd(mp.Process):
             img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
             viewpoint.freq_mask = self.fft_filter.generate_frequency_mask(img_bgr)
 
+            # ---- 深度边缘过滤：纹理平面上 RGB 高频 ≠ 几何边缘，重新归类 ----
+            evo_cfg = self.config.get("FFTEdgeVO", {})
+            if evo_cfg.get("use_depth_edge_filter", False):
+                depth_np = viewpoint.depth
+                depth_f32 = depth_np.astype(np.float32, copy=False)
+                gx = cv2.Sobel(depth_f32, cv2.CV_32F, 1, 0, ksize=3)
+                gy = cv2.Sobel(depth_f32, cv2.CV_32F, 0, 1, ksize=3)
+                grad = np.sqrt(gx ** 2 + gy ** 2)
+                valid = (depth_np > 0.01) & np.isfinite(depth_np)
+                if valid.sum() > 100:
+                    th = np.percentile(grad[valid], evo_cfg.get("depth_grad_percentile", 80))
+                    depth_edge = grad > th
+                    freq_np = viewpoint.freq_mask.cpu().numpy()
+                    # 高频但不在深度边缘 → 降级为低频
+                    demoted = freq_np & valid & (~depth_edge)
+                    freq_np[demoted] = False
+                    viewpoint.freq_mask = torch.from_numpy(freq_np).cuda()
+
+            # ---- 可视化 FFT mask 播种区域 ----
+            if self.config.get("Training", {}).get("debug_seed_vis", False):
+                self._save_seed_vis(viewpoint, img_bgr, frame_idx)
+
         # ---- Error 掩膜：基于当前地图渲染的空洞 + 深度穿透检测 ----
         use_error_mask = self.config.get("Ablation", {}).get("use_error_mask", True)
         if (not init) and use_error_mask and len(self.gaussians._xyz) > 0:
@@ -239,6 +261,35 @@ class BackEnd(mp.Process):
         self.gaussians.extend_from_pcd_seq(
             viewpoint, kf_id=frame_idx, init=init, scale=scale, depthmap=depth_map
         )
+
+    def _save_seed_vis(self, viewpoint, img_bgr, frame_idx):
+        """保存 FFT mask 播种可视化：高/低频区域 + 深度有效性叠加图。"""
+        import os as _os
+        save_dir = self.config["Results"]["save_dir"]
+        _os.makedirs(save_dir, exist_ok=True)
+
+        freq_np = viewpoint.freq_mask.detach().cpu().numpy()
+        depth_np = viewpoint.depth
+        depth_valid = (depth_np > 0.01) & np.isfinite(depth_np)
+
+        # 背景：RGB 图
+        vis = img_bgr.copy()
+        # 绿色 = 高频 + 有效深度（小尺度 Gaussians）
+        hf = freq_np & depth_valid
+        vis[hf] = [0, 255, 0]
+        # 蓝色 = 低频 + 有效深度（大尺度 Gaussians）
+        lf = (~freq_np) & depth_valid
+        vis[lf] = [255, 0, 0]
+        # 红色 = 无效深度（不播种）
+        no_d = ~depth_valid
+        vis[no_d] = [0, 0, 255]
+
+        # 半透明叠加
+        blended = cv2.addWeighted(img_bgr, 0.5, vis, 0.5, 0)
+        path = _os.path.join(save_dir, f"seed_vis_kf{frame_idx:04d}.png")
+        cv2.imwrite(path, blended)
+
+        Log(f"[SeedVis] 高频区点数={hf.sum()} 低频区点数={lf.sum()} 无效深度={no_d.sum()}  → {path}")
 
     def initialize_map(self, cur_frame_idx, viewpoint, iters=None):
         if iters is None:

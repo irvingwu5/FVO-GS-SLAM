@@ -93,12 +93,13 @@ Training:
   max_init_gaussian_scale: 0.06    # 初始 Gaussian scale 上限 (m)，0.02-0.10
 
   # ===== RSKM (Random Sampling Keyframe Mapping) =====
-  use_rskm: true                  # Replica 子图小不启用 RSKM（参考 0.1cm 配置）
+  use_rskm: false                 # C1: 关闭 RSKM 排查（注释原说"子图小不启用"）
   rskm_current_frame_interval: 4   # 每 N 次采样强制使用当前帧（避免遗忘），2-8
   rskm_seed: 42                    # RSKM 随机种子（省略则使用 Experiment.seed）
   rskm_debug_log: false            # 是否输出 RSKM 调试统计
   normal_debug_log: false          # 是否输出法线对齐调试统计
   normal_debug_log_every: 50       # 法线对齐日志输出间隔（iterations）
+  debug_seed_vis: true             # 是否保存 FFT mask 播种可视化
 
 # ============================================================
 # FFT Edge VO Configuration (dense DT alignment, Edge VO style)
@@ -133,6 +134,10 @@ FFTEdgeVO:
   min_depth: 0.1                   # 最小有效深度 (m)
   max_depth: 8.0                   # 最大有效深度 (m)
 
+  # Depth edge filter (EAGS-style: keep only geometric edges for VO)
+  use_depth_edge_filter: true      # 开启深度边缘筛选（仅保留深度不连续处的 FFT 高频点）
+  depth_grad_percentile: 80        # 深度梯度百分位阈值
+
   # Sampling (Stage 8)
   sampling_strategy: "grid"        # 采样策略: "grid" (均匀网格) 或 "random" (固定种子随机)
   vo_random_seed: 42               # random 采样的随机种子（省略则使用 Experiment.seed）
@@ -155,6 +160,7 @@ FFTEdgeVO:
   max_outside_ratio: 0.25           # 最大 FOV 外点比例
   min_near_edge_ratio: 0.10         # near_edge/inside 下限（过低=没对齐）
   max_near_edge_ratio: 0.95         # near_edge/inside 上限（过高=DT退化）
+  min_good_bad_ratio: 2.0           # good/bad 点比值下限（EAGS 风格）
 
   # Candidate Selection (Stage 2): Replica 关闭，VO 足够可靠
   candidate_selection_enable: true
