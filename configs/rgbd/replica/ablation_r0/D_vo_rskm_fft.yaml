@@ -1,27 +1,29 @@
-# Round A: Replica baseline — 仅 FFT mask ON（当前默认"好"配置）
+# Round D: C + FFT mask + freq_sampling_density — 频域尺度控制 + 频率感知采样密度
 inherit_from: "configs/rgbd/replica/base_config.yaml"
 
 Dataset:
   dataset_path: "/home/wuxiangyu/Desktop/data/2d_gaussian_slam/datasets/replica/room0"
 
-# === base_config 默认：FFT mask ON, others OFF, kf_pose=true ===
-# 无需额外覆盖，显式列出以保持与 B-F 轮一致
 Ablation:
   use_fft_mask: True
   use_submap: False
   use_loop_closure: False
   use_fdn: False
   use_error_mask: False
+  use_color_refinement: True
 
 VOPrior:
-  type: none
+  type: simple_rgbd_odom
+  tracking_refine_iters: 60
 
 Training:
-  use_rskm: False
+  use_rskm: True
+  use_freq_sampling_density: true
+  use_rgb_error_mask: false
 
 opt_params:
   use_sa_dist: false
-  lambda_dist: 0.005
+  lambda_dist: 0.0
 
 pipeline_params:
   use_sa: false

@@ -89,12 +89,22 @@ Training:
   spherical_harmonics: False
   #近景幕布gs+雾片挡相机，限制gs尺寸
   alpha: 0.9
-  low_freq_scale_multiplier: 2.0
-  min_init_gaussian_scale: 0.002
-  max_init_gaussian_scale: 0.06
+  low_freq_scale_multiplier: 2.0    # 低频区域初始 Gaussian scale 乘数，1.0-3.0（FGS-SLAM: 2.0）
+  min_init_gaussian_scale: 0.002   # 初始 Gaussian scale 下限 (m)
+  max_init_gaussian_scale: 0.06    # 初始 Gaussian scale 上限 (m)
+
+  # FGS-style mask seeding
+  use_freq_sampling_density: true   # 是否启用频率感知采样密度（高频密/低频疏）
+  high_freq_sample_stride: 2        # 高频区域采样步长（1=全采样）
+  low_freq_sample_stride: 4         # 低频区域采样步长
+  depth_error_median_factor: 10.0   # 深度穿透误差阈值乘数（FGS-SLAM: 10）
+  error_mask_opacity_th: 0.98       # alpha 空洞检测阈值（FGS-SLAM: 0.98）
+  use_rgb_error_mask: false         # 是否启用 RGB 表达误差掩膜
+  rgb_error_th: 0.5                 # RGB 误差阈值（0-1 空间）
+  max_new_gaussians_per_keyframe: 30000  # 每关键帧新增高斯数量上限
 
   # ===== RSKM (Random Sampling Keyframe Mapping) =====
-  use_rskm: false
+  use_rskm: true
   rskm_current_frame_interval: 4
   rskm_seed: 42                    # RSKM 随机种子（省略则使用 Experiment.seed）
   rskm_debug_log: false
@@ -110,7 +120,7 @@ Training:
 # VOPrior Configuration (tracking initial pose source)
 # ============================================================
 VOPrior:
-  type: none                       # VO prior type: "none" | "simple_rgbd_odom"
+  type: simple_rgbd_odom           # VO prior type: "none" | "simple_rgbd_odom"
   debug_log: true                  # 是否输出 VOPrior 调试日志
   tracking_refine_iters: 40         # VO render-accepted 后精化迭代数
   tracking_fallback_iters: 120      # VO 失败/未选中时渲染精化迭代数
@@ -339,8 +349,8 @@ opt_params:
   # ===== Loss Parameters =====
   lambda_sensor_normal: 0.001 #
   lambda_dssim: 0.2
-  lambda_dist: 0.0                 # 深度失真损失权重，0=关闭，0.01-0.1 用于压实表面消除浮空物。use_sa=true时语义为SA depth variance
-  use_sa_dist: false               # use_sa=true时是否将SA depth variance加入loss。false=仅SA depth track，true=SA dist也进loss
+  lambda_dist: 0.005                 # 深度失真损失权重，use_sa=true时语义为SA depth variance
+  use_sa_dist: true                # use_sa=true时是否将SA depth variance加入loss
 
 # ============================================================
 # Model Parameters
@@ -357,7 +367,7 @@ pipeline_params:
   compute_cov3D_python: False
   depth_ratio: 1.0
   use_sa: false
-  use_sa_depth: false
+  use_sa_depth: true
   depth_eps: 1.0e-6
   debug_sa_depth: false
   # psedo surface attributes
@@ -369,9 +379,9 @@ pipeline_params:
 # Ablation Switches
 # ============================================================
 Ablation:
-  use_submap: True           # (2) 是否开启子图切图策略 (关闭时退化为全局单地图)
-  use_loop_closure: True     # (3)&(4) 是否开启回环检测与全局 PGO 修正
-  use_fdn: True              # (5) 是否开启有限差分法线监督及相关 Loss 衰减
-  use_fft_mask: True         # (6) 是否开启 FFT 高低频掩膜指导采样与初始尺度设定
-  use_error_mask: True       # (6) 是否开启渲染误差掩膜指导动态补点
-  use_color_refinement: True   # (8) 是否开启颜色优化（如果开启，则在每次优化迭代中同时优化颜色相关参数；如果关闭，则只优化几何相关参数，颜色参数保持不变）
+  use_submap: False                 # 子图切图策略 (关闭 → 全局单地图)
+  use_loop_closure: False           # 回环检测 + PGO 修正
+  use_fdn: False                    # FDN 有限差分法向监督
+  use_fft_mask: True               # FFT 高低频掩膜指导采样与初始 scale
+  use_error_mask: True              # 渲染误差掩膜指导动态补点
+  use_color_refinement: True       # final merge 后离线颜色精化

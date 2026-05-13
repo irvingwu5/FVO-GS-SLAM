@@ -1,0 +1,31 @@
+# Round F: E + SA depth — SA expected depth 进入 loss (fr2_xyz)
+inherit_from: "configs/rgbd/tum/fr2_xyz.yaml"
+
+Ablation:
+  use_fft_mask: True
+  use_submap: False
+  use_loop_closure: False
+  use_fdn: False
+  use_error_mask: True
+  use_color_refinement: True
+
+VOPrior:
+  type: simple_rgbd_odom
+  tracking_refine_iters: 60
+
+Training:
+  use_rskm: True
+  use_freq_sampling_density: true
+  use_rgb_error_mask: true
+
+opt_params:
+  use_sa_dist: false
+  lambda_dist: 0.0
+
+pipeline_params:
+  use_sa: true
+  use_sa_depth: true
+  depth_ratio: 0.0
+
+Backend:
+  optimize_keyframe_pose: true

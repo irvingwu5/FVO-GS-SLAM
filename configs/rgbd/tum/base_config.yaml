@@ -74,9 +74,19 @@ Training:
   prune_mode: 'slam'               # prune 模式: 'slam'（基于 covisibility）/ 'odometry'
   single_thread: False             # True=前端后端在同一进程运行
   spherical_harmonics: False       # True=启用高阶 SH（需 sh_degree>0）
-  low_freq_scale_multiplier: 1.05   # 低频区域初始 Gaussian scale 乘数，1.0-3.0
+  low_freq_scale_multiplier: 2.0    # 低频区域初始 Gaussian scale 乘数，1.0-3.0（FGS-SLAM: 2.0）
   min_init_gaussian_scale: 0.002   # 初始 Gaussian scale 下限 (m)，0.001-0.005
   max_init_gaussian_scale: 0.06    # 初始 Gaussian scale 上限 (m)，0.02-0.10
+
+  # FGS-style mask seeding
+  use_freq_sampling_density: true   # 是否启用频率感知采样密度（高频密/低频疏）
+  high_freq_sample_stride: 2        # 高频区域采样步长（1=全采样）
+  low_freq_sample_stride: 4         # 低频区域采样步长
+  depth_error_median_factor: 10.0   # 深度穿透误差阈值乘数（FGS-SLAM: 10）
+  error_mask_opacity_th: 0.98       # alpha 空洞检测阈值（FGS-SLAM: 0.98）
+  use_rgb_error_mask: false         # 是否启用 RGB 表达误差掩膜
+  rgb_error_th: 0.5                 # RGB 误差阈值（0-1 空间）
+  max_new_gaussians_per_keyframe: 30000  # 每关键帧新增高斯数量上限
 
   # Depth edge filter (keep only geometric edges for FFT mask)
   use_depth_edge_filter: true       # 开启深度边缘筛选（仅保留深度不连续处的 FFT 高频点）
@@ -97,6 +107,7 @@ Training:
 VOPrior:
   type: simple_rgbd_odom           # VO prior type: "none" | "simple_rgbd_odom"
   debug_log: false                  # 是否输出 VOPrior 调试日志
+  full_render_warmup_frames: 100     # 前 N 帧跳过 VO，全量 100 迭代 warmup（0=关闭）
   tracking_refine_iters: 40         # VO render-accepted 后精化迭代数
   tracking_fallback_iters: 120      # VO 失败/未选中时渲染精化迭代数
 
@@ -359,5 +370,5 @@ Ablation:
   use_loop_closure: False           # 回环检测 + PGO 修正
   use_fdn: False                    # FDN 有限差分法向监督
   use_fft_mask: True               # FFT 高低频掩膜指导采样与初始 scale
-  use_error_mask: False             # 渲染误差掩膜指导动态补点
+  use_error_mask: True              # 渲染误差掩膜指导动态补点
   use_color_refinement: True       # final merge 后离线颜色精化

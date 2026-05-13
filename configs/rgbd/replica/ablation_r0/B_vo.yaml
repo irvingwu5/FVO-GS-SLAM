@@ -1,30 +1,33 @@
-# Round F: SA only — 验证 Replica base 注释"SA 损害遮挡边界 tracking"
+# Round B: A + VOPrior — Simple-RGBD-Odometry tracking 初值
 inherit_from: "configs/rgbd/replica/base_config.yaml"
 
 Dataset:
   dataset_path: "/home/wuxiangyu/Desktop/data/2d_gaussian_slam/datasets/replica/room0"
 
-# === 仅 SA depth + SA dist ON ===
 Ablation:
   use_fft_mask: False
   use_submap: False
   use_loop_closure: False
   use_fdn: False
   use_error_mask: False
+  use_color_refinement: True
 
 VOPrior:
-  type: none
+  type: simple_rgbd_odom
+  tracking_refine_iters: 60
 
 Training:
   use_rskm: False
+  use_freq_sampling_density: false
+  use_rgb_error_mask: false
 
 opt_params:
-  use_sa_dist: true
-  lambda_dist: 0.005
+  use_sa_dist: false
+  lambda_dist: 0.0
 
 pipeline_params:
-  use_sa: true
-  use_sa_depth: true
+  use_sa: false
+  use_sa_depth: false
 
 Backend:
   optimize_keyframe_pose: true
