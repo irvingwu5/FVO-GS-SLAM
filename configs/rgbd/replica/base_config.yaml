@@ -112,6 +112,26 @@ Training:
   rskm_current_frame_interval: 4   # 每 N 次采样强制使用当前帧（避免遗忘），2-8
   rskm_seed: 42                    # RSKM 随机种子（省略则使用 Experiment.seed）
   rskm_debug_log: false            # 是否输出 RSKM 调试统计
+  # ===== PAR RSKM (Pose-Aware Random Keyframe Replay) =====
+  rskm_mode: vanilla              # vanilla | par，位姿感知随机关键帧重放模式
+  par_rskm_debug_log: true        # 是否输出 PAR RSKM 调试统计（含 reliability 分布、采样分数）
+  par_rskm_enable_loss_weight: true   # 是否对历史 replay 帧应用 loss 权重
+  par_rskm_reliability_threshold: 0.05  # 最低 replay 可信度阈值 tau_r
+  par_rskm_gamma: 1.5             # 可信度锐化系数
+  par_rskm_eps: 1.0e-6            # 数值稳定性 epsilon
+  par_rskm_min_weight: 0.25       # 历史帧最小 replay loss 权重
+  par_rskm_max_weight: 1.0        # 历史帧最大 replay loss 权重
+  par_rskm_beta_pose: 1.0         # pose error 在 exp 中的缩放系数
+  par_rskm_beta_track: 0.5        # tracking loss 在 exp 中的缩放系数（暂未使用）
+  par_rskm_beta_depth: 0.5        # depth loss 在 exp 中的缩放系数（暂未使用）
+  par_rskm_default_reliability: 1.0  # 缺失 metadata 时的默认 reliability
+  par_rskm_log_interval: 50       # PAR RSKM 日志输出间隔
+  par_rskm_save_stats: false       # 是否保存 PAR RSKM 统计到文件
+  par_rskm_stats_path: null        # PAR RSKM 统计文件路径（null=自动生成到 save_dir）
+  par_rskm_use_temporal_bins: false # 是否启用时间分层采样
+  par_rskm_recent_bin_prob: 0.5    # 近期关键帧采样概率
+  par_rskm_middle_bin_prob: 0.3    # 中期关键帧采样概率
+  par_rskm_old_bin_prob: 0.2       # 远期关键帧采样概率
   normal_debug_log: false          # 是否输出法线对齐调试统计
   normal_debug_log_every: 50       # 法线对齐日志输出间隔（iterations）
   debug_seed_vis: false             # 是否保存 FFT mask 播种可视化

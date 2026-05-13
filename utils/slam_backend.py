@@ -120,6 +120,44 @@ class BackEnd(mp.Process):
         if self.use_rskm and self.rskm_debug_log:
             Log(f"[RSKM] enabled interval={self.rskm_current_frame_interval} seed={rskm_seed}")
 
+        # ===== PAR RSKM (Pose-Aware Random Keyframe Replay) =====
+        self.rskm_mode = self.config.get("Training", {}).get("rskm_mode", "vanilla")
+        self.par_config = {}
+        self._par_reliabilities = {}
+        self._par_rskm_log_counter = 0
+        self._par_rskm_stats = None
+        self._par_rskm_save_stats = False
+        self._par_rskm_stats_path = None
+        if self.rskm_mode == "par":
+            train_cfg = self.config.get("Training", {})
+            self.par_config = {
+                "beta_pose": float(train_cfg.get("par_rskm_beta_pose", 1.0)),
+                "eps": float(train_cfg.get("par_rskm_eps", 1.0e-6)),
+                "gamma": float(train_cfg.get("par_rskm_gamma", 1.5)),
+                "tau_r": float(train_cfg.get("par_rskm_reliability_threshold", 0.05)),
+                "w_min": float(train_cfg.get("par_rskm_min_weight", 0.25)),
+                "w_max": float(train_cfg.get("par_rskm_max_weight", 1.0)),
+                "default_reliability": float(train_cfg.get("par_rskm_default_reliability", 1.0)),
+                "log_interval": int(train_cfg.get("par_rskm_log_interval", 50)),
+            }
+            self._par_rskm_debug_log = train_cfg.get("par_rskm_debug_log", False)
+            self._par_rskm_save_stats = train_cfg.get("par_rskm_save_stats", False)
+            self._par_rskm_stats_path = train_cfg.get("par_rskm_stats_path", None)
+            if self._par_rskm_save_stats and self._par_rskm_stats_path is None:
+                save_dir = self.config.get("Results", {}).get("save_dir", ".")
+                self._par_rskm_stats_path = os.path.join(save_dir, "par_rskm_stats.json")
+            self._par_use_temporal_bins = train_cfg.get("par_rskm_use_temporal_bins", False)
+            self._par_bin_probs = {
+                "recent": float(train_cfg.get("par_rskm_recent_bin_prob", 0.5)),
+                "middle": float(train_cfg.get("par_rskm_middle_bin_prob", 0.3)),
+                "old": float(train_cfg.get("par_rskm_old_bin_prob", 0.2)),
+            }
+            Log(f"[PAR-RSKM] mode=par beta={self.par_config['beta_pose']} "
+                f"gamma={self.par_config['gamma']} tau_r={self.par_config['tau_r']} "
+                f"temporal_bins={self._par_use_temporal_bins} "
+                f"debug_log={self._par_rskm_debug_log} "
+                f"save_stats={self._par_rskm_save_stats}")
+
         # ===== Normal Debug Log =====
         self.normal_debug_log = self.config.get("Training", {}).get("normal_debug_log", False)
         self.normal_debug_log_every = int(self.config.get("Training", {}).get(
@@ -427,10 +465,17 @@ class BackEnd(mp.Process):
 
             if self.use_rskm and not prune:
                 num_samples = len(current_window) + 2
-                supervised_kf_ids = self._select_rskm_keyframes(current_window, num_samples)
+                current_kf_id = current_window[-1] if len(current_window) > 0 else None
+
+                if self.rskm_mode == "par":
+                    supervised_kf_ids = self._select_par_rskm_keyframes(
+                        current_window, num_samples
+                    )
+                else:
+                    supervised_kf_ids = self._select_rskm_keyframes(current_window, num_samples)
+
                 supervision_pairs = [(kf_idx, self.viewpoints[kf_idx]) for kf_idx in supervised_kf_ids]
                 keyframes_opt = viewpoint_stack[:]
-                current_kf_id = current_window[-1] if len(current_window) > 0 else None
                 if self._rskm_stats is None:
                     self._rskm_stats = {
                         "total_iters": 0, "n_current": 0, "n_history": 0,
@@ -449,6 +494,7 @@ class BackEnd(mp.Process):
                 for cam_idx in torch.randperm(len(random_viewpoint_stack))[:2]:
                     supervision_pairs.append((None, random_viewpoint_stack[cam_idx]))
                 keyframes_opt = viewpoint_stack[:]
+                current_kf_id = current_window[-1] if len(current_window) > 0 else None
 
             # 法线 debug 统计量初始化
             if self.normal_debug_log and self.use_fdn:
@@ -505,6 +551,19 @@ class BackEnd(mp.Process):
                             self._normal_debug_dot_sum += float(dot_per_pixel[valid_mask].mean())
                             self._normal_debug_err_sum += float(normal_error)
                             self._normal_debug_count += 1
+
+                # ---- PAR RSKM: apply replay loss weight ----
+                if (self.rskm_mode == "par"
+                        and kf_idx is not None
+                        and kf_idx != current_kf_id):
+                    from utils.par_rskm import compute_replay_weight
+                    r = getattr(viewpoint, "par_reliability", None)
+                    w = compute_replay_weight(
+                        r,
+                        min_weight=self.par_config.get("w_min", 0.25),
+                        max_weight=self.par_config.get("w_max", 1.0),
+                    )
+                    loss_view = w * loss_view
 
                 loss_view.backward()
 
@@ -695,6 +754,46 @@ class BackEnd(mp.Process):
                 f"distinct_history={len(stats['history_kf_set'])}")
             self._rskm_stats = None
 
+        # ---- PAR RSKM stats summary ----
+        if (self.rskm_mode == "par"
+                and self._par_rskm_stats is not None
+                and self._par_rskm_stats["reliability_count"] > 0):
+            st = self._par_rskm_stats
+            mean_r = st["reliability_sum"] / st["reliability_count"]
+            mean_w = st["weight_sum"] / st["weight_count"] if st["weight_count"] > 0 else 1.0
+
+            should_log = (
+                self._par_rskm_debug_log
+                and self._par_rskm_log_counter % self.par_config.get("log_interval", 50) == 0
+            )
+            if should_log:
+                Log(f"[PAR-RSKM][Stats] current={st['num_current_selected']} "
+                    f"replay={st['num_replay_selected']} "
+                    f"fallback={st['num_replay_fallback']} "
+                    f"rejected={st['num_replay_rejected']} "
+                    f"mean_r={mean_r:.3f} mean_w={mean_w:.3f} "
+                    f"pool={len(self.viewpoints)}kfs")
+
+            # Save to file if configured
+            if self._par_rskm_save_stats and self._par_rskm_stats_path:
+                try:
+                    import json
+                    stats_out = {
+                        "num_current_selected": st["num_current_selected"],
+                        "num_replay_selected": st["num_replay_selected"],
+                        "num_replay_fallback": st["num_replay_fallback"],
+                        "num_replay_rejected": st["num_replay_rejected"],
+                        "mean_reliability": round(mean_r, 6),
+                        "mean_weight": round(mean_w, 6),
+                        "pool_size": len(self.viewpoints),
+                    }
+                    with open(self._par_rskm_stats_path, "w") as f:
+                        json.dump(stats_out, f)
+                except Exception:
+                    pass  # Never crash SLAM due to stats saving
+
+            self._par_rskm_stats = None
+
         return gaussian_split
 
     # ========================================================================
@@ -717,6 +816,144 @@ class BackEnd(mp.Process):
                 selected.append(self.rskm_rng.choice(active_kf_ids))
             elif current_kf_id is not None:
                 selected.append(current_kf_id)
+        return selected
+
+    # ========================================================================
+    # 6.2 PAR RSKM (Pose-Aware Random Keyframe Replay)
+    # ========================================================================
+    def _select_par_rskm_keyframes(self, current_window, num_samples):
+        """PAR weighted keyframe selection with forced current-frame injection.
+
+        Updates self._par_reliabilities cache and replay counts on viewpoints.
+        Falls back to vanilla uniform when all scores are zero.
+        """
+        from utils.par_rskm import (
+            compute_reliabilities_batch, compute_par_sampling_score,
+            select_par_keyframes, select_par_keyframes_binned,
+        )
+
+        current_kf_id = current_window[-1] if len(current_window) > 0 else None
+
+        # Step 1: Update reliabilities cache for newly initialized viewpoints
+        newly_initialized = any(
+            getattr(vp, "par_initialized", False)
+            and getattr(vp, "par_reliability", None) is None
+            for vp in self.viewpoints.values()
+        )
+        if newly_initialized:
+            self._par_reliabilities = compute_reliabilities_batch(
+                self.viewpoints, self.par_config
+            )
+            if getattr(self, "_par_rskm_debug_log", False):
+                rel_vals = list(self._par_reliabilities.values())
+                Log(f"[PAR-RSKM] reliabilities initialized: n={len(rel_vals)} "
+                    f"mean={sum(rel_vals)/len(rel_vals):.4f} "
+                    f"min={min(rel_vals):.4f} max={max(rel_vals):.4f}")
+
+        reliabilities = self._par_reliabilities
+        if not reliabilities:
+            # No PAR data yet: fallback to vanilla
+            if getattr(self, "_par_rskm_debug_log", False):
+                Log(f"[PAR-RSKM] no reliabilities yet (pool={len(self.viewpoints)}), "
+                    f"fallback to vanilla uniform")
+            return self._select_rskm_keyframes(current_window, num_samples)
+
+        # Step 2: Compute sampling scores for all keyframes
+        scores = {}
+        active_kf_ids = sorted(list(self.viewpoints.keys()))
+        for kf_id in active_kf_ids:
+            vp = self.viewpoints[kf_id]
+            r = reliabilities.get(kf_id, self.par_config["default_reliability"])
+            replay_cnt = getattr(vp, "par_replay_count", 0)
+            scores[kf_id] = compute_par_sampling_score(
+                r, replay_count=replay_cnt,
+                threshold=self.par_config["tau_r"],
+                gamma=self.par_config["gamma"],
+                eps=self.par_config["eps"],
+            )
+
+        # Step 3: Weighted selection (binned or flat)
+        if getattr(self, "_par_use_temporal_bins", False):
+            selected, fallback_used = select_par_keyframes_binned(
+                self.viewpoints, current_window, num_samples,
+                scores, self._par_bin_probs, self.rskm_rng,
+                self.rskm_current_frame_interval, self.iteration_count,
+            )
+        else:
+            selected, fallback_used = select_par_keyframes(
+                self.viewpoints, current_window, num_samples,
+                scores, self.rskm_rng,
+                self.rskm_current_frame_interval, self.iteration_count,
+            )
+
+        # Step 4: Update replay counts on selected history frames
+        for kf_id in selected:
+            if kf_id != current_kf_id and kf_id in self.viewpoints:
+                vp = self.viewpoints[kf_id]
+                vp.par_replay_count = getattr(vp, "par_replay_count", 0) + 1
+                vp.par_last_replay_iter = self.iteration_count
+
+        # Step 5: Accumulate stats and periodic log
+        self._par_rskm_log_counter += 1
+
+        # Lazy-init stats dict
+        if self._par_rskm_stats is None:
+            self._par_rskm_stats = {
+                "num_current_selected": 0,
+                "num_replay_selected": 0,
+                "num_replay_fallback": 0,
+                "num_replay_rejected": 0,
+                "reliability_sum": 0.0,
+                "reliability_count": 0,
+                "weight_sum": 0.0,
+                "weight_count": 0,
+            }
+
+        # Accumulate
+        for kf_id in selected:
+            if kf_id == current_kf_id:
+                self._par_rskm_stats["num_current_selected"] += 1
+            else:
+                self._par_rskm_stats["num_replay_selected"] += 1
+                r = reliabilities.get(kf_id, self.par_config["default_reliability"])
+                self._par_rskm_stats["reliability_sum"] += r
+                self._par_rskm_stats["reliability_count"] += 1
+                w = max(self.par_config["w_min"],
+                        min(self.par_config["w_max"], r))
+                self._par_rskm_stats["weight_sum"] += w
+                self._par_rskm_stats["weight_count"] += 1
+        if fallback_used:
+            self._par_rskm_stats["num_replay_fallback"] += 1
+
+        # Count rejected (reliability < tau_r) across all active KFs
+        tau_r = self.par_config["tau_r"]
+        for kf_id in active_kf_ids:
+            r = reliabilities.get(kf_id, self.par_config["default_reliability"])
+            if r < tau_r:
+                self._par_rskm_stats["num_replay_rejected"] += 1
+
+        should_log = (
+            getattr(self, "_par_rskm_debug_log", False)
+            and self._par_rskm_log_counter % self.par_config.get("log_interval", 50) == 0
+        )
+        if should_log or fallback_used:
+            rel_values = [v for v in reliabilities.values() if v is not None]
+            mean_r = sum(rel_values) / max(len(rel_values), 1)
+            if fallback_used:
+                Log("[PAR-RSKM] fallback to vanilla uniform because all PAR scores are zero")
+            else:
+                sample_info = []
+                for kf_id in selected[:3]:
+                    r = reliabilities.get(kf_id, 0)
+                    s = scores.get(kf_id, 0)
+                    rc = getattr(self.viewpoints.get(kf_id), "par_replay_count", 0)
+                    sample_info.append(
+                        f"kf={kf_id} r={r:.3f} score={s:.4f} rc={rc}"
+                    )
+                Log(f"[PAR-RSKM] candidates={len(active_kf_ids)} "
+                    f"selected={len(selected)} mean_r={mean_r:.3f} "
+                    + " | ".join(sample_info))
+
         return selected
 
     # ========================================================================
@@ -1119,6 +1356,13 @@ class BackEnd(mp.Process):
                     self.viewpoints[cur_frame_idx] = viewpoint
                     self.current_window = current_window
                     self.add_next_kf(cur_frame_idx, viewpoint, depth_map=depth_map)
+
+                    # ---- PAR RSKM: proactively compute reliabilities for new keyframe ----
+                    if self.rskm_mode == "par" and len(self.viewpoints) >= 2:
+                        from utils.par_rskm import compute_reliabilities_batch
+                        self._par_reliabilities = compute_reliabilities_batch(
+                            self.viewpoints, self.par_config
+                        )
 
                     opt_params = []
                     frames_to_optimize = self.config["Training"]["pose_window"]

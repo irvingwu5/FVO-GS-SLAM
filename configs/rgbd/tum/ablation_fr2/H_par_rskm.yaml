@@ -1,4 +1,5 @@
-# Round C: B + RSKM — 子图内随机关键帧重放 (fr2_xyz)
+# Round H: C + PAR-RSKM — 位姿感知随机关键帧重放 (fr2_xyz)
+# 与 C_vo_rskm 唯一差异：rskm_mode=par 替代 vanilla
 inherit_from: "configs/rgbd/tum/fr2_xyz.yaml"
 
 Ablation:
@@ -16,6 +17,12 @@ VOPrior:
 Training:
   use_rskm: True
   rskm_mode: par
+  rskm_current_frame_interval: 4
+  par_rskm_enable_loss_weight: true
+  par_rskm_reliability_threshold: 0.05
+  par_rskm_gamma: 1.5
+  par_rskm_min_weight: 0.25
+  par_rskm_max_weight: 1.0
   use_freq_sampling_density: false
   use_rgb_error_mask: false
 

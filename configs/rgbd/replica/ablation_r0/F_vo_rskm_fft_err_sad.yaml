@@ -18,6 +18,7 @@ VOPrior:
 
 Training:
   use_rskm: True
+  rskm_mode: par
   use_freq_sampling_density: true
   use_rgb_error_mask: true
 

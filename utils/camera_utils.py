@@ -70,6 +70,17 @@ class Camera(nn.Module):
         self.exposure_b = nn.Parameter(
             torch.tensor([0.0], requires_grad=True, device=device)
         )
+
+        # ---- PAR RSKM metadata (plain attrs, survive pickle) ----
+        self.vo_init_c2w = None             # np.ndarray (4,4) float64, C2W from VO prior
+        self.render_opt_c2w = None          # np.ndarray (4,4) float64, C2W after tracking
+        self.par_pose_trans_error = None    # float, VO vs render translation error (m)
+        self.par_pose_rot_error_deg = None  # float, VO vs render rotation error (deg)
+        self.par_tracking_loss = None       # float, best_loss from tracking refinement
+        self.par_reliability = None         # float, r_i = exp(-beta * pose_error)
+        self.par_replay_count = 0           # int, times selected for replay
+        self.par_last_replay_iter = -1      # int, last mapping iteration when replayed
+        self.par_initialized = False        # bool, whether PAR metadata has been computed
         # 兼容处理：如果未提供动态内参，则根据传入的静态参数构造一个 3x3 矩阵
         # 防止下游 SLAM 跟踪线程调用 self.dynamic_intrinsic 时引发 NoneType 错误
         if dynamic_intrinsic is not None:

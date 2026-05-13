@@ -561,6 +561,33 @@ class FrontEnd(mp.Process):
             "vo_render_accepted": vo_render_accepted,
         }
 
+        # ---- PAR RSKM: save pose consistency metadata ----
+        if self.config.get("Training", {}).get("rskm_mode", "vanilla") == "par":
+            from utils.par_rskm import compute_pose_delta_metrics
+
+            viewpoint.vo_init_c2w = est_c2w  # from VOPrior (None if VO failed)
+            with torch.no_grad():
+                viewpoint.render_opt_c2w = (
+                    torch.linalg.inv(viewpoint.T).cpu().numpy().astype(np.float64)
+                )
+            viewpoint.par_tracking_loss = best_loss
+
+            # Compute pose consistency (VO init vs render refined)
+            trans_err, rot_err = compute_pose_delta_metrics(
+                viewpoint.vo_init_c2w, viewpoint.render_opt_c2w
+            )
+            viewpoint.par_pose_trans_error = trans_err
+            viewpoint.par_pose_rot_error_deg = rot_err
+
+            # First-version reliability: pose consistency only
+            beta_pose = self.config.get("Training", {}).get("par_rskm_beta_pose", 1.0)
+            pose_error = trans_err + rot_err / 30.0
+            viewpoint.par_reliability = float(np.exp(-beta_pose * pose_error))
+
+            viewpoint.par_replay_count = 0
+            viewpoint.par_last_replay_iter = -1
+            viewpoint.par_initialized = True
+
         return best_render_pkg if best_render_pkg is not None else render_pkg
 
     # ========================================================================
