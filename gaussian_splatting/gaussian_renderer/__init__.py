@@ -188,7 +188,9 @@ def render(
     render_depth_expected = render_depth_expected / torch.clamp(render_alpha, min=depth_eps)
     render_depth_expected = torch.nan_to_num(render_depth_expected, 0, 0)
 
-    # get depth distortion map
+    # Depth regularization map.
+    # use_sa=False: original 2DGS depth distortion.
+    # use_sa=True:  surface-aware depth variance around median depth.
     render_dist = allmap[6:7]
 
     # surf depth selection:
