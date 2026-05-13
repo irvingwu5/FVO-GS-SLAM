@@ -174,14 +174,33 @@ class GaussianModel:
         raw_valid_mask = valid_mask.copy()
 
         # ==============================================================
-        # 机制 1：FFT 掩膜 — 仅用于尺度控制（对齐 FGS-SLAM）
-        # 不在此处过滤点密度；freq_mask 在 create_pcd_from_image_and_depth
-        # 中通过 is_high_freq → scale_multiplier 区分高/低频尺度
+        # 机制 1：FFT 掩膜 — 频率感知采样密度 + 尺度控制（对齐 FGS-SLAM）
         # ==============================================================
+        if (
+                use_fft_mask
+                and hasattr(cam, "freq_mask")
+                and cam.freq_mask is not None
+        ):
+            train_cfg = self.config.get("Training", {})
+            if train_cfg.get("use_freq_sampling_density", False):
+                freq_mask_np = cam.freq_mask.detach().cpu().numpy().astype(bool)
+                if freq_mask_np.ndim == 3:
+                    freq_mask_np = np.squeeze(freq_mask_np, axis=0)
+
+                high_stride = train_cfg.get("high_freq_sample_stride", 2)
+                low_stride = train_cfg.get("low_freq_sample_stride", 4)
+
+                high_stride_mask = np.zeros_like(freq_mask_np)
+                low_stride_mask = np.zeros_like(freq_mask_np)
+                high_stride_mask[::high_stride, ::high_stride] = True
+                low_stride_mask[::low_stride, ::low_stride] = True
+
+                freq_sampling = (freq_mask_np & high_stride_mask) | (~freq_mask_np & low_stride_mask)
+                valid_mask = valid_mask & freq_sampling
 
         # ==============================================================
         # 机制 2：误差掩膜
-        # 初始化阶段不建议启用 error_mask；它本来就是“渲染误差补点”语义
+        # 初始化阶段不建议启用 error_mask；它本来就是"渲染误差补点"语义
         # ==============================================================
         if (
                 (not init)
@@ -213,7 +232,7 @@ class GaussianModel:
             rgb,
             depth,
             init=init,
-            depth_np=depth_raw,  # 关键：把“真正用于反投影的深度支持域”传下去
+            depth_np=depth_raw,  # 关键：把"真正用于反投影的深度支持域"传下去
         )
 
     def create_pcd_from_image_and_depth(self, cam, rgb, depth, init=False, depth_np=None):
@@ -273,7 +292,7 @@ class GaussianModel:
 
         # ==============================================================
         # 关键修复：
-        # 法向必须按“真正送进 RGBD 反投影的 depth_np”取，而不是 cam.depth
+        # 法向必须按"真正送进 RGBD 反投影的 depth_np"取，而不是 cam.depth
         # ==============================================================
         normals_assigned = False
         if cam.normal_raw is not None:
@@ -310,6 +329,15 @@ class GaussianModel:
             raise RuntimeError(
                 "[create_pcd_from_image_and_depth] 0 points remain after downsampling."
             )
+
+        max_pts = self.config.get("Training", {}).get("max_new_gaussians_per_keyframe", 0)
+        if max_pts > 0 and new_xyz.shape[0] > max_pts:
+            base_seed = self.config.get("Experiment", {}).get("seed", 42)
+            rng = np.random.default_rng(base_seed)
+            keep_idx = rng.choice(new_xyz.shape[0], size=max_pts, replace=False)
+            new_xyz = new_xyz[keep_idx]
+            new_rgb = new_rgb[keep_idx]
+            normals_np = normals_np[keep_idx]
 
         use_fft_mask = self.config.get("Ablation", {}).get("use_fft_mask", True)
         is_high_freq = np.ones(new_xyz.shape[0], dtype=bool)
@@ -900,7 +928,7 @@ class GaussianModel:
                     torch.ones_like(self.get_opacity[stable_mask]) * stable_opacity
                 )
 
-        # 可见点必须保留“原始 logit 参数”
+        # 可见点必须保留"原始 logit 参数"
         logits_new[visible_mask] = self._opacity.detach()[visible_mask]
 
         optimizable_tensors = self.replace_tensor_to_optimizer(logits_new, "opacity")
@@ -1368,7 +1396,7 @@ class GaussianModel:
             # )# 进行逻辑或操作，更新剪枝掩码prune_mask，标记出所有需要剪枝的高斯点
             # ==============================================================
             # 【新增：FGS-SLAM 细针剔除机制 (Needle Pruning)】
-            # 防止 2DGS 退化为极度细长、疯狂消耗显存和算力的“废点”
+            # 防止 2DGS 退化为极度细长、疯狂消耗显存和算力的"废点"
             # ==============================================================
             scales = self.get_scaling
             # 防止分母为 0 导致 nan

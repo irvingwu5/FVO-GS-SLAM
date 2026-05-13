@@ -75,6 +75,8 @@ class FrontEnd(mp.Process):
         self.tracking_refine_iters = int(vop_cfg.get("tracking_refine_iters", 40))
         self.tracking_fallback_iters = int(vop_cfg.get("tracking_fallback_iters", 100))
         self.vo_render_accepted = False  # per-frame state for refine_iters decision
+        self.warmup_frames = int(vop_cfg.get("full_render_warmup_frames", 0))
+        self.vo_candidate_interval = int(vop_cfg.get("vo_candidate_interval", 1))
 
         # Stage 2: Candidate selection for tracking initialization
         self.candidate_selection_enable = vop_cfg.get("candidate_selection_enable", False)
@@ -352,42 +354,6 @@ class FrontEnd(mp.Process):
         initial_depth[~valid_rgb.cpu()] = 0  # Ignore the invalid rgb pixels
         return initial_depth[0].numpy()
 
-    # ========================================================================
-    # 4. Error Mask (rendering-guided densification hint)
-    # ========================================================================
-    def compute_error_mask(self, render_pkg, viewpoint):
-        """
-        对齐 FGS-SLAM seeding_mask：alpha 空洞 + 深度穿透误差
-        freq_mask 管"新高斯点尺度"，error_mask 管"在哪里补新高斯点"
-        """
-        gt_image = viewpoint.original_image.cuda()  # [3, H, W]
-        render_opacity = render_pkg["opacity"].detach()  # [1, H, W]
-
-        # 1. Alpha 掩膜 (地图空洞，对齐 FGS-SLAM alpha_mask)
-        alpha_mask = (render_opacity < 0.95).squeeze(0)  # [H, W]
-
-        # 2. Depth 穿透误差掩膜 (对齐 FGS-SLAM depth_error_mask)
-        depth_error_mask = torch.zeros_like(alpha_mask, dtype=torch.bool)
-        if not self.monocular and viewpoint.depth is not None:
-            gt_depth = torch.from_numpy(viewpoint.depth).cuda()  # [H, W]
-            render_depth = render_pkg["depth"].detach().squeeze(0)  # [H, W]
-            depth_error = torch.abs(gt_depth - render_depth)
-
-            valid_depth = gt_depth > 0.01
-            if valid_depth.any():
-                median_error = depth_error[valid_depth].median()
-                # FGS-SLAM: render_depth > gt_depth AND depth_error > 40 * median
-                depth_error_mask = (
-                    valid_depth
-                    & (render_depth > gt_depth)
-                    & (depth_error > 40.0 * median_error)
-                )
-
-        # 综合掩膜：空洞 | 深度穿透（对齐 FGS-SLAM seeding_mask = alpha_mask | depth_error_mask）
-        error_mask = alpha_mask | depth_error_mask
-
-        return error_mask
-
     def _get_render_model(self):
         return self.gaussians
 
@@ -408,6 +374,7 @@ class FrontEnd(mp.Process):
         prev_cam = self.cameras.get(cur_frame_idx - 1)
 
         # ---- Step 1: External VO prior estimation ---------------------------
+        in_warmup = (self.warmup_frames > 0 and cur_frame_idx < self.warmup_frames)
         vo_success = False
         est_c2w = None
         vo_info = {}
@@ -420,15 +387,23 @@ class FrontEnd(mp.Process):
                         if prev_cam is not None else None)
             vo_success, est_c2w, vo_info = self.vo_prior.track(rgb_img, depth_np, init_c2w)
 
-            # Skip VO candidate when output ≈ previous pose
-            if vo_success and est_c2w is not None and prev_cam is not None:
-                prev_c2w_check = torch.linalg.inv(prev_cam.T).cpu().numpy().astype(np.float64)
-                delta_T = np.linalg.inv(prev_c2w_check) @ est_c2w
-                delta_trans = np.linalg.norm(delta_T[:3, 3])
-                delta_rot_rad = np.arccos(np.clip(
-                    (np.trace(delta_T[:3, :3]) - 1.0) / 2.0, -1.0, 1.0))
-                if delta_trans < 1e-4 and delta_rot_rad < 1e-5:
-                    vo_success = False
+            # Suppress VO candidate during warmup or when interval says skip
+            skip_candidate = in_warmup or (
+                self.vo_candidate_interval > 1
+                and (cur_frame_idx % self.vo_candidate_interval) != 0
+            )
+            if skip_candidate:
+                vo_success = False
+            else:
+                # Skip VO candidate when output ≈ previous pose
+                if vo_success and est_c2w is not None and prev_cam is not None:
+                    prev_c2w_check = torch.linalg.inv(prev_cam.T).cpu().numpy().astype(np.float64)
+                    delta_T = np.linalg.inv(prev_c2w_check) @ est_c2w
+                    delta_trans = np.linalg.norm(delta_T[:3, 3])
+                    delta_rot_rad = np.arccos(np.clip(
+                        (np.trace(delta_T[:3, :3]) - 1.0) / 2.0, -1.0, 1.0))
+                    if delta_trans < 1e-4 and delta_rot_rad < 1e-5:
+                        vo_success = False
 
             if self.debug_log and self.vo_prior is not None:
                 vo_trans = vo_info.get("motion_trans", -1)
@@ -490,13 +465,14 @@ class FrontEnd(mp.Process):
                 selected_candidate_name = "previous"
 
         # ---- Step 3: Refinement iteration count --------------------------
-        use_vo = (self.vo_prior_type != "none")
-        if self.candidate_selection_enable and use_vo:
+        if in_warmup:
+            refine_iters = self.tracking_itr_num
+        elif self.candidate_selection_enable and (self.vo_prior_type != "none"):
             if vo_render_accepted:
                 refine_iters = self.tracking_refine_iters
             else:
                 refine_iters = self.tracking_fallback_iters
-        elif use_vo:
+        elif self.vo_prior_type != "none":
             refine_iters = (self.tracking_refine_iters if vo_success
                             else self.tracking_fallback_iters)
         else:

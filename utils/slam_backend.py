@@ -227,21 +227,22 @@ class BackEnd(mp.Process):
             if self.config.get("Training", {}).get("debug_seed_vis", False):
                 self._save_seed_vis(viewpoint, img_bgr, frame_idx)
 
-        # ---- Error 掩膜：基于当前地图渲染的空洞 + 深度穿透检测 ----
+        # ---- Error 掩膜：基于当前地图渲染的空洞 + 深度穿透 + RGB 表达误差检测 ----
         use_error_mask = self.config.get("Ablation", {}).get("use_error_mask", True)
         if (not init) and use_error_mask and len(self.gaussians._xyz) > 0:
             with torch.no_grad():
+                train_cfg = self.config.get("Training", {})
                 render_pkg = render(
                     viewpoint, self.gaussians, self.pipeline_params, self.background, surf=False
                 )
                 render_opacity = render_pkg["opacity"].detach()
                 render_depth = render_pkg["depth"].detach()
 
-                # Alpha 空洞掩膜（对齐 FGS-SLAM alpha_mask）
-                alpha_mask = (render_opacity < 0.95).squeeze(0)
+                opacity_th = train_cfg.get("error_mask_opacity_th", 0.98)
+                alpha_mask = (render_opacity < opacity_th).squeeze(0)
 
-                # Depth 穿透误差掩膜（对齐 FGS-SLAM depth_error_mask）
                 depth_error_mask = torch.zeros_like(alpha_mask, dtype=torch.bool)
+                rgb_error_mask = torch.zeros_like(alpha_mask, dtype=torch.bool)
                 if (not self.monocular) and viewpoint.depth is not None:
                     gt_depth = torch.from_numpy(viewpoint.depth).to(
                         dtype=torch.float32, device=render_depth.device
@@ -249,14 +250,23 @@ class BackEnd(mp.Process):
                     depth_error = torch.abs(gt_depth - render_depth.squeeze(0))
                     valid_depth = gt_depth > 0.01
                     if valid_depth.any():
+                        median_factor = train_cfg.get("depth_error_median_factor", 10.0)
                         median_error = depth_error[valid_depth].median()
                         depth_error_mask = (
                             valid_depth
                             & (render_depth.squeeze(0) > gt_depth)
-                            & (depth_error > 40.0 * median_error)
+                            & (depth_error > median_factor * median_error)
                         )
 
-                viewpoint.error_mask = (alpha_mask | depth_error_mask)
+                    # RGB 表达误差掩膜（对齐 FGS-SLAM non_presence_rgb_mask）
+                    if train_cfg.get("use_rgb_error_mask", False):
+                        gt_rgb = viewpoint.original_image.cuda()
+                        render_rgb = render_pkg["render"].detach()
+                        rgb_error = torch.sum(torch.abs(gt_rgb - render_rgb), dim=0)
+                        rgb_th = train_cfg.get("rgb_error_th", 0.5)
+                        rgb_error_mask = (rgb_error > rgb_th) & valid_depth
+
+                viewpoint.error_mask = (alpha_mask | depth_error_mask | rgb_error_mask)
 
         self.gaussians.extend_from_pcd_seq(
             viewpoint, kf_id=frame_idx, init=init, scale=scale, depthmap=depth_map
